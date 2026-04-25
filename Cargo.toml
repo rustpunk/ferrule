@@ -1,0 +1,39 @@
+[workspace]
+members = ["ferrule-core", "ferrule-config", "ferrule-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Ferrule Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rustpunk/ferrule"
+
+[workspace.dependencies]
+# Shared core
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util", "io-std", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+indexmap = { version = "2", features = ["serde"] }
+url = "2"
+
+# CLI / Output
+clap = { version = "4", features = ["derive", "string", "wrap_help"] }
+tabled = "0.18"
+crossterm = "0.29"
+is-terminal = "0.4"
+miette = { version = "7", features = ["fancy"] }
+secrecy = "0.10"
+
+# Config
+dirs = "5"
+toml = "0.8"
+
+# Prompt
+rpassword = "7"
+
+# Types
+uuid = "1"

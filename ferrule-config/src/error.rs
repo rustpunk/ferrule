@@ -1,0 +1,22 @@
+#![allow(dead_code, unused_variables, unused_imports)]
+
+use thiserror::Error;
+
+/// Errors originating in `ferrule-config`.
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("config file not found: {0}")]
+    ConfigNotFound(String),
+
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+
+    #[error("connection '{0}' not found in registry")]
+    ConnectionNotFound(String),
+
+    #[error("duplicate connection name: {0}")]
+    DuplicateConnection(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}

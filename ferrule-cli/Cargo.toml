@@ -1,0 +1,31 @@
+[package]
+name = "ferrule-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ferrule"
+path = "src/main.rs"
+
+[features]
+default = ["ferrule-core/postgres", "ferrule-core/mysql", "ferrule-core/mssql", "ferrule-core/sqlite"]
+all = ["ferrule-core/oracle"]
+oracle = ["ferrule-core/oracle"]
+
+[dependencies]
+ferrule-core = { path = "../ferrule-core" }
+ferrule-config = { path = "../ferrule-config" }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+miette = { workspace = true }
+is-terminal = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+
+rpassword = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

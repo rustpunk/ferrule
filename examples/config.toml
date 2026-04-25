@@ -1,0 +1,24 @@
+# Ferrule global configuration
+# Located at ~/.config/ferrule/config.toml on Linux
+
+[default]
+# Default output format when not a TTY
+format = "json"
+# Default row limit for safety
+limit = 1000
+# Query timeout in seconds
+timeout = 30
+
+# Per-connection profiles can reference environment variables
+[connection.prod]
+url = "postgres://admin@db.example.com/production"
+# Password resolved via FERRULE_PROD_PASSWORD or OS keyring
+
+[connection.staging]
+url = "mysql://developer@staging.internal/app_db"
+
+[connection.warehouse]
+url = "mssql://etl_user@sql-warehouse.internal/warehouse?encrypt=true"
+
+[connection.local]
+url = "sqlite:///home/user/data/app.db"

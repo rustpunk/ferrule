@@ -1,0 +1,7 @@
+[connection.oracle-legacy]
+url = "oracle://readonly@oracle-db.internal/PROD_SERVICE"
+# Oracle connections require the Oracle Instant Client on your library path.
+# Download from: https://www.oracle.com/database/technologies/instant-client/downloads.html
+
+[connection.sqlite-memory]
+url = "sqlite::memory:"
