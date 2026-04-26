@@ -2,14 +2,32 @@
 
 [Introduction](README.md)
 
+# Getting Started
+
 - [Installation](installation.md)
 - [Quick Start](quickstart.md)
+
+# Concepts
+
+- [How Ferrule Thinks](concepts.md)
 - [Connections](connections.md)
+- [Configuration](configuration.md)
+- [Security](security.md)
+
+# Using Ferrule
+
 - [Querying Data](querying.md)
 - [Schema Introspection](schema.md)
 - [Bookmarks](bookmarks.md)
 - [Interactive REPL](repl.md)
-- [Advanced Features](advanced.md)
-- [Configuration](configuration.md)
+
+# Advanced
+
+- [EXPLAIN, Dump, Watch](advanced.md)
+- [Connection Pooling Daemon](daemon.md)
+
+# Reference
+
 - [Backends](backends.md)
-- [Reference](reference.md)
+- [Troubleshooting](troubleshooting.md)
+- [CLI Reference](reference.md)

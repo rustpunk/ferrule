@@ -1,134 +1,258 @@
-# Reference
+# CLI Reference
 
-## Exit Codes
+Quick lookup for commands, flags, exit codes, and file locations.
+For conceptual context, start with [Concepts](concepts.md).
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Usage error (invalid CLI arguments, malformed SQL) |
-| 2 | Connection error (network, auth, backend unavailable) |
-| 3 | Query error (syntax error, constraint violation) |
-| 4 | No rows returned (optional, used by `--expect-rows`) |
+## Commands
 
-## Environment Variables
+```bash
+ferrule [--config <path>] <subcommand> [args...]
+```
 
-| Variable | Purpose |
-|----------|---------|
-| `FERRULE_<NAME>_PASSWORD` | Password for connection `<NAME>` (legacy fallback) |
-| `FERRULE_CONFIG` | Path to config file override |
-| `RUST_LOG` | Enable debug logging from underlying crates |
+Aliases: `ferrule conn` for `ferrule connection`, `ferrule q` for
+`ferrule query`, `ferrule r` for `ferrule repl`.
 
-## CLI Quick Reference
+### `query` — execute SQL
 
-### Connections
+```bash
+ferrule query <connection> [<sql>]
+  [--file <path>] [--stdin]
+  [--param NAME=VALUE]... [--param-file <json>]
+  [--explain] [--dry-run]
+  [--format <fmt>] [--output <file>]
+  [--limit <n>] [--offset <n>]
+  [--timing] [--verbose]
+  [--insecure] [--daemon]
+  [--password <pwd>]
+```
+
+See [Querying Data](querying.md).
+
+### `tables` / `describe` — schema introspection
+
+```bash
+ferrule tables   <connection> [output flags] [connection flags]
+ferrule describe <connection> <table> [output flags] [connection flags]
+```
+
+See [Schema Introspection](schema.md).
+
+### `explain` — execution plans
+
+```bash
+ferrule explain <connection> <sql>
+  [--analyze]
+  [--format <fmt>] [--output <file>]
+  [--timing] [--verbose]
+  [--insecure] [--daemon]
+```
+
+See [EXPLAIN, Dump, and Watch](advanced.md#explain).
+
+### `dump` / `load` — data movement
+
+```bash
+ferrule dump <connection> <table>
+  [--file <path>]
+  [--dump-format csv|json|sql]
+  [--schema <name>]
+  [--limit <n>] [--offset <n>]
+  [--timing] [--verbose]
+  [--insecure] [--daemon]
+
+ferrule load <connection> <file>
+  [--table <name>]
+  [--format csv|json]
+  [--create-table]
+  [--insecure] [--daemon]
+```
+
+See [Dump and Load](advanced.md#dump-and-load).
+
+### `watch` — periodic re-execution
+
+```bash
+ferrule watch <connection> <sql>
+  [--interval <seconds>]
+  [--max-iterations <n>]
+  [--diff]
+  [--format <fmt>] [--output <file>]
+  [--timing] [--verbose]
+  [--insecure] [--daemon]
+  [--password <pwd>]
+```
+
+See [Watch mode](advanced.md#watch-mode).
+
+### `repl` — interactive shell
+
+```bash
+ferrule repl [<connection>]
+  [--format <fmt>] [--output <file>]
+  [--limit <n>] [--offset <n>]
+  [--timing] [--verbose]
+  [--insecure] [--daemon]
+```
+
+See [Interactive REPL](repl.md).
+
+### `bookmark` — saved queries
+
+```bash
+ferrule bookmark add <name> <sql> [--connection <name>]
+ferrule bookmark list
+ferrule bookmark run <name> [<arg>...]
+  [--connection <name>]
+  [--format <fmt>] [--output <file>]
+  [--limit <n>] [--offset <n>]
+  [--timing] [--verbose]
+  [--insecure] [--daemon]
+ferrule bookmark delete <name>
+```
+
+See [Bookmarks](bookmarks.md).
+
+### `connection` (alias `conn`) — registry and daemon
 
 ```bash
 ferrule conn add <name> <url>
 ferrule conn list
 ferrule conn remove <name>
-ferrule conn test <name>
-ferrule conn set-password <name>
+ferrule conn test <name> [--insecure] [--daemon]
+
+ferrule conn set-password <name>      # interactive prompt; stores in OS keyring
 ferrule conn delete-password <name>
+
+ferrule conn start [--background]     # connection-pooling daemon
+ferrule conn stop
+ferrule conn status
+ferrule conn restart
 ```
 
-### Querying
+See [Connections](connections.md) and [Daemon](daemon.md).
 
-```bash
-ferrule query <connection> <sql> [options]
-ferrule explain <connection> <sql>
-ferrule tables <connection>
-ferrule describe <connection> <table>
-```
+## Flags reference
 
-### Bookmarks
+### Output flags
 
-```bash
-ferrule bookmark add <name> <sql> [--connection <conn>]
-ferrule bookmark list
-ferrule bookmark run <name> [param1] [param2] ... [--connection <conn>] [--format <fmt>]
-ferrule bookmark delete <name>
-```
-
-Bookmark names can be dotted (`pg.select_users`) — the first segment suggests the connection to use.
-
-### Data Movement
-
-```bash
-ferrule dump <connection> <table> [--dump-format <fmt>] [--file <path>] [--schema <schema>]
-ferrule load <connection> <file> --table <table> [--create-table]
-```
-
-### Monitoring
-
-```bash
-ferrule watch <connection> <sql> [--interval <secs>] [--diff] [--max-iterations <N>]
-```
-
-### Interactive
-
-```bash
-ferrule repl <connection>
-```
-
-## Common Options (for `query`, `tables`, `describe`, `dump`, `explain`, `watch`)
+Available on `query`, `tables`, `describe`, `explain`, `dump`,
+`watch`, `repl`, `bookmark run`.
 
 | Flag | Description |
-|------|-------------|
-| `-f, --format <fmt>` | Output format: `table`, `json`, `csv`, `yaml`, `raw` |
-| `-n, --limit <N>` | Server-side row limit (`0` to disable) |
-| `--offset <N>` | Skip N rows |
-| `--timing` | Show timing diagnostics |
-| `-v, --verbose` | Show resolved URL and SQL |
-| `--insecure` | Disable TLS verification |
-| `-p, --password <pwd>` | **Insecure** — leaks to shell history; use `password_url` instead |
-| `--output <FILE>` | Write results to a file |
-| `--daemon` | Route through connection-pooling daemon |
+|---|---|
+| `-f, --format <fmt>` | One of `table`, `json`, `csv`, `yaml`, `raw`. Default: `json` |
+| `-o, --output <file>` | Write results to a file (otherwise stdout) |
+| `-n, --limit <n>` | Cap the number of rows returned. `0` disables paging for the call |
+| `--offset <n>` | Skip the first `<n>` rows |
+| `--timing` | Print connect/query/format timing to stderr |
+| `-v, --verbose` | Echo resolved (redacted) URL and SQL to stderr |
 
-## Configuration File
+### Connection flags
 
-See [Configuration](configuration.md) for the full `.ferrule.toml` format. A minimal example:
+Available on every command that opens a connection.
 
-```toml
-[default]
-format = "json"
-limit = 1000
+| Flag | Description |
+|---|---|
+| `--insecure` | Disable TLS certificate-chain *and* hostname verification. Prints a warning to stderr. See [Security](security.md#tls-posture-per-backend) |
+| `--daemon` | Route the request through the per-user connection-pooling daemon (must be running — `ferrule conn start`). See [Daemon](daemon.md) |
 
-[connection.production]
-url = "postgres://user@db.example.com/app"
-password_url = "keyring://ferrule/production"
-```
+### Password flag (`query` and `watch` only)
 
-The optional `password_url` field resolves the password via `hasp` before falling back to the legacy stack. Supported schemes:
+| Flag | Description |
+|---|---|
+| `-p, --password <pwd>` | Pass the password explicitly. **Insecure** — leaks to shell history. Prefer `password_url` in [Configuration](configuration.md#password_url) |
 
-| Scheme | Example | Notes |
-|--------|---------|-------|
-| `env://` | `env://DB_PASSWORD` | Environment variable |
-| `keyring://` | `keyring://ferrule/production` | OS keyring (service/account) |
-| `file://` | `file:///run/secrets/db_password` | File on disk; trims trailing newline by default |
+### Query-only flags
 
-## File Locations
+| Flag | Description |
+|---|---|
+| `--file <path>` | Read SQL from a file |
+| `--stdin` | Read SQL from stdin |
+| `--param NAME=VALUE` | Set a `${NAME}` placeholder. Repeat for multiple parameters |
+| `--param-file <path>` | Load parameters from a JSON object file |
+| `--explain` | Wrap the SQL in EXPLAIN before sending |
+| `--dry-run` | Print the resolved SQL and URL; do not connect |
+
+### Explain-only flags
+
+| Flag | Description |
+|---|---|
+| `--analyze` | Execute the statement and collect runtime statistics. Silently downgraded for INSERT / UPDATE / DELETE / DDL to avoid side effects |
+
+### Dump-only flags
+
+| Flag | Description |
+|---|---|
+| `--file <path>` | Output file (stdout if omitted) |
+| `--dump-format <fmt>` | One of `csv`, `json`, `sql`. Default: `csv`. Distinct from `--format` |
+| `--schema <name>` | Schema name; affects qualified table names in SQL dumps |
+
+### Load-only flags
+
+| Flag | Description |
+|---|---|
+| `-t, --table <name>` | Target table (inferred from file stem if omitted) |
+| `-f, --format <fmt>` | `csv` or `json` (inferred from extension if omitted) |
+| `--create-table` | Create the target table from the JSON schema before loading. JSON only |
+
+### Watch-only flags
+
+| Flag | Description |
+|---|---|
+| `-i, --interval <seconds>` | Polling interval. Default: `5`. Minimum: `1` |
+| `--max-iterations <n>` | Stop after `<n>` iterations |
+| `--diff` | Only print output when the result differs from the previous iteration |
+
+### Daemon-only flags
+
+| Flag | Description |
+|---|---|
+| `--background` (on `conn start`) | Fork to background and detach |
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Usage error (invalid CLI arguments, malformed SQL parsing) |
+| 2 | Connection error (network, TLS, authentication, backend unavailable) |
+| 3 | Query error (SQL syntax, constraint violation, schema mismatch) |
+| 4 | Reserved for `--expect-rows`-style assertions |
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `FERRULE_<NAME>_PASSWORD` | Legacy password fallback for connection `<name>` (uppercased; hyphens become underscores). `production` → `FERRULE_PRODUCTION_PASSWORD` |
+| `RUST_LOG` | Enable structured logging from ferrule and driver crates. `RUST_LOG=ferrule=debug` is a useful starting point |
+
+`FERRULE_CONFIG` is **not** currently a recognized override; pass
+`--config` on the command line.
+
+## File locations
 
 | File | Purpose | Path |
-|------|---------|------|
+|---|---|---|
 | Global config | Per-user defaults, connection profiles | `~/.config/ferrule/ferrule.toml` |
-| Connections | Saved name → URL registry | `~/.config/ferrule/connections.toml` |
+| Project config | Project-local overrides | `./.ferrule.toml` |
+| Connections registry | Saved name → URL (managed by `ferrule conn add`) | `~/.config/ferrule/connections.toml` |
 | Bookmarks | Saved query library | `~/.config/ferrule/bookmarks.toml` |
-| History | REPL command history | `~/.cache/ferrule/history` |
+| REPL history | Persistent history file | `~/.cache/ferrule/history` |
+| Daemon socket (Unix) | Per-user IPC for `--daemon` mode | `~/.cache/ferrule/daemon.sock` |
+| Daemon PID | PID file for the running daemon | `~/.cache/ferrule/daemon.pid` |
+| Daemon port (Windows) | TCP port file (Unix uses sockets) | `%LOCALAPPDATA%\ferrule\daemon.port` |
 
-## Type Reference
+Paths use `dirs::config_dir()` and `dirs::cache_dir()` — replace
+`~/.config` and `~/.cache` with the platform equivalent on macOS
+(`~/Library/Application Support/`, `~/Library/Caches/`) and Windows
+(`%APPDATA%`, `%LOCALAPPDATA%`).
 
-Every backend maps native types to a unified `Value` enum:
+## Type mapping
 
-| Ferrule `Value` | Postgres | MySQL | MSSQL | SQLite | Oracle |
-|----------------|----------|-------|-------|--------|--------|
-| `Bool` | `BOOLEAN` | `BOOLEAN` | `BIT` | `INTEGER` | `NUMBER(1)` |
-| `Int64` | `BIGINT` | `BIGINT` | `BIGINT` | `INTEGER` | `NUMBER` |
-| `Float64` | `DOUBLE` | `DOUBLE` | `FLOAT` | `REAL` | `BINARY_FLOAT` |
-| `Decimal` | `NUMERIC` | `DECIMAL` | `DECIMAL` | `NUMERIC` | `NUMBER` |
-| `String` | `TEXT` | `VARCHAR` | `NVARCHAR` | `TEXT` | `VARCHAR2` |
-| `Bytes` | `BYTEA` | `BLOB` | `VARBINARY` | `BLOB` | `RAW` |
-| `Date` | `DATE` | `DATE` | `DATE` | `TEXT` | `DATE` |
-| `DateTime` | `TIMESTAMP` | `DATETIME` | `DATETIME2` | `TEXT` | `TIMESTAMP` |
-| `DateTimeTz` | `TIMESTAMPTZ` | `TIMESTAMP` | `DATETIMEOFFSET` | `TEXT` | `TIMESTAMP WITH TIME ZONE` |
-| `Json` | `JSONB` | `JSON` | `NVARCHAR(MAX)` | `TEXT` | `CLOB` |
-| `Uuid` | `UUID` | `CHAR(36)` | `UNIQUEIDENTIFIER` | `TEXT` | `RAW(16)` |
+The canonical type-mapping table lives in [Backends](backends.md#type-mapping).
+
+## Credential resolution
+
+The canonical credential resolution stack lives in
+[Concepts](concepts.md#the-credential-stack); the security
+trade-offs of each scheme live in [Security](security.md).

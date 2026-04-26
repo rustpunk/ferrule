@@ -1,107 +1,176 @@
 # Quick Start
 
-## First Query
+This walkthrough takes you from a fresh ferrule install to a real
+database in under five minutes. SQLite for the warm-up, then a
+disposable Postgres in Docker for everything else.
+
+## Step 1 — your first query
+
+SQLite needs no setup. Run:
 
 ```bash
-# SQLite works without any setup
-ferrule query "sqlite::memory:" "SELECT 1 + 1 AS answer;"
+ferrule query "sqlite::memory:" "SELECT 1 + 1 AS answer;" --format table
 ```
 
-Output (TTY defaults to table format):
+Output:
 
 ```text
- answer
---------
- 42
+┌────────┐
+│ answer │
+├────────┤
+│ 2      │
+└────────┘
 ```
 
-## Save a Named Connection
-
-Typing full URLs repeatedly is tedious. Save the ones you use often:
+Drop the `--format table` flag and you'll get JSON instead — that's
+the default. Either form is fine for now.
 
 ```bash
-ferrule conn add production "postgres://user@db.example.com/app"
-
-# Now use the name instead of the full URL
-ferrule query production "SELECT * FROM customers LIMIT 5;"
-ferrule tables production
-ferrule repl production
+ferrule query "sqlite::memory:" "SELECT 1 + 1 AS answer;"
+# [
+#   {
+#     "answer": 2
+#   }
+# ]
 ```
 
-## Pipe-Friendly Defaults
+## Step 2 — a real database
 
-When stdout is not a TTY, output defaults to JSON:
+Spin up a throwaway Postgres in Docker. This mirrors the test setup
+in `CLAUDE.md`; copy and paste:
 
 ```bash
-ferrule query "sqlite::memory:" "SELECT 1" | jq '.[]."1"'
-# > 1
+docker run -d --name ferrule-quickstart \
+  -e POSTGRES_PASSWORD=ferrule \
+  -e POSTGRES_USER=ferrule \
+  -e POSTGRES_DB=ferrule \
+  -p 127.0.0.1:15432:5432 \
+  postgres:17-alpine
+
+# Wait for it to come up (~3 seconds)
+until docker exec ferrule-quickstart pg_isready -U ferrule >/dev/null 2>&1; do
+  sleep 1
+done
+
+# Seed a tiny schema
+PGPASSWORD=ferrule psql -h 127.0.0.1 -p 15432 -U ferrule -d ferrule -c "
+CREATE TABLE customers (
+  id SERIAL PRIMARY KEY,
+  name TEXT,
+  signed_up TIMESTAMPTZ DEFAULT now()
+);
+INSERT INTO customers (name) VALUES ('Alice'), ('Bob'), ('Carol');
+"
 ```
 
-## Save a Bookmark
-
-For queries you run all the time:
+Now query it directly:
 
 ```bash
-ferrule bookmark add daily-count "SELECT COUNT(*) FROM events;" --connection production
+ferrule query "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "SELECT * FROM customers;" --format table
+```
+
+Output something like:
+
+```text
+┌────┬───────┬───────────────────────────────┐
+│ id │ name  │ signed_up                     │
+├────┼───────┼───────────────────────────────┤
+│ 1  │ Alice │ 2026-04-26 18:01:23.456+00:00 │
+│ 2  │ Bob   │ 2026-04-26 18:01:23.456+00:00 │
+│ 3  │ Carol │ 2026-04-26 18:01:23.456+00:00 │
+└────┴───────┴───────────────────────────────┘
+```
+
+When you're done with the container:
+
+```bash
+docker stop ferrule-quickstart && docker rm ferrule-quickstart
+```
+
+## Step 3 — save a named connection
+
+Typing the full URL every time gets old. Add it to the registry:
+
+```bash
+ferrule conn add demo "postgres://ferrule@127.0.0.1:15432/ferrule?sslmode=disable"
+ferrule conn set-password demo
+# Password: ferrule
+```
+
+Now use the name:
+
+```bash
+ferrule query demo "SELECT COUNT(*) FROM customers;"
+ferrule tables demo
+ferrule describe demo customers
+ferrule repl demo
+```
+
+The password is stored in your OS keyring under
+`keyring://ferrule/demo`, never on disk in plaintext.
+
+## Step 4 — pipe-friendly defaults
+
+The default output format is JSON. That's chosen so output piped to
+`jq`, `awk`, or another command "just works":
+
+```bash
+ferrule query demo "SELECT * FROM customers" | jq '.[].name'
+# "Alice"
+# "Bob"
+# "Carol"
+```
+
+If you'd rather see tables in your terminal, either pass `--format
+table` per command, or set a project default in `.ferrule.toml`
+(see [Configuration](configuration.md)).
+
+## Step 5 — save a bookmark
+
+For queries you run all the time, bookmarks beat shell aliases:
+
+```bash
+ferrule bookmark add daily-count \
+  "SELECT COUNT(*) FROM customers WHERE signed_up > now() - interval '1 day';" \
+  --connection demo
 
 ferrule bookmark run daily-count
 ```
 
-## Password Resolution
-
-Ferrule resolves passwords via the `hasp` unified secret stack. For daily use, prefer the most secure option available in your environment:
-
-1. **`file://`** — mount secrets as files (Docker / Kubernetes). Not visible in `/proc/<pid>/environ`.
-2. **`keyring://`** — OS keyring. Encrypted at rest, isolated from other processes.
-3. **`env://`** — environment variable. Convenient but visible to other processes as the same user.
-4. **`FERRULE_<NAME>_PASSWORD`** — legacy env var fallback.
-5. **Interactive prompt** — TTY only; secret never touches disk or env.
-6. **`--password`** — **least secure**; leaks to shell history (`~/.bash_history`) and `ps`.
-
-### Recommended: `file://` in production
-
-```toml
-[connection.production]
-url = "postgres://app@db.example.com/myapp"
-password_url = "file:///run/secrets/db_password"
-```
-
-### Recommended: `keyring://` on workstations
+Positional parameters work too:
 
 ```bash
-# Store in OS keyring once
-ferrule conn set-password production
+ferrule bookmark add by-name "SELECT * FROM customers WHERE name = ${1};" \
+  --connection demo
 
-# Use from now on
-ferrule query production "SELECT 1;"
+ferrule bookmark run by-name "'Alice'"
 ```
 
-### One-off debugging (avoid for real secrets)
+## How passwords get resolved
 
-```bash
-# Leaks to shell history — only use for ephemeral testing
-ferrule query production "SELECT 1;" --password "my-secret"
+Step 3 stored a password in the keyring. The next time you run
+`ferrule query demo "..."` without a password on the URL, ferrule
+walks this stack and stops at the first hit:
+
+```text
+1. --password CLI flag        (you didn't pass one)
+2. password_url in profile    (no .ferrule.toml profile yet)
+3. FERRULE_DEMO_PASSWORD env  (unset)
+4. keyring://ferrule/demo     ← FOUND (set by `conn set-password`)
+5. Interactive prompt
+6. Fail
 ```
 
-## JSON Output with Paging
+This is described in detail in [Concepts](concepts.md#the-credential-stack)
+and [Security](security.md). For now: storing in the keyring is the
+right default for a workstation.
 
-```bash
-ferrule query production "SELECT * FROM events" \
-  --format json --limit 50 --offset 100
-```
+## Where to next
 
-## File Output
-
-```bash
-ferrule query production "SELECT * FROM events" --output events.json
-```
-
-## Explore Schema
-
-```bash
-# List tables
-ferrule tables production
-
-# Describe a table
-ferrule describe production events
-```
+- [Querying Data](querying.md) — output formats, paging,
+  parameterized queries.
+- [Connections](connections.md) — profiles, environment
+  interpolation, registry vs `.ferrule.toml`.
+- [Interactive REPL](repl.md) — meta-commands, watch mode.
+- [Concepts](concepts.md) — the abstractions everything is built on.

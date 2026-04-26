@@ -187,4 +187,8 @@ url = "postgres://app@${DB_HOST:-db.example.com}/myapp"
 
 Ferrule discovers `.ferrule.toml` automatically. The URL above uses optional environment interpolation — if `DB_HOST` is unset, it falls back to `db.example.com`.
 
-Named connections from the registry take precedence over `.ferrule.toml` profiles if they share a name.
+Profiles in `.ferrule.toml` take precedence over registry entries
+(`~/.config/ferrule/connections.toml`) that share the same name. This
+lets a project-local `.ferrule.toml` shadow a global registry entry
+without modifying it. See [Concepts](concepts.md#connection-resolution)
+for the full resolution order.
