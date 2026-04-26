@@ -1,73 +1,93 @@
-use secrecy::ExposeSecret;
+use hasp::Store;
 use secrecy::SecretString;
 
-/// Resolve a password from the environment (`FERRULE_{NAME}_PASSWORD`).
-/// Returns `None` if the variable is unset or empty.
-pub fn resolve_env_password(name: &str) -> Option<SecretString> {
-    let env_var = format!(
-        "FERRULE_{}_PASSWORD",
+/// Resolve credentials through the hasp unified stack.
+///
+/// Resolution order:
+/// 1. `explicit` (CLI `--password` flag)
+/// 2. `password_url` via `hasp::Store::get()`
+/// 3. `env://FERRULE_{NAME}_PASSWORD` via hasp
+/// 4. `keyring://ferrule/{name}` via hasp
+///
+/// Returns `Ok(None)` when no credential is found so the caller can
+/// fall back to an interactive prompt.
+pub fn resolve_password_stack(
+    name: &str,
+    explicit: Option<SecretString>,
+    password_url: Option<&str>,
+) -> Result<Option<SecretString>, crate::error::ConfigError> {
+    if let Some(pwd) = explicit {
+        return Ok(Some(pwd));
+    }
+
+    let store = Store::with_defaults();
+
+    // 2. password_url from profile
+    if let Some(url) = password_url {
+        match store.get(url) {
+            Ok(secret) => return Ok(Some(secret)),
+            Err(ref e) => {
+                if let Some(err) = warn_or_fail(url, e) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    // 3. Legacy env var via hasp
+    let env_url = format!(
+        "env://FERRULE_{}_PASSWORD",
         name.to_ascii_uppercase().replace('-', "_")
     );
-    std::env::var(&env_var)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|v| SecretString::new(v.into()))
-}
-
-/// Resolve a password from the OS keyring.
-/// Returns `None` if no entry is found or keyring is unavailable.
-#[cfg(feature = "keyring")]
-pub fn resolve_keyring_password(name: &str) -> Option<SecretString> {
-    let entry = keyring::Entry::new("ferrule", name).ok()?;
-    match entry.get_password() {
-        Ok(pwd) if !pwd.is_empty() => Some(SecretString::new(pwd.into())),
-        _ => None,
+    match store.get(&env_url) {
+        Ok(secret) => return Ok(Some(secret)),
+        Err(ref e) => {
+            if let Some(err) = warn_or_fail(&env_url, e) {
+                return Err(err);
+            }
+        }
     }
+
+    // 4. OS keyring via hasp
+    let keyring_url = format!("keyring://ferrule/{}", name);
+    match store.get(&keyring_url) {
+        Ok(secret) => return Ok(Some(secret)),
+        Err(ref e) => {
+            if let Some(err) = warn_or_fail(&keyring_url, e) {
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(None)
 }
 
-#[cfg(not(feature = "keyring"))]
-pub fn resolve_keyring_password(_name: &str) -> Option<SecretString> {
-    None
-}
-
-/// Store a password in the OS keyring.
-#[cfg(feature = "keyring")]
-pub fn set_keyring_password(
-    name: &str,
-    password: &SecretString,
-) -> Result<(), crate::error::ConfigError> {
-    let entry = keyring::Entry::new("ferrule", name)
-        .map_err(|e| crate::error::ConfigError::KeyringError(e.to_string()))?;
-    entry
-        .set_password(password.expose_secret())
-        .map_err(|e| crate::error::ConfigError::KeyringError(e.to_string()))?;
-    Ok(())
-}
-
-#[cfg(not(feature = "keyring"))]
-pub fn set_keyring_password(
-    _name: &str,
-    _password: &SecretString,
-) -> Result<(), crate::error::ConfigError> {
-    Err(crate::error::ConfigError::KeyringError(
-        "keyring support is not enabled in this build".into(),
-    ))
-}
-
-/// Delete a password from the OS keyring.
-#[cfg(feature = "keyring")]
-pub fn delete_keyring_password(name: &str) -> Result<(), crate::error::ConfigError> {
-    let entry = keyring::Entry::new("ferrule", name)
-        .map_err(|e| crate::error::ConfigError::KeyringError(e.to_string()))?;
-    entry
-        .delete_credential()
-        .map_err(|e| crate::error::ConfigError::KeyringError(e.to_string()))?;
-    Ok(())
-}
-
-#[cfg(not(feature = "keyring"))]
-pub fn delete_keyring_password(_name: &str) -> Result<(), crate::error::ConfigError> {
-    Err(crate::error::ConfigError::KeyringError(
-        "keyring support is not enabled in this build".into(),
-    ))
+fn warn_or_fail(url: &str, err: &hasp::Error) -> Option<crate::error::ConfigError> {
+    match err {
+        hasp::Error::NotFound(_) => None,
+        hasp::Error::PermissionDenied(_) => {
+            eprintln!("Warning: hasp permission denied for {}", url);
+            None
+        }
+        hasp::Error::AuthenticationFailed(_) => {
+            eprintln!("Warning: hasp authentication failed for {}", url);
+            None
+        }
+        e if e.is_transient() => {
+            eprintln!("Warning: hasp transient failure for {}, retrying...", url);
+            None
+        }
+        hasp::Error::InvalidUrl(msg) => Some(crate::error::ConfigError::HaspError(format!(
+            "invalid hasp URL '{}': {}",
+            url, msg
+        ))),
+        hasp::Error::UrlParse(e) => Some(crate::error::ConfigError::HaspError(format!(
+            "invalid hasp URL '{}': {}",
+            url, e
+        ))),
+        e => {
+            eprintln!("Warning: hasp lookup failed for {}: {}", url, e);
+            None
+        }
+    }
 }

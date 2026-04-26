@@ -55,13 +55,19 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
                 return Err(CliError::usage("Password cannot be empty."));
             }
             let secret = secrecy::SecretString::new(password.into());
-            ferrule_config::credentials::set_keyring_password(&name, &secret)
-                .map_err(CliError::registry)?;
+            let store = hasp::Store::with_defaults();
+            let url = format!("keyring://ferrule/{}", name);
+            store.put(&url, &secret).map_err(|e| {
+                CliError::registry(ferrule_config::error::ConfigError::HaspError(e.to_string()))
+            })?;
             println!("Password stored in keyring for '{}'.", name);
         }
         ConnCommand::DeletePassword { name } => {
-            ferrule_config::credentials::delete_keyring_password(&name)
-                .map_err(CliError::registry)?;
+            let store = hasp::Store::with_defaults();
+            let url = format!("keyring://ferrule/{}", name);
+            store.delete(&url).map_err(|e| {
+                CliError::registry(ferrule_config::error::ConfigError::HaspError(e.to_string()))
+            })?;
             println!("Password removed from keyring for '{}'.", name);
         }
         ConnCommand::Start { background } => {

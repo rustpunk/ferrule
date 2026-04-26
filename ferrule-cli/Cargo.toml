@@ -36,3 +36,4 @@ serde_json = { workspace = true }
 dashmap = "6"
 dirs = { workspace = true }
 indexmap = { workspace = true }
+hasp = { path = "../../hasp/crates/hasp", default-features = false, features = ["env", "keyring", "file"] }

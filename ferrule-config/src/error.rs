@@ -21,6 +21,6 @@ pub enum ConfigError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("keyring error: {0}")]
-    KeyringError(String),
+    #[error("hasp error: {0}")]
+    HaspError(String),
 }

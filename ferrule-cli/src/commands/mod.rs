@@ -45,12 +45,18 @@ pub async fn resolve_connection(
                         connection, e
                     ))
                 })?;
-                let resolved = resolve_password_stack(
+                let resolved = ferrule_config::credentials::resolve_password_stack(
                     connection,
                     password.map(|p| secrecy::SecretString::new(p.into())),
+                    profile.password_url.as_deref(),
                 )
-                .await?;
-                if let Some(pwd) = resolved {
+                .map_err(CliError::registry)?;
+                let final_pwd = if let Some(pwd) = resolved {
+                    Some(pwd)
+                } else {
+                    prompt_password_interactive(connection).await?
+                };
+                if let Some(pwd) = final_pwd {
                     url.set_password(Some(pwd.expose_secret()));
                 }
                 return Ok(url);
@@ -71,13 +77,18 @@ pub async fn resolve_connection(
                 ))
             })?;
 
-            let resolved = resolve_password_stack(
+            let resolved = ferrule_config::credentials::resolve_password_stack(
                 connection,
                 password.map(|p| secrecy::SecretString::new(p.into())),
+                None,
             )
-            .await?;
-
-            if let Some(pwd) = resolved {
+            .map_err(CliError::registry)?;
+            let final_pwd = if let Some(pwd) = resolved {
+                Some(pwd)
+            } else {
+                prompt_password_interactive(connection).await?
+            };
+            if let Some(pwd) = final_pwd {
                 url.set_password(Some(pwd.expose_secret()));
             }
             Ok(url)
@@ -85,27 +96,10 @@ pub async fn resolve_connection(
     }
 }
 
-/// Credential resolution stack:
-/// 1. Explicit override
-/// 2. `FERRULE_{NAME}_PASSWORD` env var
-/// 3. OS keyring
-/// 4. Interactive prompt (TTY only)
-pub async fn resolve_password_stack(
+/// Prompt for a password interactively (TTY only).
+async fn prompt_password_interactive(
     name: &str,
-    explicit: Option<secrecy::SecretString>,
 ) -> Result<Option<secrecy::SecretString>, CliError> {
-    if let Some(pwd) = explicit {
-        return Ok(Some(pwd));
-    }
-
-    if let Some(pwd) = ferrule_config::credentials::resolve_env_password(name) {
-        return Ok(Some(pwd));
-    }
-
-    if let Some(pwd) = ferrule_config::credentials::resolve_keyring_password(name) {
-        return Ok(Some(pwd));
-    }
-
     let tty = is_terminal::IsTerminal::is_terminal(&std::io::stdin());
     if tty {
         let prompt = format!("Password for '{}': ", name);
@@ -117,7 +111,6 @@ pub async fn resolve_password_stack(
             return Ok(Some(secrecy::SecretString::new(pwd.into())));
         }
     }
-
     Ok(None)
 }
 

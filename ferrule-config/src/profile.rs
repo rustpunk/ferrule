@@ -117,6 +117,8 @@ fn default_timeout() -> u64 {
 pub struct ConnectionProfile {
     pub url: String,
     #[serde(default)]
+    pub password_url: Option<String>,
+    #[serde(default)]
     pub headers: IndexMap<String, String>,
 }
 
