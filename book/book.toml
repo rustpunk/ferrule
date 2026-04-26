@@ -1,0 +1,28 @@
+[book]
+title = "Ferrule"
+description = "The collar that joins you to your data — a Rust-native database query CLI."
+authors = ["rustpunk"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "_build"
+create-missing = false
+
+[preprocessor.index]
+
+[preprocessor.links]
+
+[output.html]
+default-theme = "navy"
+git-repository-url = "https://github.com/rustpunk/ferrule"
+edit-url-template = "https://github.com/rustpunk/ferrule/edit/main/book/{path}"
+site-url = "/ferrule/"
+additional-css = []
+
+[output.html.playground]
+runnable = false
+
+[output.html.fold]
+enable = true
+level = 0
