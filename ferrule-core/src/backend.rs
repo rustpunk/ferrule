@@ -1,5 +1,5 @@
 use crate::backends;
-use crate::connection::{Connection, ConnectOptions};
+use crate::connection::{ConnectOptions, Connection};
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
 

@@ -21,9 +21,7 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
         }
         ConnCommand::Remove { name } => {
             let mut registry = ConnectionRegistry::load_default().map_err(CliError::registry)?;
-            registry
-                .remove(&name)
-                .map_err(CliError::registry)?;
+            registry.remove(&name).map_err(CliError::registry)?;
             registry.save_default().map_err(CliError::registry)?;
             println!("Connection '{}' removed.", name);
         }
@@ -35,13 +33,10 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
             if opts.insecure {
                 eprintln!("Warning: --insecure disables TLS certificate verification.");
             }
-            let mut conn = ferrule_core::backend::connect(&url, &opts
-            )
-            .await
-            .map_err(CliError::connection)?;
-            conn.ping()
+            let mut conn = ferrule_core::backend::connect(&url, &opts)
                 .await
                 .map_err(CliError::connection)?;
+            conn.ping().await.map_err(CliError::connection)?;
             println!("Connection '{}' is alive.", name);
         }
         ConnCommand::SetPassword { name } => {

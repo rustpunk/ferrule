@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::error::CoreError;
 use crate::value::{ColumnInfo, Row};
+use async_trait::async_trait;
 
 /// Backend-agnostic connection options.
 #[derive(Debug, Clone, Default)]
@@ -34,13 +34,10 @@ pub enum StatementResult {
 #[async_trait]
 pub trait Connection: Send {
     /// Execute a statement that may not return rows (INSERT, UPDATE, CREATE, etc.).
-    async fn execute(&mut self,
-        sql: &str,
-    ) -> Result<ExecutionSummary, CoreError>;
+    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError>;
 
     /// Execute a SELECT-like query and return rows.
-    async fn query(
-        &mut self, sql: &str) -> Result<QueryResult, CoreError>;
+    async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError>;
 
     /// Execute one or more statements.
     ///
@@ -62,10 +59,7 @@ pub trait Connection: Send {
     async fn ping(&mut self) -> Result<(), CoreError>;
 
     /// List tables in the given schema (or default schema if `None`).
-    async fn list_tables(
-        &mut self,
-        schema: Option<&str>,
-    ) -> Result<Vec<String>, CoreError>;
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError>;
 
     /// Describe the columns of a single table.
     async fn describe_table(

@@ -20,35 +20,23 @@ impl ConnectionRegistry {
         Self::default()
     }
 
-    pub fn add(
-        &mut self,
-        name: String,
-        url: String,
-    ) -> Result<(), ConfigError> {
+    pub fn add(&mut self, name: String, url: String) -> Result<(), ConfigError> {
         if self.entries.contains_key(&name) {
             return Err(ConfigError::DuplicateConnection(name));
         }
-        self.entries.insert(
-            name.clone(),
-            ConnectionEntry { name, url },
-        );
+        self.entries
+            .insert(name.clone(), ConnectionEntry { name, url });
         Ok(())
     }
 
-    pub fn remove(
-        &mut self,
-        name: &str,
-    ) -> Result<(), ConfigError> {
+    pub fn remove(&mut self, name: &str) -> Result<(), ConfigError> {
         self.entries
             .shift_remove(name)
             .ok_or_else(|| ConfigError::ConnectionNotFound(name.to_string()))?;
         Ok(())
     }
 
-    pub fn get(
-        &self,
-        name: &str,
-    ) -> Option<&ConnectionEntry> {
+    pub fn get(&self, name: &str) -> Option<&ConnectionEntry> {
         self.entries.get(name)
     }
 
@@ -63,8 +51,8 @@ impl ConnectionRegistry {
             return Ok(Self::new());
         }
         let content = std::fs::read_to_string(&path)?;
-        let mut registry: ConnectionRegistry = toml::from_str(&content)
-            .map_err(|e| ConfigError::InvalidConfig(e.to_string()))?;
+        let mut registry: ConnectionRegistry =
+            toml::from_str(&content).map_err(|e| ConfigError::InvalidConfig(e.to_string()))?;
         for entry in registry.entries.values_mut() {
             entry.url = interpolate_env_vars(&entry.url);
         }
@@ -77,8 +65,8 @@ impl ConnectionRegistry {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string(self)
-            .map_err(|e| ConfigError::InvalidConfig(e.to_string()))?;
+        let content =
+            toml::to_string(self).map_err(|e| ConfigError::InvalidConfig(e.to_string()))?;
         std::fs::write(&path, content)?;
         Ok(())
     }
@@ -164,10 +152,7 @@ mod tests {
 
     #[test]
     fn test_interpolate_escape() {
-        assert_eq!(
-            interpolate_env_vars("cost is $$5.00"),
-            "cost is $5.00"
-        );
+        assert_eq!(interpolate_env_vars("cost is $$5.00"), "cost is $5.00");
     }
 
     #[test]
@@ -182,9 +167,6 @@ mod tests {
     #[test]
     fn test_interpolate_no_braces() {
         // Bare $VAR is left as-is (not interpolated)
-        assert_eq!(
-            interpolate_env_vars("host=$VAR"),
-            "host=$VAR"
-        );
+        assert_eq!(interpolate_env_vars("host=$VAR"), "host=$VAR");
     }
 }

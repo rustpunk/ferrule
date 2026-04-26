@@ -32,8 +32,8 @@ impl GlobalConfig {
     pub fn load_from(path: &std::path::Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::ConfigNotFound(format!("{}: {}", path.display(), e)))?;
-        let mut config: GlobalConfig = toml::from_str(&content)
-            .map_err(|e| ConfigError::InvalidConfig(e.to_string()))?;
+        let mut config: GlobalConfig =
+            toml::from_str(&content).map_err(|e| ConfigError::InvalidConfig(e.to_string()))?;
         // Apply env interpolation to profile URLs
         for profile in config.connection.values_mut() {
             profile.url = crate::registry::interpolate_env_vars(&profile.url);
@@ -51,7 +51,9 @@ impl GlobalConfig {
         }
         // 2. User-global
         let config_dir = dirs::config_dir()
-            .ok_or_else(|| ConfigError::ConfigNotFound("could not determine config directory".into()))?
+            .ok_or_else(|| {
+                ConfigError::ConfigNotFound("could not determine config directory".into())
+            })?
             .join("ferrule");
         Ok(config_dir.join("ferrule.toml"))
     }

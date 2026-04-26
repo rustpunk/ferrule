@@ -4,8 +4,9 @@ mod commands;
 mod daemon;
 mod error;
 mod output;
+mod repl;
 
-use commands::{ConnArgs, DescribeArgs, QueryArgs, TablesArgs};
+use commands::{ConnArgs, DescribeArgs, QueryArgs, ReplArgs, TablesArgs};
 use error::CliError;
 
 /// Ferrule — the collar that joins you to your data.
@@ -27,6 +28,10 @@ enum Commands {
     /// Manage saved connections
     #[command(alias = "conn")]
     Connection(ConnArgs),
+
+    /// Interactive REPL
+    #[command(alias = "r")]
+    Repl(ReplArgs),
 
     /// Execute a SQL query
     #[command(alias = "q")]
@@ -73,12 +78,13 @@ fn main() {
 
     let result: Result<(), CliError> = rt.block_on(async {
         let cli = Cli::parse();
-        let global_config = ferrule_config::GlobalConfig::load(cli.config.as_deref())
-            .unwrap_or_default();
+        let global_config =
+            ferrule_config::GlobalConfig::load(cli.config.as_deref()).unwrap_or_default();
 
         match cli.command {
             Commands::Connection(args) => commands::conn::run(args, &global_config).await,
             Commands::Query(args) => commands::query::run(args, &global_config).await,
+            Commands::Repl(args) => commands::repl::run(args, &global_config).await,
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,
             Commands::Describe(args) => commands::describe::run(args, &global_config).await,
         }

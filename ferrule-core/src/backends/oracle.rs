@@ -1,8 +1,8 @@
-use async_trait::async_trait;
-use crate::connection::{Connection, ConnectOptions, ExecutionSummary, QueryResult};
+use crate::connection::{ConnectOptions, Connection, ExecutionSummary, QueryResult};
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, TypeHint, Value};
+use async_trait::async_trait;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
 
@@ -57,7 +57,9 @@ impl Connection for OracleConnection {
                     .sql_values()
                     .iter()
                     .enumerate()
-                    .map(|(i, sql_val)| oracle_to_value(sql_val, row.column_info()[i].oracle_type()))
+                    .map(|(i, sql_val)| {
+                        oracle_to_value(sql_val, row.column_info()[i].oracle_type())
+                    })
                     .collect();
                 rows.push(values);
             }
@@ -81,10 +83,7 @@ impl Connection for OracleConnection {
         .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?
     }
 
-    async fn list_tables(
-        &mut self,
-        schema: Option<&str>,
-    ) -> Result<Vec<String>, CoreError> {
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError> {
         let sql = match schema {
             Some(s) => format!(
                 "SELECT table_name FROM all_tables WHERE owner = '{}' ORDER BY table_name",
@@ -359,7 +358,8 @@ mod tests {
             .expect("list_tables should succeed");
         assert!(
             tables.iter().any(|t| t.eq_ignore_ascii_case("test_users")),
-            "should contain test_users (got: {:?})", tables
+            "should contain test_users (got: {:?})",
+            tables
         );
     }
 
@@ -375,25 +375,16 @@ mod tests {
             .describe_table(None, "test_users")
             .await
             .expect("describe_table should succeed");
-        assert_eq!(
-            result.columns.len(),
-            6,
-            "should return 6 metadata columns"
-        );
+        assert_eq!(result.columns.len(), 6, "should return 6 metadata columns");
         // Oracle column names from data dictionary are uppercase by default.
         // Just verify the count — exact names depend on Oracle metadata casing.
-        assert!(
-            !result.columns.is_empty(),
-            "should have describe columns"
-        );
+        assert!(!result.columns.is_empty(), "should have describe columns");
     }
 
     #[tokio::test]
     async fn test_oracle_type_mapping() {
         let Some(mut conn) = try_connect().await else {
-            eprintln!(
-                "ORACLE_TEST_URL not set or unreachable; skipping test_oracle_type_mapping"
-            );
+            eprintln!("ORACLE_TEST_URL not set or unreachable; skipping test_oracle_type_mapping");
             return;
         };
         let result = conn
@@ -445,7 +436,10 @@ mod tests {
         }
         let url = DatabaseUrl::parse("oracle://user:pass@127.0.0.1:1521/XEPDB1").unwrap();
         let result = connect(&url, &ConnectOptions::default()).await;
-        assert!(result.is_err(), "should fail when Instant Client is missing");
+        assert!(
+            result.is_err(),
+            "should fail when Instant Client is missing"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("Oracle Instant Client not found")

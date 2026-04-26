@@ -1,9 +1,9 @@
 use super::QueryArgs;
 use crate::error::CliError;
+use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::connect;
 use ferrule_core::connection::{ConnectOptions, QueryResult, StatementResult};
-use ferrule_core::formatter::{OutputFormat, format_result};
-use ferrule_config::profile::GlobalConfig;
+use ferrule_core::formatter::{format_result, OutputFormat};
 
 fn render_query_result(
     result: &QueryResult,
@@ -59,11 +59,9 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             .map_err(CliError::Io)?
     } else if args.stdin {
         let mut buf = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(),
-            &mut buf,
-        )
-        .await
-        .map_err(CliError::Io)?;
+        tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut buf)
+            .await
+            .map_err(CliError::Io)?;
         buf
     } else if let Some(sql) = args.sql {
         sql
@@ -84,10 +82,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         return Ok(());
     }
 
-    let url = super::resolve_connection(&args.connection,
-        args.password,
-        global_config,
-    ).await?;
+    let url = super::resolve_connection(&args.connection, args.password, global_config).await?;
 
     if args.output.verbose {
         eprintln!("[ferrule] Resolved URL: {}", url.redacted());
@@ -117,17 +112,14 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     }
 
     let backend = ferrule_core::Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CliError::usage(format!(
-            "Unsupported scheme: {}", url.scheme()
-        )))?;
+        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", url.scheme())))?;
 
     let conn_start = std::time::Instant::now();
     let mut conn = connect(&url, &opts).await.map_err(CliError::connection)?;
     let conn_time = conn_start.elapsed();
 
     // Inject server-side paging into the SQL
-    let sql = ferrule_core::apply_paging(&sql, limit, offset, backend)
-        .map_err(CliError::query)?;
+    let sql = ferrule_core::apply_paging(&sql, limit, offset, backend).map_err(CliError::query)?;
 
     if (limit.is_some() || offset.is_some()) && args.output.verbose {
         eprintln!("[ferrule] Paged SQL: {}", sql);
@@ -136,16 +128,10 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     let query_start = std::time::Instant::now();
     let results = match conn.query(&sql).await {
         Ok(qr) => vec![StatementResult::Query(qr)],
-        Err(ferrule_core::CoreError::QueryFailed(_)) => {
-            match conn.execute(&sql).await {
-                Ok(summary) => vec![StatementResult::Summary(summary)],
-                Err(_) => {
-                    conn.execute_multi(&sql)
-                        .await
-                        .map_err(CliError::query)?
-                }
-            }
-        }
+        Err(ferrule_core::CoreError::QueryFailed(_)) => match conn.execute(&sql).await {
+            Ok(summary) => vec![StatementResult::Summary(summary)],
+            Err(_) => conn.execute_multi(&sql).await.map_err(CliError::query)?,
+        },
         Err(e) => return Err(CliError::query(e)),
     };
     let query_time = query_start.elapsed();
@@ -153,12 +139,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     let format_start = std::time::Instant::now();
 
     if results.len() == 1 {
-        let rendered = render_single_result(
-            &results[0],
-            format,
-            limit,
-            offset,
-        )?;
+        let rendered = render_single_result(&results[0], format, limit, offset)?;
         match &results[0] {
             StatementResult::Query(_) => println!("{}", rendered),
             StatementResult::Summary(_) => eprintln!("{}", rendered),
@@ -167,8 +148,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         for (i, result) in results.iter().enumerate() {
             match result {
                 StatementResult::Query(_) => {
-                    let rendered = render_single_result(
-                        result, format, limit, offset)?;
+                    let rendered = render_single_result(result, format, limit, offset)?;
                     println!("-- Result set {}\n", i + 1);
                     println!("{}", rendered);
                     println!();
@@ -188,8 +168,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
 
     if let Some(path) = args.output.output {
         eprintln!("Warning: file output with multi-statement uses first result only.");
-        let rendered = render_single_result(
-            &results[0], format, limit, offset)?;
+        let rendered = render_single_result(&results[0], format, limit, offset)?;
         tokio::fs::write(&path, rendered)
             .await
             .map_err(CliError::Io)?;

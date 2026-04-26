@@ -27,7 +27,9 @@ secrecy = { workspace = true }
 thiserror = { workspace = true }
 
 rpassword = { workspace = true }
+rustyline = "15"
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = "6"
 dirs = { workspace = true }
+indexmap = { workspace = true }

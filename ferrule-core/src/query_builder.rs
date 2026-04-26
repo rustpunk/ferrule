@@ -42,7 +42,11 @@ pub fn apply_paging(
     }
 
     // Only apply paging to SELECT-like statements
-    let first_word = trimmed.split_whitespace().next().unwrap_or("").to_uppercase();
+    let first_word = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_uppercase();
     if first_word != "SELECT" && first_word != "WITH" {
         return Ok(sql.to_string());
     }

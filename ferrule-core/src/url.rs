@@ -13,8 +13,7 @@ pub struct DatabaseUrl {
 impl DatabaseUrl {
     /// Parse a raw connection string.
     pub fn parse(raw: &str) -> Result<Self, CoreError> {
-        let parsed = Url::parse(raw)
-            .map_err(|e| CoreError::InvalidUrl(format!("{e}")))?;
+        let parsed = Url::parse(raw).map_err(|e| CoreError::InvalidUrl(format!("{e}")))?;
         Ok(Self {
             raw: raw.to_string(),
             parsed,
@@ -30,9 +29,7 @@ impl DatabaseUrl {
     }
 
     pub fn password(&self) -> Option<SecretString> {
-        self.parsed
-            .password()
-            .map(|p| SecretString::new(p.into()))
+        self.parsed.password().map(|p| SecretString::new(p.into()))
     }
 
     pub fn host(&self) -> Option<&str> {

@@ -1,13 +1,16 @@
 pub mod conn;
 pub mod describe;
 pub mod query;
+pub mod repl;
 pub mod tables;
+
+pub use repl::ReplArgs;
 
 use crate::error::CliError;
 use clap::{Args, Subcommand};
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::url::DatabaseUrl;
 use ferrule_config::registry::ConnectionRegistry;
+use ferrule_core::url::DatabaseUrl;
 use secrecy::ExposeSecret;
 
 /// Resolve a connection string — either a raw URL or a registry/profile entry.
@@ -138,22 +141,17 @@ pub struct OutputFlags {
 
 impl OutputFlags {
     /// Merge CLI flags with global config defaults.
-    pub fn resolve_format(&self,
-        global_config: &GlobalConfig,
-    ) -> ferrule_core::OutputFormat {
+    pub fn resolve_format(&self, global_config: &GlobalConfig) -> ferrule_core::OutputFormat {
         self.format
             .as_deref()
             .and_then(ferrule_core::OutputFormat::parse)
             .unwrap_or_else(|| {
-                ferrule_core::OutputFormat::parse(&global_config.resolve_format(None),
-                )
-                .unwrap_or_else(crate::output::default_format)
+                ferrule_core::OutputFormat::parse(&global_config.resolve_format(None))
+                    .unwrap_or_else(crate::output::default_format)
             })
     }
 
-    pub fn resolve_limit(&self,
-        global_config: &GlobalConfig,
-    ) -> Option<usize> {
+    pub fn resolve_limit(&self, global_config: &GlobalConfig) -> Option<usize> {
         self.limit.or(global_config.resolve_limit(None))
     }
 }
@@ -180,16 +178,11 @@ pub struct ConnArgs {
 #[derive(Subcommand, Clone, Debug)]
 pub enum ConnCommand {
     /// Add a named connection
-    Add {
-        name: String,
-        url: String,
-    },
+    Add { name: String, url: String },
     /// List saved connections
     List,
     /// Remove a connection
-    Remove {
-        name: String,
-    },
+    Remove { name: String },
     /// Test a connection
     Test {
         name: String,
@@ -197,13 +190,9 @@ pub enum ConnCommand {
         conn_flags: ConnectionFlags,
     },
     /// Store a password in the OS keyring
-    SetPassword {
-        name: String,
-    },
+    SetPassword { name: String },
     /// Remove a password from the OS keyring
-    DeletePassword {
-        name: String,
-    },
+    DeletePassword { name: String },
     /// Start the connection pooling daemon
     Start {
         /// Run in background

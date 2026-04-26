@@ -1,10 +1,12 @@
-use async_trait::async_trait;
-use crate::connection::{Connection, ConnectOptions, ExecutionSummary, QueryResult, StatementResult};
+use crate::connection::{
+    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+};
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, TypeHint, Value};
-use rusqlite::Connection as SqliteConn;
+use async_trait::async_trait;
 use rusqlite::types::Value as SqliteValue;
+use rusqlite::Connection as SqliteConn;
 
 pub struct SqliteConnection {
     conn: std::sync::Arc<std::sync::Mutex<SqliteConn>>,
@@ -12,10 +14,7 @@ pub struct SqliteConnection {
 
 #[async_trait]
 impl Connection for SqliteConnection {
-    async fn execute(
-        &mut self,
-        sql: &str,
-    ) -> Result<ExecutionSummary, CoreError> {
+    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError> {
         let sql = sql.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -32,10 +31,7 @@ impl Connection for SqliteConnection {
         .map_err(|e| CoreError::QueryFailed(e.to_string()))?
     }
 
-    async fn query(
-        &mut self,
-        sql: &str,
-    ) -> Result<QueryResult, CoreError> {
+    async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError> {
         let sql = sql.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -45,15 +41,18 @@ impl Connection for SqliteConnection {
                 .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
             let col_names = stmt.column_names();
             if col_names.is_empty() {
-                return Err(CoreError::QueryFailed("Statement does not return rows".to_string()));
+                return Err(CoreError::QueryFailed(
+                    "Statement does not return rows".to_string(),
+                ));
             }
-            let columns: Vec<ColumnInfo> = col_names.iter().map(|name| {
-                ColumnInfo {
+            let columns: Vec<ColumnInfo> = col_names
+                .iter()
+                .map(|name| ColumnInfo {
                     name: name.to_string(),
                     type_hint: TypeHint::Other,
                     nullable: true,
-                }
-            }).collect();
+                })
+                .collect();
 
             let mut rows = Vec::new();
             let mut rows_iter = stmt
@@ -81,12 +80,9 @@ impl Connection for SqliteConnection {
 
     // execute_multi uses the default impl: tries query(), falls back to execute()
 
-    async fn execute_multi(
-        &mut self,
-        sql: &str,
-    ) -> Result<Vec<StatementResult>, CoreError> {
-        let statements = split_sqlite_statements(sql)
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, CoreError> {
+        let statements =
+            split_sqlite_statements(sql).map_err(|e| CoreError::QueryFailed(e.to_string()))?;
         let mut results = Vec::with_capacity(statements.len());
         for stmt in statements {
             let stmt = stmt.trim();
@@ -110,10 +106,7 @@ impl Connection for SqliteConnection {
         Ok(())
     }
 
-    async fn list_tables(
-        &mut self,
-        _schema: Option<&str>,
-    ) -> Result<Vec<String>, CoreError> {
+    async fn list_tables(&mut self, _schema: Option<&str>) -> Result<Vec<String>, CoreError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let guard = conn.lock().unwrap();
@@ -145,13 +138,14 @@ impl Connection for SqliteConnection {
                 .prepare(&sql)
                 .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
             let col_names = stmt.column_names();
-            let columns: Vec<ColumnInfo> = col_names.iter().map(|name| {
-                ColumnInfo {
+            let columns: Vec<ColumnInfo> = col_names
+                .iter()
+                .map(|name| ColumnInfo {
                     name: name.to_string(),
                     type_hint: TypeHint::String,
                     nullable: true,
-                }
-            }).collect();
+                })
+                .collect();
             let mut rows = Vec::new();
             let mut rows_iter = stmt
                 .query([])
@@ -176,11 +170,14 @@ impl Connection for SqliteConnection {
     }
 }
 
-pub async fn connect(_url: &DatabaseUrl, _opts: &ConnectOptions) -> Result<SqliteConnection, CoreError> {
+pub async fn connect(
+    _url: &DatabaseUrl,
+    _opts: &ConnectOptions,
+) -> Result<SqliteConnection, CoreError> {
     let path = _url.path().to_string();
     tokio::task::spawn_blocking(move || {
-        let conn = SqliteConn::open(&path)
-            .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+        let conn =
+            SqliteConn::open(&path).map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
         Ok(SqliteConnection {
             conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
         })

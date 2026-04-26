@@ -1,7 +1,7 @@
 use crate::error::CliError;
 use dashmap::DashMap;
 use ferrule_core::connection::{ConnectOptions, StatementResult};
-use ferrule_core::formatter::{OutputFormat, format_result};
+use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::url::DatabaseUrl;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -154,16 +154,14 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
                         Ok(summary) => {
                             vec![StatementResult::Summary(summary)]
                         }
-                        Err(_) => {
-                            match guard.execute_multi(&paged_sql).await {
-                                Ok(res) => res,
-                                Err(e) => {
-                                    return Response::Err {
-                                        message: e.to_string(),
-                                    };
-                                }
+                        Err(_) => match guard.execute_multi(&paged_sql).await {
+                            Ok(res) => res,
+                            Err(e) => {
+                                return Response::Err {
+                                    message: e.to_string(),
+                                };
                             }
-                        }
+                        },
                     }
                 }
                 Err(e) => {
@@ -191,9 +189,7 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
                 }
             };
 
-            Response::Ok {
-                payload: rendered,
-            }
+            Response::Ok { payload: rendered }
         }
         Request::Execute { sql, url, insecure } => {
             let db_url = match DatabaseUrl::parse(&url) {
@@ -365,7 +361,9 @@ fn port_file() -> Option<PathBuf> {
 async fn bind_listener() -> Result<tokio::net::UnixListener, CliError> {
     let path = socket_path().ok_or_else(|| CliError::usage("Could not determine socket path."))?;
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(CliError::Io)?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(CliError::Io)?;
     }
     let _ = tokio::fs::remove_file(&path).await;
     let listener = tokio::net::UnixListener::bind(&path).map_err(CliError::Io)?;
@@ -381,7 +379,9 @@ async fn bind_listener() -> Result<tokio::net::UnixListener, CliError> {
 #[cfg(not(unix))]
 async fn bind_listener() -> Result<tokio::net::TcpListener, CliError> {
     let dir = cache_dir().ok_or_else(|| CliError::usage("Could not determine cache directory."))?;
-    tokio::fs::create_dir_all(&dir).await.map_err(CliError::Io)?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(CliError::Io)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(CliError::Io)?;
@@ -393,7 +393,9 @@ async fn bind_listener() -> Result<tokio::net::TcpListener, CliError> {
     Ok(listener)
 }
 
-async fn read_json_line<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<Request, Box<dyn std::error::Error + Send + Sync>> {
+async fn read_json_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> Result<Request, Box<dyn std::error::Error + Send + Sync>> {
     let mut line = String::new();
     reader.read_line(&mut line).await?;
     let req = serde_json::from_str(line.trim())?;
@@ -477,13 +479,17 @@ pub async fn run_daemon_server() -> Result<(), CliError> {
 }
 
 #[cfg(unix)]
-async fn accept_conn(listener: &tokio::net::UnixListener) -> Result<tokio::net::UnixStream, std::io::Error> {
+async fn accept_conn(
+    listener: &tokio::net::UnixListener,
+) -> Result<tokio::net::UnixStream, std::io::Error> {
     let (stream, _) = listener.accept().await?;
     Ok(stream)
 }
 
 #[cfg(not(unix))]
-async fn accept_conn(listener: &tokio::net::TcpListener) -> Result<tokio::net::TcpStream, std::io::Error> {
+async fn accept_conn(
+    listener: &tokio::net::TcpListener,
+) -> Result<tokio::net::TcpStream, std::io::Error> {
     let (stream, _) = listener.accept().await?;
     Ok(stream)
 }
@@ -655,10 +661,7 @@ pub async fn daemon_status() -> Result<(), CliError> {
 }
 
 pub async fn is_daemon_running() -> bool {
-    matches!(
-        send_request(&Request::Ping).await,
-        Ok(Response::Ok { .. })
-    )
+    matches!(send_request(&Request::Ping).await, Ok(Response::Ok { .. }))
 }
 
 /// Execute a query through the daemon, returning the formatted payload.

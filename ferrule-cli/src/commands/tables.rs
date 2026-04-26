@@ -1,10 +1,10 @@
 use super::TablesArgs;
 use crate::error::CliError;
+use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::connect;
 use ferrule_core::connection::{ConnectOptions, QueryResult};
 use ferrule_core::formatter::format_result;
 use ferrule_core::value::{ColumnInfo, TypeHint, Value};
-use ferrule_config::profile::GlobalConfig;
 
 pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);
@@ -22,12 +22,7 @@ pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), C
     // Route through daemon if requested
     if args.conn_flags.daemon {
         eprintln!("[ferrule] Routing via daemon...");
-        let payload = crate::daemon::daemon_tables(
-            &url,
-            args.conn_flags.insecure,
-            None,
-        )
-        .await?;
+        let payload = crate::daemon::daemon_tables(&url, args.conn_flags.insecure, None).await?;
         println!("{}", payload);
         return Ok(());
     }
@@ -44,10 +39,7 @@ pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), C
     let conn_time = conn_start.elapsed();
 
     let query_start = std::time::Instant::now();
-    let names = conn
-        .list_tables(None)
-        .await
-        .map_err(CliError::query)?;
+    let names = conn.list_tables(None).await.map_err(CliError::query)?;
     let query_time = query_start.elapsed();
 
     let mut result = QueryResult {
@@ -56,10 +48,7 @@ pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), C
             type_hint: TypeHint::String,
             nullable: true,
         }],
-        rows: names
-            .into_iter()
-            .map(|n| vec![Value::String(n)])
-            .collect(),
+        rows: names.into_iter().map(|n| vec![Value::String(n)]).collect(),
     };
 
     // Apply client-side offset

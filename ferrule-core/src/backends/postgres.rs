@@ -1,10 +1,10 @@
-use async_trait::async_trait;
 use crate::connection::{
-    Connection, ConnectOptions, ExecutionSummary, QueryResult, StatementResult,
+    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
+use async_trait::async_trait;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
 use tokio_postgres::types::Type;
@@ -15,10 +15,7 @@ pub struct PostgresConnection {
 
 #[async_trait]
 impl Connection for PostgresConnection {
-    async fn execute(
-        &mut self,
-        sql: &str,
-    ) -> Result<ExecutionSummary, CoreError> {
+    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError> {
         let rows_affected = self
             .client
             .execute(sql, &[])
@@ -30,10 +27,7 @@ impl Connection for PostgresConnection {
         })
     }
 
-    async fn query(
-        &mut self,
-        sql: &str,
-    ) -> Result<QueryResult, CoreError> {
+    async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError> {
         let rows = self
             .client
             .query(sql, &[])
@@ -71,10 +65,7 @@ impl Connection for PostgresConnection {
         })
     }
 
-    async fn execute_multi(
-        &mut self,
-        sql: &str,
-    ) -> Result<Vec<StatementResult>, CoreError> {
+    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, CoreError> {
         let msgs = self
             .client
             .simple_query(sql)
@@ -143,10 +134,7 @@ impl Connection for PostgresConnection {
         Ok(())
     }
 
-    async fn list_tables(
-        &mut self,
-        schema: Option<&str>,
-    ) -> Result<Vec<String>, CoreError> {
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError> {
         let schema = schema.unwrap_or("public");
         let rows = self
             .client
@@ -262,7 +250,9 @@ pub async fn connect(
         Err(_) => build_config_from_url(url)?,
     };
 
-    let tls_connector = build_tls_connector(opts).await.map_err(CoreError::TlsError)?;
+    let tls_connector = build_tls_connector(opts)
+        .await
+        .map_err(CoreError::TlsError)?;
 
     let (client, connection) = config
         .connect(tls_connector)
@@ -395,25 +385,86 @@ fn pg_to_value(row: &tokio_postgres::Row, col: usize, pg_type: &Type) -> Value {
 
     // For nullable types, try Option first
     match pg_type {
-        &Type::BOOL => row.try_get::<_, Option<bool>>(col).unwrap_or(None).map(Value::Bool).unwrap_or(Value::Null),
-        &Type::INT2 => row.try_get::<_, Option<i16>>(col).unwrap_or(None).map(|v| Value::Int64(i64::from(v))).unwrap_or(Value::Null),
-        &Type::INT4 => row.try_get::<_, Option<i32>>(col).unwrap_or(None).map(|v| Value::Int64(i64::from(v))).unwrap_or(Value::Null),
-        &Type::INT8 => row.try_get::<_, Option<i64>>(col).unwrap_or(None).map(Value::Int64).unwrap_or(Value::Null),
-        &Type::FLOAT4 => row.try_get::<_, Option<f32>>(col).unwrap_or(None).map(|v| Value::Float64(f64::from(v))).unwrap_or(Value::Null),
-        &Type::FLOAT8 => row.try_get::<_, Option<f64>>(col).unwrap_or(None).map(Value::Float64).unwrap_or(Value::Null),
-        &Type::NUMERIC => row.try_get::<_, Option<rust_decimal::Decimal>>(col)
+        &Type::BOOL => row
+            .try_get::<_, Option<bool>>(col)
+            .unwrap_or(None)
+            .map(Value::Bool)
+            .unwrap_or(Value::Null),
+        &Type::INT2 => row
+            .try_get::<_, Option<i16>>(col)
+            .unwrap_or(None)
+            .map(|v| Value::Int64(i64::from(v)))
+            .unwrap_or(Value::Null),
+        &Type::INT4 => row
+            .try_get::<_, Option<i32>>(col)
+            .unwrap_or(None)
+            .map(|v| Value::Int64(i64::from(v)))
+            .unwrap_or(Value::Null),
+        &Type::INT8 => row
+            .try_get::<_, Option<i64>>(col)
+            .unwrap_or(None)
+            .map(Value::Int64)
+            .unwrap_or(Value::Null),
+        &Type::FLOAT4 => row
+            .try_get::<_, Option<f32>>(col)
+            .unwrap_or(None)
+            .map(|v| Value::Float64(f64::from(v)))
+            .unwrap_or(Value::Null),
+        &Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(col)
+            .unwrap_or(None)
+            .map(Value::Float64)
+            .unwrap_or(Value::Null),
+        &Type::NUMERIC => row
+            .try_get::<_, Option<rust_decimal::Decimal>>(col)
             .unwrap_or(None)
             .map(|d| Value::Decimal(d.to_string()))
             .unwrap_or(Value::Null),
-        &Type::TEXT | &Type::VARCHAR | &Type::BPCHAR | &Type::NAME => row.try_get::<_, Option<String>>(col).unwrap_or(None).map(Value::String).unwrap_or(Value::Null),
-        &Type::BYTEA => row.try_get::<_, Option<Vec<u8>>>(col).unwrap_or(None).map(Value::Bytes).unwrap_or(Value::Null),
-        &Type::DATE => row.try_get::<_, Option<chrono::NaiveDate>>(col).unwrap_or(None).map(Value::Date).unwrap_or(Value::Null),
-        &Type::TIME => row.try_get::<_, Option<chrono::NaiveTime>>(col).unwrap_or(None).map(Value::Time).unwrap_or(Value::Null),
-        &Type::TIMESTAMP => row.try_get::<_, Option<chrono::NaiveDateTime>>(col).unwrap_or(None).map(Value::DateTime).unwrap_or(Value::Null),
-        &Type::TIMESTAMPTZ => row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(col).unwrap_or(None).map(Value::DateTimeTz).unwrap_or(Value::Null),
-        &Type::JSON | &Type::JSONB => row.try_get::<_, Option<serde_json::Value>>(col).unwrap_or(None).map(Value::Json).unwrap_or(Value::Null),
-        &Type::UUID => row.try_get::<_, Option<uuid::Uuid>>(col).unwrap_or(None).map(|u| Value::Uuid(u.to_string())).unwrap_or(Value::Null),
+        &Type::TEXT | &Type::VARCHAR | &Type::BPCHAR | &Type::NAME => row
+            .try_get::<_, Option<String>>(col)
+            .unwrap_or(None)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        &Type::BYTEA => row
+            .try_get::<_, Option<Vec<u8>>>(col)
+            .unwrap_or(None)
+            .map(Value::Bytes)
+            .unwrap_or(Value::Null),
+        &Type::DATE => row
+            .try_get::<_, Option<chrono::NaiveDate>>(col)
+            .unwrap_or(None)
+            .map(Value::Date)
+            .unwrap_or(Value::Null),
+        &Type::TIME => row
+            .try_get::<_, Option<chrono::NaiveTime>>(col)
+            .unwrap_or(None)
+            .map(Value::Time)
+            .unwrap_or(Value::Null),
+        &Type::TIMESTAMP => row
+            .try_get::<_, Option<chrono::NaiveDateTime>>(col)
+            .unwrap_or(None)
+            .map(Value::DateTime)
+            .unwrap_or(Value::Null),
+        &Type::TIMESTAMPTZ => row
+            .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(col)
+            .unwrap_or(None)
+            .map(Value::DateTimeTz)
+            .unwrap_or(Value::Null),
+        &Type::JSON | &Type::JSONB => row
+            .try_get::<_, Option<serde_json::Value>>(col)
+            .unwrap_or(None)
+            .map(Value::Json)
+            .unwrap_or(Value::Null),
+        &Type::UUID => row
+            .try_get::<_, Option<uuid::Uuid>>(col)
+            .unwrap_or(None)
+            .map(|u| Value::Uuid(u.to_string()))
+            .unwrap_or(Value::Null),
         // Arrays and anything else: fall back to string representation
-        _ => row.try_get::<_, Option<String>>(col).unwrap_or(None).map(Value::String).unwrap_or(Value::Null),
+        _ => row
+            .try_get::<_, Option<String>>(col)
+            .unwrap_or(None)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
     }
 }

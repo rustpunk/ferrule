@@ -1,9 +1,9 @@
 use super::DescribeArgs;
 use crate::error::CliError;
+use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::connect;
 use ferrule_core::connection::ConnectOptions;
 use ferrule_core::formatter::format_result;
-use ferrule_config::profile::GlobalConfig;
 
 pub async fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);
@@ -19,13 +19,9 @@ pub async fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(),
     // Route through daemon if requested
     if args.conn_flags.daemon {
         eprintln!("[ferrule] Routing via daemon...");
-        let payload = crate::daemon::daemon_describe(
-            &url,
-            args.conn_flags.insecure,
-            None,
-            &args.table,
-        )
-        .await?;
+        let payload =
+            crate::daemon::daemon_describe(&url, args.conn_flags.insecure, None, &args.table)
+                .await?;
         println!("{}", payload);
         return Ok(());
     }
