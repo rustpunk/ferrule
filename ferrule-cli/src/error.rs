@@ -1,10 +1,9 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use std::fmt;
 use thiserror::Error;
 
 /// Exit codes used by the ferrule binary.
 pub mod exit {
+    #[allow(dead_code)]
     pub const SUCCESS: i32 = 0;
     pub const USAGE: i32 = 1;
     pub const CONNECTION: i32 = 2;
@@ -37,6 +36,7 @@ pub enum CliError {
     Usage(String),
 
     #[error("no rows returned")]
+    #[allow(dead_code)]
     NoRows,
 }
 

@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use crate::error::ConfigError;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};

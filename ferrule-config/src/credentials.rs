@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use secrecy::SecretString;
 
 /// Resolve a password from the environment (`FERRULE_{NAME}_PASSWORD`).

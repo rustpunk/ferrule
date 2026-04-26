@@ -1,12 +1,10 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use async_trait::async_trait;
 use crate::connection::{Connection, ConnectOptions, ExecutionSummary, QueryResult, StatementResult};
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use secrecy::ExposeSecret;
-use chrono::{NaiveDate, NaiveTime, NaiveDateTime, Utc, TimeZone};
+use chrono::{NaiveDate, NaiveTime, NaiveDateTime, Utc};
 use mysql_async::prelude::Queryable;
 
 pub struct MySqlConnection {

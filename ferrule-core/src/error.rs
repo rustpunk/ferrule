@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use thiserror::Error;
 
 /// Errors originating in `ferrule-core`.

@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use ferrule_core::formatter::OutputFormat;
 use is_terminal::IsTerminal;
 

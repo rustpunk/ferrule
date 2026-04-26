@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use crate::error::CoreError;
 use indexmap::IndexMap;
 use secrecy::SecretString;

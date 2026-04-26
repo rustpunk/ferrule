@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use crate::backends;
 use crate::connection::{Connection, ConnectOptions};
 use crate::error::CoreError;

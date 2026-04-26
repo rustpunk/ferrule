@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use crate::connection::QueryResult;
 use crate::error::CoreError;
 use crate::value::Value;

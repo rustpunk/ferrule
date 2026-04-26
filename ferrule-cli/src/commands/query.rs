@@ -1,9 +1,7 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use super::QueryArgs;
 use crate::error::CliError;
 use ferrule_core::backend::connect;
-use ferrule_core::connection::{ConnectOptions, ExecutionSummary, QueryResult, StatementResult};
+use ferrule_core::connection::{ConnectOptions, QueryResult, StatementResult};
 use ferrule_core::formatter::{OutputFormat, format_result};
 
 fn render_query_result(

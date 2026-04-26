@@ -1,10 +1,8 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use async_trait::async_trait;
 use crate::connection::{Connection, ConnectOptions, ExecutionSummary, QueryResult, StatementResult};
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
-use crate::value::{ColumnInfo, Row, TypeHint, Value};
+use crate::value::{ColumnInfo, TypeHint, Value};
 use rusqlite::Connection as SqliteConn;
 use rusqlite::types::Value as SqliteValue;
 

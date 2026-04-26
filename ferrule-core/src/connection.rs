@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use async_trait::async_trait;
 use crate::error::CoreError;
 use crate::value::{ColumnInfo, Row};

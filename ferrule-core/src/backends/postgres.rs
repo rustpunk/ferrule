@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use async_trait::async_trait;
 use crate::connection::{
     Connection, ConnectOptions, ExecutionSummary, QueryResult, StatementResult,
@@ -8,7 +6,6 @@ use crate::error::CoreError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use secrecy::ExposeSecret;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio_postgres::types::Type;
 

@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 pub mod conn;
 pub mod describe;
 pub mod query;
@@ -7,7 +5,6 @@ pub mod tables;
 
 use crate::error::CliError;
 use clap::{Args, Subcommand};
-use ferrule_core::connection::ConnectOptions;
 use ferrule_core::url::DatabaseUrl;
 use ferrule_config::registry::ConnectionRegistry;
 use secrecy::ExposeSecret;

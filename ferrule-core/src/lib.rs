@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 //! `ferrule-core` — Backend drivers, unified types, URL parsing, and formatters.
 
 pub mod backend;

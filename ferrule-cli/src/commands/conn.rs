@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use super::{ConnArgs, ConnCommand};
 use crate::error::CliError;
 use ferrule_config::registry::ConnectionRegistry;

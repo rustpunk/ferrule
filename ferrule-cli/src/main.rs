@@ -1,7 +1,4 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 use clap::{Parser, Subcommand};
-use ferrule_config::registry::ConnectionRegistry;
 
 mod commands;
 mod error;
