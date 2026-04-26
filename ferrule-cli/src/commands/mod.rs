@@ -249,6 +249,12 @@ pub struct QueryArgs {
     #[arg(short = 'p', long)]
     pub password: Option<String>,
 
+    /// JMESPath expression applied to JSON output before printing.
+    ///
+    /// Implies --format json. Errors fail with exit code 3.
+    #[arg(long, value_name = "EXPR")]
+    pub filter: Option<String>,
+
     /// Dry run — print without executing
     #[arg(long)]
     pub dry_run: bool,

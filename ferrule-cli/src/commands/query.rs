@@ -7,6 +7,29 @@ use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::{infer_type, parse_param, substitute, ParameterSet};
 
+/// Apply an optional JMESPath filter to a rendered JSON string.
+///
+/// When `filter` is `None` the input string is returned unchanged. When set,
+/// the string is parsed, filtered, and re-serialized (pretty). Any JMESPath
+/// or JSON error is mapped to `CliError::Query` so the binary exits with
+/// code 3 — the same class as a SQL execution failure.
+fn maybe_apply_filter(rendered: String, filter: Option<&str>) -> Result<String, CliError> {
+    let Some(expr) = filter else {
+        return Ok(rendered);
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).map_err(|e| {
+        CliError::query(ferrule_core::CoreError::QueryFailed(format!(
+            "filter expects JSON output but rendered output is not valid JSON: {e}"
+        )))
+    })?;
+    let filtered = crate::output::apply_filter(parsed, expr).map_err(|e| {
+        CliError::query(ferrule_core::CoreError::QueryFailed(e))
+    })?;
+    serde_json::to_string_pretty(&filtered).map_err(|e| {
+        CliError::query(ferrule_core::CoreError::QueryFailed(e.to_string()))
+    })
+}
+
 fn render_query_result(
     result: &QueryResult,
     format: OutputFormat,
@@ -64,7 +87,28 @@ fn print_explain_payload(payload: &str, out: ExplainOutput) {
 }
 
 pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
-    let format = args.output.resolve_format(global_config);
+    // Validate --filter precondition before resolving format.
+    // Filter operates on JSON, so it implies --format json.
+    let format = if args.filter.is_some() {
+        match args.output.format.as_deref() {
+            None => OutputFormat::Json,
+            Some(s) if s.eq_ignore_ascii_case("json") => OutputFormat::Json,
+            Some(other) => {
+                return Err(CliError::usage(format!(
+                    "--filter requires --format json (got --format {other})"
+                )));
+            }
+        }
+    } else {
+        args.output.resolve_format(global_config)
+    };
+
+    if args.filter.is_some() && args.explain {
+        return Err(CliError::usage(
+            "--filter cannot be combined with --explain.",
+        ));
+    }
+
     let limit = args.output.resolve_limit(global_config);
     let offset = args.output.offset;
 
@@ -172,6 +216,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             offset,
         )
         .await?;
+        let payload = maybe_apply_filter(payload, args.filter.as_deref())?;
         println!("{}", payload);
         return Ok(());
     }
@@ -210,10 +255,25 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     if results.len() == 1 {
         let rendered = render_single_result(&results[0], format, limit, offset)?;
         match &results[0] {
-            StatementResult::Query(_) => println!("{}", rendered),
-            StatementResult::Summary(_) => eprintln!("{}", rendered),
+            StatementResult::Query(_) => {
+                let filtered = maybe_apply_filter(rendered, args.filter.as_deref())?;
+                println!("{}", filtered);
+            }
+            StatementResult::Summary(_) => {
+                if args.filter.is_some() {
+                    return Err(CliError::usage(
+                        "--filter requires a SELECT-style query that returns rows.",
+                    ));
+                }
+                eprintln!("{}", rendered);
+            }
         }
     } else {
+        if args.filter.is_some() {
+            return Err(CliError::usage(
+                "--filter cannot be applied to multi-statement queries.",
+            ));
+        }
         for (i, result) in results.iter().enumerate() {
             match result {
                 StatementResult::Query(_) => {
