@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_infer_float() {
-        assert_eq!(infer_type("3.14"), Value::Float64(3.14));
+        assert_eq!(infer_type("2.5"), Value::Float64(2.5));
     }
 
     #[test]

@@ -192,8 +192,30 @@ fn format_sql(
     Ok(lines.join("\n"))
 }
 
-/// Naive identifier quoting — wraps in double quotes.
-/// TODO: escape embedded double quotes.
+/// SQL-standard identifier quoting: wraps in double quotes and doubles
+/// any embedded double-quote characters.
 fn quote_identifier(id: &str) -> String {
-    format!("\"{}\"", id)
+    format!("\"{}\"", id.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_identifier_wraps_in_double_quotes() {
+        assert_eq!(quote_identifier("users"), "\"users\"");
+    }
+
+    #[test]
+    fn quote_identifier_escapes_embedded_quotes() {
+        assert_eq!(quote_identifier("a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote_identifier("\"\""), "\"\"\"\"\"\"");
+    }
+
+    #[test]
+    fn quote_identifier_preserves_other_chars() {
+        assert_eq!(quote_identifier("col with space"), "\"col with space\"");
+        assert_eq!(quote_identifier("snake_case_99"), "\"snake_case_99\"");
+    }
 }

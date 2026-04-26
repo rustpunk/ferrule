@@ -276,3 +276,192 @@ fn split_sqlite_statements(sql: &str) -> Result<Vec<&str>, String> {
 
     Ok(statements)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Returns a fresh on-disk SQLite URL. Each call yields a unique path so
+    /// concurrent tests do not collide.
+    fn fresh_test_url() -> (String, std::path::PathBuf) {
+        let pid = std::process::id();
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("ferrule-sqlite-test-{pid}-{n}.db"));
+        let _ = std::fs::remove_file(&path);
+        let url = format!("sqlite://{}", path.display());
+        (url, path)
+    }
+
+    /// Connect to a fresh on-disk SQLite database, returning the connection
+    /// and the path so the caller can clean up.
+    async fn fresh_conn() -> (SqliteConnection, std::path::PathBuf) {
+        let (raw_url, path) = fresh_test_url();
+        let url = DatabaseUrl::parse(&raw_url).expect("parse sqlite URL");
+        let conn = connect(&url, &ConnectOptions::default())
+            .await
+            .expect("connect should succeed");
+        (conn, path)
+    }
+
+    /// Seed the standard test_users table; mirrors the schemas used for the
+    /// other backends (see CLAUDE.md "How to Test").
+    async fn seed_test_users(conn: &mut SqliteConnection) {
+        conn.execute(
+            "CREATE TABLE test_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                age INTEGER,
+                score REAL,
+                active INTEGER,
+                meta TEXT
+            )",
+        )
+        .await
+        .expect("create table");
+        conn.execute("INSERT INTO test_users (name, age, score, active, meta) VALUES ('Alice', 30, 99.5, 1, '{\"role\":\"admin\"}')")
+            .await
+            .expect("insert alice");
+        conn.execute("INSERT INTO test_users (name, age, score, active, meta) VALUES ('Bob', 25, 88.25, 0, '{\"role\":\"user\"}')")
+            .await
+            .expect("insert bob");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_ping() {
+        let (mut conn, path) = fresh_conn().await;
+        conn.ping().await.expect("ping should succeed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_query() {
+        let (mut conn, path) = fresh_conn().await;
+        seed_test_users(&mut conn).await;
+        let result = conn
+            .query("SELECT * FROM test_users ORDER BY id")
+            .await
+            .expect("query should succeed");
+        assert_eq!(result.columns.len(), 6, "expected 6 columns");
+        assert_eq!(result.rows.len(), 2, "expected 2 seeded rows");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_execute() {
+        let (mut conn, path) = fresh_conn().await;
+        seed_test_users(&mut conn).await;
+        let summary = conn
+            .execute("INSERT INTO test_users (name, age) VALUES ('Charlie', 35)")
+            .await
+            .expect("execute should succeed");
+        assert_eq!(
+            summary.rows_affected,
+            Some(1),
+            "expected exactly one row inserted"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_list_tables() {
+        let (mut conn, path) = fresh_conn().await;
+        seed_test_users(&mut conn).await;
+        conn.execute("CREATE TABLE other (id INTEGER)")
+            .await
+            .expect("create other");
+        let tables = conn.list_tables(None).await.expect("list_tables");
+        assert!(tables.contains(&"test_users".to_string()));
+        assert!(tables.contains(&"other".to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_describe_table() {
+        let (mut conn, path) = fresh_conn().await;
+        seed_test_users(&mut conn).await;
+        let result = conn
+            .describe_table(None, "test_users")
+            .await
+            .expect("describe");
+        // PRAGMA table_info returns one row per column: cid, name, type, notnull, dflt_value, pk.
+        assert!(
+            result.rows.len() >= 6,
+            "expected >=6 columns in test_users, got {}",
+            result.rows.len()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_type_mapping() {
+        let (mut conn, path) = fresh_conn().await;
+        // Build a row that exercises each SqliteValue branch in sqlite_to_value.
+        conn.execute(
+            "CREATE TABLE typed (
+                i INTEGER,
+                r REAL,
+                t TEXT,
+                b BLOB,
+                n INTEGER
+            )",
+        )
+        .await
+        .expect("create typed");
+        conn.execute("INSERT INTO typed VALUES (42, 2.5, 'hi', x'deadbeef', NULL)")
+            .await
+            .expect("insert typed");
+
+        let result = conn
+            .query("SELECT i, r, t, b, n FROM typed")
+            .await
+            .expect("query typed");
+        let row = &result.rows[0];
+        assert!(matches!(row[0], Value::Int64(42)), "i should be Int64(42)");
+        assert!(
+            matches!(row[1], Value::Float64(f) if (f - 2.5).abs() < 1e-9),
+            "r should be Float64(~2.5)"
+        );
+        assert!(
+            matches!(&row[2], Value::String(s) if s == "hi"),
+            "t should be String('hi')"
+        );
+        assert!(
+            matches!(&row[3], Value::Bytes(b) if b == &vec![0xde, 0xad, 0xbe, 0xef]),
+            "b should be Bytes(0xDEADBEEF)"
+        );
+        assert!(matches!(row[4], Value::Null), "n should be Null");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_execute_multi() {
+        let (mut conn, path) = fresh_conn().await;
+        let results = conn
+            .execute_multi(
+                "CREATE TABLE m (id INTEGER); \
+                 INSERT INTO m VALUES (1); \
+                 INSERT INTO m VALUES (2); \
+                 SELECT COUNT(*) AS c FROM m;",
+            )
+            .await
+            .expect("execute_multi");
+        assert_eq!(results.len(), 4, "expected 4 statement results");
+        match results.last().unwrap() {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows.len(), 1);
+                assert!(matches!(qr.rows[0][0], Value::Int64(2)));
+            }
+            other => panic!("last result should be Query, got {:?}", other),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_escape_sqlite_identifier_doubles_quotes() {
+        assert_eq!(escape_sqlite_identifier("plain"), "\"plain\"");
+        assert_eq!(escape_sqlite_identifier("a\"b"), "\"a\"\"b\"");
+    }
+}

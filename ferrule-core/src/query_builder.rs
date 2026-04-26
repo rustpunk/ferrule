@@ -108,6 +108,7 @@ fn build_limit_offset_paging(sql: &str, limit: usize, offset: usize) -> String {
     }
 }
 
+#[cfg(feature = "mssql")]
 fn build_mssql_paging(
     sql: &str,
     upper: &str,
@@ -127,7 +128,7 @@ fn build_mssql_paging(
     Ok(result)
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "oracle")]
 fn build_oracle_paging(
     sql: &str,
     upper: &str,

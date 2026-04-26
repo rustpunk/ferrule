@@ -468,3 +468,154 @@ fn pg_to_value(row: &tokio_postgres::Row, col: usize, pg_type: &Type) -> Value {
             .unwrap_or(Value::Null),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Container URL pinned in CLAUDE.md "How to Test → Postgres". Tests skip
+    /// gracefully when the container is not running, so they're safe in CI
+    /// environments without docker.
+    const TEST_POSTGRES_URL: &str =
+        "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable";
+
+    async fn try_connect() -> Option<PostgresConnection> {
+        let url = DatabaseUrl::parse(TEST_POSTGRES_URL).ok()?;
+        let conn = connect(&url, &ConnectOptions::default()).await.ok()?;
+        Some(conn)
+    }
+
+    #[tokio::test]
+    async fn test_postgres_ping() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("Postgres test container not available, skipping test_postgres_ping");
+            return;
+        };
+        conn.ping().await.expect("ping should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_postgres_query() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("Postgres test container not available, skipping test_postgres_query");
+            return;
+        };
+        let result = conn
+            .query("SELECT * FROM test_users")
+            .await
+            .expect("query should succeed");
+        assert!(!result.columns.is_empty(), "should have columns");
+        assert!(!result.rows.is_empty(), "should have rows");
+    }
+
+    #[tokio::test]
+    async fn test_postgres_execute() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("Postgres test container not available, skipping test_postgres_execute");
+            return;
+        };
+        let summary = conn
+            .execute("INSERT INTO test_users (name, age) VALUES ('TestUser', 99)")
+            .await
+            .expect("execute should succeed");
+        assert!(
+            summary.rows_affected.is_some_and(|n| n > 0),
+            "should have affected rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_postgres_list_tables() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("Postgres test container not available, skipping test_postgres_list_tables");
+            return;
+        };
+        let tables = conn
+            .list_tables(None)
+            .await
+            .expect("list_tables should succeed");
+        assert!(
+            tables.contains(&"test_users".to_string()),
+            "should contain test_users, got: {tables:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_postgres_describe_table() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_describe_table"
+            );
+            return;
+        };
+        let result = conn
+            .describe_table(None, "test_users")
+            .await
+            .expect("describe_table should succeed");
+        assert_eq!(result.columns.len(), 6, "should return 6 metadata columns");
+        let col_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(
+            col_names,
+            vec![
+                "column_name",
+                "data_type",
+                "is_nullable",
+                "column_default",
+                "numeric_precision",
+                "numeric_scale",
+            ]
+        );
+        // The seeded table has 8 columns (id/name/age/score/created_at/active/meta/uid).
+        assert!(
+            result.rows.len() >= 6,
+            "expected at least 6 rows, got {}",
+            result.rows.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_postgres_type_mapping() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("Postgres test container not available, skipping test_postgres_type_mapping");
+            return;
+        };
+        let result = conn
+            .query(
+                "SELECT name, age, score, active, meta, uid FROM test_users \
+                 WHERE name = 'Alice'",
+            )
+            .await
+            .expect("query should succeed");
+        assert_eq!(result.rows.len(), 1, "expected exactly Alice");
+        let row = &result.rows[0];
+        assert!(matches!(row[0], Value::String(_)), "name should be String");
+        assert!(matches!(row[1], Value::Int64(_)), "age should be Int64");
+        assert!(
+            matches!(row[2], Value::Decimal(_) | Value::Float64(_)),
+            "score (NUMERIC) should be Decimal or Float64"
+        );
+        assert!(matches!(row[3], Value::Bool(_)), "active should be Bool");
+        assert!(matches!(row[4], Value::Json(_)), "meta (JSONB) should be Json");
+        assert!(matches!(row[5], Value::Uuid(_)), "uid should be Uuid");
+    }
+
+    #[tokio::test]
+    async fn test_postgres_timestamptz_mapping() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_timestamptz_mapping"
+            );
+            return;
+        };
+        let result = conn
+            .query("SELECT created_at FROM test_users WHERE name = 'Alice'")
+            .await
+            .expect("query should succeed");
+        assert_eq!(result.rows.len(), 1);
+        assert!(
+            matches!(result.rows[0][0], Value::DateTimeTz(_)),
+            "created_at (TIMESTAMPTZ) should be DateTimeTz, got {:?}",
+            result.rows[0][0]
+        );
+    }
+}

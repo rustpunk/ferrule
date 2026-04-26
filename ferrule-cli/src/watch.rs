@@ -27,13 +27,6 @@ pub struct WatchOptions {
     pub print_lock: Arc<std::sync::Mutex<()>>,
 }
 
-/// A handle to a running background watch task.
-#[allow(dead_code)]
-pub struct WatchHandle {
-    pub running: Arc<AtomicBool>,
-    pub interval_secs: Arc<AtomicU64>,
-}
-
 /// Run the watch loop until the `running` flag is cleared.
 pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(), CliError> {
     let mut iteration = 0u64;

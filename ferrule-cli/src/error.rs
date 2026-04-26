@@ -2,13 +2,14 @@ use std::fmt;
 use thiserror::Error;
 
 /// Exit codes used by the ferrule binary.
+///
+/// `0` (success) is implicit via Rust's normal `main()` return.
+/// `4` (no rows) is reserved by the design contract for a future
+/// `--fail-on-empty` flag and will be re-added when that flag is wired up.
 pub mod exit {
-    #[allow(dead_code)]
-    pub const SUCCESS: i32 = 0;
     pub const USAGE: i32 = 1;
     pub const CONNECTION: i32 = 2;
     pub const QUERY: i32 = 3;
-    pub const NO_ROWS: i32 = 4;
 }
 
 /// CLI-level error type.
@@ -34,10 +35,6 @@ pub enum CliError {
 
     #[error("invalid usage: {0}")]
     Usage(String),
-
-    #[error("no rows returned")]
-    #[allow(dead_code)]
-    NoRows,
 }
 
 impl CliError {
@@ -65,7 +62,6 @@ impl CliError {
             Self::Registry(_) => exit::CONNECTION,
             Self::Io(_) => exit::QUERY,
             Self::Usage(_) => exit::USAGE,
-            Self::NoRows => exit::NO_ROWS,
         }
     }
 }
@@ -78,7 +74,6 @@ impl miette::Diagnostic for CliError {
             Self::Registry(_) => "ferrule::registry",
             Self::Io(_) => "ferrule::io",
             Self::Usage(_) => "ferrule::usage",
-            Self::NoRows => "ferrule::no_rows",
         }))
     }
 }
