@@ -1,5 +1,6 @@
 use crate::commands::{resolve_connection, OutputFlags};
 use crate::error::CliError;
+use ferrule_config::bookmarks::BookmarkStore;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_config::registry::ConnectionRegistry;
 use ferrule_core::backend::{connect, Backend};
@@ -357,6 +358,47 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
             }
             println!("Verbose: {}", if repl.state.verbose { "on" } else { "off" });
         }
+        "bookmark" => {
+            if args.is_empty() {
+                eprintln!("Usage: \\bookmark <subcommand> ...");
+                eprintln!("  save <name>   Save last SQL as bookmark");
+                eprintln!("  list          List bookmarks");
+                eprintln!("  run <name>   Run a bookmark");
+                eprintln!("  delete <name>  Delete a bookmark");
+            } else {
+                match args[0] {
+                    "save" => {
+                        if args.len() < 2 {
+                            eprintln!("Usage: \\bookmark save <name>");
+                        } else {
+                            cmd_bookmark_save(repl, args[1]);
+                        }
+                    }
+                    "list" => cmd_bookmark_list(),
+                    "run" => {
+                        if args.len() < 2 {
+                            eprintln!("Usage: \\bookmark run <name> [param1] ...");
+                        } else {
+                            let name = args[1];
+                            let params: Vec<String> =
+                                args[2..].iter().map(|s| s.to_string()).collect();
+                            cmd_bookmark_run(repl, name, &params, rt);
+                        }
+                    }
+                    "delete" => {
+                        if args.len() < 2 {
+                            eprintln!("Usage: \\bookmark delete <name>");
+                        } else {
+                            cmd_bookmark_delete(args[1]);
+                        }
+                    }
+                    _ => eprintln!(
+                        "Unknown bookmark subcommand: {}. Use save, list, run, delete.",
+                        args[0]
+                    ),
+                }
+            }
+        }
         "help" | "h" | "?" => print_help(),
         _ => eprintln!("Unknown meta-command: \\{}. Type \\help for help.", cmd),
     }
@@ -365,15 +407,19 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
 
 fn print_help() {
     println!("Meta-commands:");
-    println!("  \\q              Quit REPL");
-    println!("  \\conn [name]    Switch connection (or show current)");
-    println!("  \\d [table]      Describe table (or list tables if no table)");
-    println!("  \\dt [schema]    List tables");
-    println!("  \\format [fmt]   Set output format: table, json, csv, yaml, raw");
-    println!("  \\limit [N]      Set row limit (0 to clear)");
-    println!("  \\timing [on|off] Toggle timing display");
-    println!("  \\verbose [on|off] Toggle verbose logging");
-    println!("  \\help           Show this help");
+    println!("  \\q                   Quit REPL");
+    println!("  \\conn [name]         Switch connection (or show current)");
+    println!("  \\d [table]           Describe table (or list tables if no table)");
+    println!("  \\dt [schema]         List tables");
+    println!("  \\format [fmt]        Set output format: table, json, csv, yaml, raw");
+    println!("  \\limit [N]           Set row limit (0 to clear)");
+    println!("  \\timing [on|off]      Toggle timing display");
+    println!("  \\verbose [on|off]     Toggle verbose logging");
+    println!("  \\bookmark save <name>  Save last SQL as bookmark");
+    println!("  \\bookmark list          List bookmarks");
+    println!("  \\bookmark run <name>   Run a bookmark with optional params");
+    println!("  \\bookmark delete <name>  Delete a bookmark");
+    println!("  \\help                Show this help");
 }
 
 fn cmd_describe_table(repl: &mut Repl, table: &str, rt: &tokio::runtime::Handle) {
@@ -405,6 +451,134 @@ fn cmd_list_tables(repl: &mut Repl, schema: Option<&str>, rt: &tokio::runtime::H
             }
         }
         Err(e) => eprintln!("List tables failed: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bookmark helpers
+// ---------------------------------------------------------------------------
+
+fn cmd_bookmark_save(repl: &Repl, name: &str) {
+    let sql = match &repl.state.last_sql {
+        Some(s) => s.clone(),
+        None => {
+            eprintln!("No SQL to save. Execute a statement first.");
+            return;
+        }
+    };
+    let connection = resolve_connection_name_for_bookmark(repl);
+    let mut store = match BookmarkStore::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to load bookmarks: {e}");
+            return;
+        }
+    };
+
+    let full_name = if name.contains('.') {
+        name.to_string()
+    } else if let Some(ref conn_name) = connection {
+        format!("{}.{}", conn_name, name)
+    } else {
+        name.to_string()
+    };
+
+    let bm_connection = BookmarkStore::connection_hint(&full_name).map(|s| s.to_string());
+    store.insert(full_name.clone(), sql, bm_connection);
+    if let Err(e) = store.save() {
+        eprintln!("Failed to save bookmark: {e}");
+    } else {
+        println!("Bookmark '{}' saved.", full_name);
+    }
+}
+
+fn resolve_connection_name_for_bookmark(repl: &Repl) -> Option<String> {
+    // Try to find the current URL in the registry / profiles
+    if let Ok(registry) = ConnectionRegistry::load_default() {
+        for entry in registry.list() {
+            if let Ok(url) = DatabaseUrl::parse(&entry.url) {
+                if url.redacted() == repl.url.redacted() {
+                    return Some(entry.name.clone());
+                }
+            }
+        }
+    }
+    for (name, profile) in &repl.global_config.connection {
+        if let Ok(url) = DatabaseUrl::parse(&profile.url) {
+            if url.redacted() == repl.url.redacted() {
+                return Some(name.clone());
+            }
+        }
+    }
+    // Fallback: use host name from URL
+    repl.url.host().map(|h| h.to_string())
+}
+
+fn cmd_bookmark_list() {
+    let store = match BookmarkStore::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to load bookmarks: {e}");
+            return;
+        }
+    };
+    let entries = store.list();
+    if entries.is_empty() {
+        println!("No bookmarks saved.");
+        return;
+    }
+    let max_width = entries.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    println!("{:width$} | SQL", "Name", width = max_width);
+    println!("{}", "-".repeat(max_width + 3 + 60));
+    for (name, bm) in entries {
+        let truncated = if bm.sql.len() > 60 {
+            format!("{}...", &bm.sql[..57])
+        } else {
+            bm.sql.clone()
+        };
+        println!("{:width$} | {}", name, truncated, width = max_width);
+    }
+}
+
+fn cmd_bookmark_run(repl: &mut Repl, name: &str, params: &[String], rt: &tokio::runtime::Handle) {
+    let store = match BookmarkStore::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to load bookmarks: {e}");
+            return;
+        }
+    };
+    let bookmark = match store.get(name) {
+        Some(b) => b,
+        None => {
+            eprintln!("Bookmark '{}' not found.", name);
+            return;
+        }
+    };
+    let sql = BookmarkStore::resolve_params(&bookmark.sql, params);
+    if sql != bookmark.sql {
+        eprintln!("[ferrule] resolved SQL: {}", sql);
+    }
+    repl.execute_sql(&sql, rt);
+}
+
+fn cmd_bookmark_delete(name: &str) {
+    let mut store = match BookmarkStore::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to load bookmarks: {e}");
+            return;
+        }
+    };
+    match store.remove(name) {
+        Ok(()) => {
+            if let Err(e) = store.save() {
+                eprintln!("Failed to save bookmarks: {e}");
+            } else {
+                println!("Bookmark '{}' deleted.", name);
+            }
+        }
+        Err(e) => eprintln!("Failed to delete bookmark: {e}"),
     }
 }
 

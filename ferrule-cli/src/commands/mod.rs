@@ -1,9 +1,11 @@
+pub mod bookmark;
 pub mod conn;
 pub mod describe;
 pub mod query;
 pub mod repl;
 pub mod tables;
 
+pub use bookmark::BookmarkArgs;
 pub use repl::ReplArgs;
 
 use crate::error::CliError;
