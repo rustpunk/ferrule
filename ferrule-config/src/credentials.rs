@@ -91,3 +91,49 @@ fn warn_or_fail(url: &str, err: &hasp::Error) -> Option<crate::error::ConfigErro
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::ExposeSecret;
+
+    #[test]
+    fn explicit_password_returned_immediately() {
+        let secret = SecretString::new("hunter2".into());
+        let result = resolve_password_stack(
+            "prod",
+            Some(secret.clone()),
+            Some("env://SHOULD_NOT_BE_READ"),
+        );
+        assert_eq!(result.unwrap().unwrap().expose_secret(), "hunter2");
+    }
+
+    #[test]
+    fn password_url_resolved_via_hasp_env() {
+        std::env::set_var("FERRULE_TEST_HASP_PWD", "from_env");
+        let result = resolve_password_stack("test", None, Some("env://FERRULE_TEST_HASP_PWD"));
+        assert_eq!(result.unwrap().unwrap().expose_secret(), "from_env");
+        std::env::remove_var("FERRULE_TEST_HASP_PWD");
+    }
+
+    #[test]
+    fn legacy_env_var_via_hasp() {
+        std::env::set_var("FERRULE_LEGACY_ENV_PASSWORD", "legacy");
+        let result = resolve_password_stack("legacy-env", None, None);
+        assert_eq!(result.unwrap().unwrap().expose_secret(), "legacy");
+        std::env::remove_var("FERRULE_LEGACY_ENV_PASSWORD");
+    }
+
+    #[test]
+    fn not_found_falls_through_to_none() {
+        std::env::remove_var("FERRULE_NONEXISTENT_PASSWORD");
+        let result = resolve_password_stack("nonexistent", None, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn invalid_password_url_returns_error() {
+        let result = resolve_password_stack("test", None, Some("not-a-url"));
+        assert!(result.is_err());
+    }
+}
