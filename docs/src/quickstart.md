@@ -8,7 +8,8 @@ ferrule query "sqlite::memory:" "SELECT 1 + 1 AS answer;"
 ```
 
 Output (TTY defaults to table format):
-```
+
+```text
  answer
 --------
  42
@@ -48,20 +49,38 @@ ferrule bookmark run daily-count
 
 ## Password Resolution
 
-Ferrule resolves passwords via a stack:
+Ferrule resolves passwords via the `hasp` unified secret stack. For daily use, prefer the most secure option available in your environment:
 
-1. `--password` CLI flag
-2. `FERRULE_<NAME>_PASSWORD` environment variable
-3. OS keyring (`keyring://ferrule/<name>`)
-4. Interactive prompt (TTY only)
-5. Fail with diagnostic
+1. **`file://`** — mount secrets as files (Docker / Kubernetes). Not visible in `/proc/<pid>/environ`.
+2. **`keyring://`** — OS keyring. Encrypted at rest, isolated from other processes.
+3. **`env://`** — environment variable. Convenient but visible to other processes as the same user.
+4. **`FERRULE_<NAME>_PASSWORD`** — legacy env var fallback.
+5. **Interactive prompt** — TTY only; secret never touches disk or env.
+6. **`--password`** — **least secure**; leaks to shell history (`~/.bash_history`) and `ps`.
+
+### Recommended: `file://` in production
+
+```toml
+[connection.production]
+url = "postgres://app@db.example.com/myapp"
+password_url = "file:///run/secrets/db_password"
+```
+
+### Recommended: `keyring://` on workstations
 
 ```bash
-# Set via environment
-FERRULE_PRODUCTION_PASSWORD=secret ferrule query production "SELECT 1;"
-
-# Store in OS keyring
+# Store in OS keyring once
 ferrule conn set-password production
+
+# Use from now on
+ferrule query production "SELECT 1;"
+```
+
+### One-off debugging (avoid for real secrets)
+
+```bash
+# Leaks to shell history — only use for ephemeral testing
+ferrule query production "SELECT 1;" --password "my-secret"
 ```
 
 ## JSON Output with Paging

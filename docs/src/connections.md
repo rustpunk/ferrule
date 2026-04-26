@@ -31,6 +31,8 @@ ferrule query "mssql://sa:pass@127.0.0.1:1433/myapp?trustServerCertificate=true"
 
 ### URL Safety
 
+**Never embed passwords in URLs.** Even when saved, connection registry entries are stored as plain TOML. Always omit the password from the URL and let Ferrule resolve it through the credential stack.
+
 Passwords are **redacted** in all logs, error messages, and verbose diagnostics:
 
 ```bash
@@ -38,90 +40,71 @@ ferrule query --verbose "postgres://user:secret@host/db" "SELECT 1"
 # [ferrule] Resolved URL: postgres://user:***@host/db
 ```
 
-## Saving Named Connections
+## Security Recommendations
 
-Typing full URLs repeatedly is tedious and leaks passwords to shell history. Save named connections:
+Ferrule resolves passwords through the `hasp` unified secret stack. The options below are listed from **most secure** to **least secure**.
 
-```bash
-# Production database
-ferrule conn add production "postgres://app@prod.example.com/myapp"
+### Recommended: `file://` (Docker / Kubernetes secrets)
 
-# Local development copy
-ferrule conn add dev "postgres://localhost:5432/myapp_dev"
-
-# A read-only replica
-ferrule conn add replica "postgres://readonly@replica.internal/myapp"
-
-# Analytics warehouse on a different port
-ferrule conn add warehouse "postgres://analytics@warehouse.internal:8432/events"
-
-# Local SQLite file
-ferrule conn add local "sqlite:///home/me/projects/myapp/dev.db"
-```
-
-### Using Named Connections
-
-Anywhere a connection URL is expected, you can substitute the saved name:
-
-```bash
-# Query using a name
-ferrule query production "SELECT COUNT(*) FROM orders;"
-
-# List tables
-ferrule tables dev
-
-# Describe a table
-ferrule describe warehouse events
-
-# Start the REPL on a saved connection
-ferrule repl local
-
-# Watch a production metric
-ferrule watch replica "SELECT COUNT(*) FROM replication_lag;"
-```
-
-### Managing the Registry
-
-```bash
-# List all saved connections
-ferrule conn list
-# production  => postgres://app@prod.example.com/myapp
-# dev         => postgres://localhost:5432/myapp_dev
-# replica     => postgres://readonly@replica.internal/myapp
-# warehouse   => postgres://analytics@warehouse.internal:8432/events
-# local       => sqlite:///home/me/projects/myapp/dev.db
-
-# Test connectivity
-ferrule conn test production
-# Connection 'production' is alive.
-
-# Remove an entry
-ferrule conn remove warehouse
-```
-
-### Where Connections Are Stored
-
-```
-~/.config/ferrule/connections.toml
-```
-
-Format:
+Mount secrets as files. This is the most secure option because the secret is never exposed in environment variables (visible via `/proc/<pid>/environ`) or shell history.
 
 ```toml
-[production]
-name = "production"
-url = "postgres://app@prod.example.com/myapp"
+[connection.production]
+url = "postgres://app@db.example.com/myapp"
+password_url = "file:///run/secrets/db_password"
+```
 
-[dev]
-name = "dev"
-url = "postgres://localhost:5432/myapp_dev"
+Use `?raw=true` if the file must be read verbatim without trimming the trailing newline.
+
+### Recommended: `keyring://` (OS keyring)
+
+Store passwords in the OS-native credential store (macOS Keychain, Windows Credential Manager, Linux Secret Service). Secrets are encrypted at rest and isolated from other processes.
+
+```toml
+[connection.production]
+url = "postgres://app@db.example.com/myapp"
+password_url = "keyring://ferrule/production"
+```
+
+To store a password interactively:
+
+```bash
+ferrule conn set-password production
+```
+
+### Acceptable for development: `env://`
+
+Environment variables are convenient but visible to any process running as the same user via `/proc/<pid>/environ`.
+
+```toml
+[connection.staging]
+url = "mysql://user@staging.internal/app"
+password_url = "env://STAGING_DB_PASSWORD"
+```
+
+### Avoid: `--password` flag
+
+The `--password` flag leaks the secret into shell history (`~/.bash_history`, `~/.zsh_history`) and process listings (`ps`). Only use it for one-off debugging or in CI pipelines where the secret is injected as an ephemeral variable.
+
+```bash
+# Leaks to history — do not use for real secrets
+ferrule query production "SELECT 1;" --password "my-secret"
+```
+
+### Avoid: passwords in URLs
+
+URLs containing passwords are written to the connections registry (`connections.toml`) in plain text and may appear in process listings.
+
+```bash
+# Bad — password ends up in plain-text TOML
+ferrule conn add production "postgres://user:secret@host/db"
 ```
 
 ## Password Resolution Stack
 
-When a saved URL does not contain a password, Ferrule resolves one automatically in this order:
+If a connection URL does not contain a password, Ferrule resolves one automatically. The numeric order below is the exact fallback order; each step is attempted only if the previous one yielded no password.
 
-### 1. Explicit `--password` flag
+### 1. Explicit `--password` flag (_least secure_)
 
 ```bash
 ferrule query production "SELECT * FROM users;" --password "my-secret"
@@ -129,7 +112,7 @@ ferrule query production "SELECT * FROM users;" --password "my-secret"
 
 ### 2. `password_url` from profile
 
-If `.ferrule.toml` defines a `password_url`, Ferrule resolves it via `hasp` before falling back to the legacy stack.
+If `.ferrule.toml` defines a `password_url`, Ferrule resolves it via `hasp` first.
 
 ```toml
 [connection.production]
@@ -142,7 +125,7 @@ Supported `hasp` URL schemes:
 - `keyring://service/account` — OS keyring
 - `file:///path/to/secret` — file on disk (trims trailing newline by default)
 
-### 3. Per-connection environment variable
+### 3. Per-connection environment variable (legacy)
 
 ```bash
 export FERRULE_PRODUCTION_PASSWORD="my-secret"
@@ -153,7 +136,9 @@ The variable name is derived from the connection name:
 - `production` → `FERRULE_PRODUCTION_PASSWORD`
 - `local-db` → `FERRULE_LOCAL_DB_PASSWORD`
 
-### 4. OS Keyring
+### 4. OS Keyring fallback
+
+If no `password_url` is configured and the env var is unset, Ferrule falls back to the OS keyring at `keyring://ferrule/<name>`.
 
 ```bash
 # Store password without putting it on disk
@@ -164,11 +149,11 @@ ferrule conn set-password production
 ferrule conn delete-password production
 ```
 
-Passwords are stored as `service=ferrule`, `account=<name>` in the OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service).
+Passwords are stored as `service=ferrule`, `account=<name>` in the OS keyring.
 
 ### 5. Interactive prompt (TTY only)
 
-```bash
+```text
 $ ferrule query production "SELECT * FROM users;"
 Password for 'production': ••••••••
 ```
@@ -177,7 +162,7 @@ Password for 'production': ••••••••
 
 If all five steps fail, Ferrule exits with code 2:
 
-```
+```text
 ferrule::connection
   × Could not resolve password for 'production'
   ├─ No --password flag

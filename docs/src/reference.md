@@ -14,7 +14,7 @@
 
 | Variable | Purpose |
 |----------|---------|
-| `FERRULE_<NAME>_PASSWORD` | Password for connection `<NAME>` |
+| `FERRULE_<NAME>_PASSWORD` | Password for connection `<NAME>` (legacy fallback) |
 | `FERRULE_CONFIG` | Path to config file override |
 | `RUST_LOG` | Enable debug logging from underlying crates |
 
@@ -80,9 +80,31 @@ ferrule repl <connection>
 | `--timing` | Show timing diagnostics |
 | `-v, --verbose` | Show resolved URL and SQL |
 | `--insecure` | Disable TLS verification |
-| `-p, --password <pwd>` | Explicit password |
+| `-p, --password <pwd>` | **Insecure** — leaks to shell history; use `password_url` instead |
 | `--output <FILE>` | Write results to a file |
 | `--daemon` | Route through connection-pooling daemon |
+
+## Configuration File
+
+See [Configuration](configuration.md) for the full `.ferrule.toml` format. A minimal example:
+
+```toml
+[default]
+format = "json"
+limit = 1000
+
+[connection.production]
+url = "postgres://user@db.example.com/app"
+password_url = "keyring://ferrule/production"
+```
+
+The optional `password_url` field resolves the password via `hasp` before falling back to the legacy stack. Supported schemes:
+
+| Scheme | Example | Notes |
+|--------|---------|-------|
+| `env://` | `env://DB_PASSWORD` | Environment variable |
+| `keyring://` | `keyring://ferrule/production` | OS keyring (service/account) |
+| `file://` | `file:///run/secrets/db_password` | File on disk; trims trailing newline by default |
 
 ## File Locations
 

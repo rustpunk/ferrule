@@ -17,18 +17,53 @@ limit = 1000
 
 [connection.production]
 url = "postgres://user@db.example.com/app"
-password_url = "keyring://ferrule/production"
+password_url = "file:///run/secrets/db_password"
 
 [connection.staging]
 url = "mysql://user@staging.internal/app"
-password_url = "env://FERRULE_STAGING_PASSWORD"
+password_url = "env://STAGING_DB_PASSWORD"
+```
+
+## Security Notes
+
+### Prefer `file://` for production
+
+In containers, mount secrets as files rather than environment variables. Files are not visible in `/proc/<pid>/environ`, so other processes cannot read them.
+
+```toml
+[connection.production]
+url = "postgres://user@db.example.com/app"
+password_url = "file:///run/secrets/db_password"
+```
+
+### Prefer `keyring://` for development workstations
+
+The OS keyring encrypts secrets at rest and isolates them from other processes.
+
+```toml
+[connection.production]
+url = "postgres://user@db.example.com/app"
+password_url = "keyring://ferrule/production"
+```
+
+### Avoid hard-coding passwords
+
+Never put passwords directly in the `url` field. The URL is stored in plain-text TOML and may be checked into version control.
+
+```toml
+# Bad — password is visible in plain text
+url = "postgres://user:secret@db.example.com/app"
+
+# Good — password is resolved at runtime
+url = "postgres://user@db.example.com/app"
+password_url = "keyring://ferrule/production"
 ```
 
 ## `password_url`
 
 The optional `password_url` field tells Ferrule where to fetch the connection password via `hasp`. It is evaluated before the legacy env-var and keyring fallbacks.
 
-### Docker secrets
+### Docker secrets (recommended for containers)
 
 ```toml
 [connection.production]
