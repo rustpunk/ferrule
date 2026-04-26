@@ -15,6 +15,7 @@ git-repository-url = "https://github.com/rustpunk/ferrule"
 edit-url-template = "https://github.com/rustpunk/ferrule/edit/main/docs/src/{path}"
 site-url = "/ferrule/"
 additional-css = []
+additional-js = ["theme/cloudflare-active-fix.js"]
 
 [output.html.playground]
 runnable = false
