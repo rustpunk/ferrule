@@ -8,8 +8,8 @@ mod repl;
 mod watch;
 
 use commands::{
-    BookmarkArgs, ConnArgs, DescribeArgs, DumpArgs, ExplainArgs, LoadArgs, QueryArgs, ReplArgs,
-    TablesArgs, WatchArgs,
+    BookmarkArgs, ConnArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, LoadArgs, QueryArgs,
+    ReplArgs, TablesArgs, WatchArgs,
 };
 use error::CliError;
 
@@ -58,6 +58,9 @@ enum Commands {
 
     /// Describe a table
     Describe(DescribeArgs),
+
+    /// Diff schemas between two connections
+    Diff(DiffArgs),
 
     /// Watch a query and re-execute periodically
     Watch(WatchArgs),
@@ -111,6 +114,7 @@ fn main() {
             Commands::Load(args) => commands::load::run(args, &global_config).await,
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,
             Commands::Describe(args) => commands::describe::run(args, &global_config).await,
+            Commands::Diff(args) => commands::diff::run(args, &global_config).await,
         }
     });
 

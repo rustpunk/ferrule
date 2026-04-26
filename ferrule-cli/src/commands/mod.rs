@@ -1,6 +1,7 @@
 pub mod bookmark;
 pub mod conn;
 pub mod describe;
+pub mod diff;
 pub mod dump;
 pub mod explain;
 pub mod load;
@@ -281,6 +282,34 @@ pub struct DescribeArgs {
 
     /// Table name
     pub table: String,
+
+    #[command(flatten)]
+    pub output: OutputFlags,
+
+    #[command(flatten)]
+    pub conn_flags: ConnectionFlags,
+}
+
+/// Diff command arguments — compare schemas between two connections.
+#[derive(Args, Clone, Debug)]
+pub struct DiffArgs {
+    /// Left side ("A") connection name or raw URL
+    pub connection_a: String,
+
+    /// Right side ("B") connection name or raw URL
+    pub connection_b: String,
+
+    /// Optional single table to diff (default: diff every table)
+    #[arg(long, value_name = "NAME")]
+    pub table: Option<String>,
+
+    /// Password for connection A (overrides credential stack)
+    #[arg(long = "password-a")]
+    pub password_a: Option<String>,
+
+    /// Password for connection B (overrides credential stack)
+    #[arg(long = "password-b")]
+    pub password_b: Option<String>,
 
     #[command(flatten)]
     pub output: OutputFlags,
