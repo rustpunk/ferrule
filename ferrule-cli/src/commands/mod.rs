@@ -7,12 +7,14 @@ pub mod load;
 pub mod query;
 pub mod repl;
 pub mod tables;
+pub mod watch;
 
 pub use bookmark::BookmarkArgs;
 pub use dump::DumpArgs;
 pub use explain::ExplainArgs;
 pub use load::LoadArgs;
 pub use repl::ReplArgs;
+pub use watch::WatchArgs;
 
 use crate::error::CliError;
 use clap::{Args, Subcommand};

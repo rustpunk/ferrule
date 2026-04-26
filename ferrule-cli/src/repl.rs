@@ -24,6 +24,8 @@ pub struct ReplState {
     pub explain_mode: bool,
     /// FE-010 placeholder — last successfully executed SQL.
     pub last_sql: Option<String>,
+    /// FE-014 — SQL to watch.
+    pub watch_sql: Option<String>,
 }
 
 impl Default for ReplState {
@@ -37,6 +39,7 @@ impl Default for ReplState {
             params: ParameterSet::default(),
             explain_mode: false,
             last_sql: None,
+            watch_sql: None,
         }
     }
 }
@@ -495,6 +498,23 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 cmd_explain(repl, &sql, rt);
             }
         }
+        "watch" => {
+            if args.is_empty() {
+                let watch_sql = repl.state.watch_sql.clone();
+                let last_sql = repl.state.last_sql.clone();
+                if let Some(sql) = watch_sql {
+                    cmd_watch(repl, &sql, rt);
+                } else if let Some(sql) = last_sql {
+                    cmd_watch(repl, &sql, rt);
+                } else {
+                    eprintln!("No SQL to watch. Provide a query or run one first.");
+                }
+            } else {
+                let sql = args.join(" ");
+                repl.state.watch_sql = Some(sql.clone());
+                cmd_watch(repl, &sql, rt);
+            }
+        }
         "help" | "h" | "?" => print_help(),
         _ => eprintln!("Unknown meta-command: \\{}. Type \\help for help.", cmd),
     }
@@ -521,6 +541,7 @@ fn print_help() {
     println!("  \\explain <name>        Explain a query");
     println!("  \\explain               Toggle explain mode");
     println!("  \\explain off           Disable explain mode");
+    println!("  \\watch [sql]           Watch a query (re-executes every 5s)");
     println!("  \\help                 Show this help");
 }
 
@@ -714,6 +735,65 @@ fn cmd_explain(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
             Err(e) => eprintln!("Format error: {e}"),
         },
         Err(e) => eprintln!("Explain failed: {e}"),
+    }
+}
+
+fn cmd_watch(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
+    use crate::watch::{watch_loop, WatchOptions};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        eprintln!("No SQL to watch.");
+        return;
+    }
+    let substituted = match substitute(trimmed, &repl.state.params, repl.backend) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Parameter error: {e}");
+            return;
+        }
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
+    let interval_secs = Arc::new(AtomicU64::new(5));
+    let print_lock = Arc::new(std::sync::Mutex::new(()));
+
+    let opts = WatchOptions {
+        connection: repl.url.as_str().to_string(),
+        sql: substituted,
+        interval_secs,
+        max_iterations: None,
+        diff: false,
+        format: repl.state.format,
+        limit: repl.state.limit,
+        offset: repl.state.offset,
+        timing: repl.state.timing,
+        verbose: repl.state.verbose,
+        conn_flags: crate::commands::ConnectionFlags {
+            insecure: repl.insecure,
+            daemon: false,
+        },
+        global_config: repl.global_config.clone(),
+        print_lock: print_lock.clone(),
+    };
+
+    let r = running.clone();
+    rt.spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        r.store(false, Ordering::Relaxed);
+    });
+
+    rt.block_on(async {
+        if let Err(e) = watch_loop(&opts, &running).await {
+            eprintln!("[watch] error: {e}");
+        }
+    });
+
+    {
+        let _guard = print_lock.lock();
+        eprintln!("\n[watch] stopped.");
     }
 }
 

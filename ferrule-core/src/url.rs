@@ -68,6 +68,11 @@ impl DatabaseUrl {
         url.to_string()
     }
 
+    /// Return the full raw URL string.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
     /// Return the raw connection string.
     pub fn raw(&self) -> &str {
         &self.raw

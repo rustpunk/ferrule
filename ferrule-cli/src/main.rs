@@ -5,10 +5,11 @@ mod daemon;
 mod error;
 mod output;
 mod repl;
+mod watch;
 
 use commands::{
     BookmarkArgs, ConnArgs, DescribeArgs, DumpArgs, ExplainArgs, LoadArgs, QueryArgs, ReplArgs,
-    TablesArgs,
+    TablesArgs, WatchArgs,
 };
 use error::CliError;
 
@@ -57,6 +58,9 @@ enum Commands {
 
     /// Describe a table
     Describe(DescribeArgs),
+
+    /// Watch a query and re-execute periodically
+    Watch(WatchArgs),
 }
 
 fn run_daemon_mode() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -102,6 +106,7 @@ fn main() {
             Commands::Bookmark(args) => commands::bookmark::run(args, &global_config).await,
             Commands::Explain(args) => commands::explain::run(args, &global_config).await,
             Commands::Repl(args) => commands::repl::run(args, &global_config).await,
+            Commands::Watch(args) => commands::watch::run(args, &global_config).await,
             Commands::Dump(args) => commands::dump::run(args, &global_config).await,
             Commands::Load(args) => commands::load::run(args, &global_config).await,
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,

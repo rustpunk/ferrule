@@ -20,11 +20,14 @@ ferrule-core = { path = "../ferrule-core" }
 ferrule-config = { path = "../ferrule-config" }
 
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 miette = { workspace = true }
 is-terminal = { workspace = true }
 secrecy = { workspace = true }
 thiserror = { workspace = true }
+
+chrono = { workspace = true }
+crossterm = "0.28"
 
 rpassword = { workspace = true }
 rustyline = "15"
