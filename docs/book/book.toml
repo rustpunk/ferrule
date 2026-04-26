@@ -16,7 +16,7 @@ create-missing = false
 [output.html]
 default-theme = "navy"
 git-repository-url = "https://github.com/rustpunk/ferrule"
-edit-url-template = "https://github.com/rustpunk/ferrule/edit/main/book/{path}"
+edit-url-template = "https://github.com/rustpunk/ferrule/edit/main/docs/book/{path}"
 site-url = "/ferrule/"
 additional-css = []
 
