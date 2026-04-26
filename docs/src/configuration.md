@@ -17,9 +17,39 @@ limit = 1000
 
 [connection.production]
 url = "postgres://user@db.example.com/app"
+password_url = "keyring://ferrule/production"
 
 [connection.staging]
 url = "mysql://user@staging.internal/app"
+password_url = "env://FERRULE_STAGING_PASSWORD"
+```
+
+## `password_url`
+
+The optional `password_url` field tells Ferrule where to fetch the connection password via `hasp`. It is evaluated before the legacy env-var and keyring fallbacks.
+
+### Docker secrets
+
+```toml
+[connection.production]
+url = "postgres://user@db.example.com/app"
+password_url = "file:///run/secrets/db_password"
+```
+
+### Team-shared env var
+
+```toml
+[connection.staging]
+url = "mysql://user@staging.internal/app"
+password_url = "env://STAGING_DB_PASSWORD"
+```
+
+### OS keyring
+
+```toml
+[connection.production]
+url = "postgres://user@db.example.com/app"
+password_url = "keyring://ferrule/production"
 ```
 
 ## Environment Interpolation

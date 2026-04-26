@@ -127,7 +127,22 @@ When a saved URL does not contain a password, Ferrule resolves one automatically
 ferrule query production "SELECT * FROM users;" --password "my-secret"
 ```
 
-### 2. Per-connection environment variable
+### 2. `password_url` from profile
+
+If `.ferrule.toml` defines a `password_url`, Ferrule resolves it via `hasp` before falling back to the legacy stack.
+
+```toml
+[connection.production]
+url = "postgres://app@prod.example.com/myapp"
+password_url = "keyring://ferrule/production"
+```
+
+Supported `hasp` URL schemes:
+- `env://VAR_NAME` — environment variable
+- `keyring://service/account` — OS keyring
+- `file:///path/to/secret` — file on disk (trims trailing newline by default)
+
+### 3. Per-connection environment variable
 
 ```bash
 export FERRULE_PRODUCTION_PASSWORD="my-secret"
@@ -138,7 +153,7 @@ The variable name is derived from the connection name:
 - `production` → `FERRULE_PRODUCTION_PASSWORD`
 - `local-db` → `FERRULE_LOCAL_DB_PASSWORD`
 
-### 3. OS Keyring
+### 4. OS Keyring
 
 ```bash
 # Store password without putting it on disk
@@ -151,21 +166,22 @@ ferrule conn delete-password production
 
 Passwords are stored as `service=ferrule`, `account=<name>` in the OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service).
 
-### 4. Interactive prompt (TTY only)
+### 5. Interactive prompt (TTY only)
 
 ```bash
 $ ferrule query production "SELECT * FROM users;"
 Password for 'production': ••••••••
 ```
 
-### 5. Fail with diagnostic
+### 6. Fail with diagnostic
 
-If all four steps fail, Ferrule exits with code 2:
+If all five steps fail, Ferrule exits with code 2:
 
 ```
 ferrule::connection
   × Could not resolve password for 'production'
   ├─ No --password flag
+  ├─ password_url not configured
   ├─ FERRULE_PRODUCTION_PASSWORD is unset
   ├─ keyring://ferrule/production: not found
   └─ Terminal is not interactive
