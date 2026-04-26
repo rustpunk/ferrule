@@ -57,6 +57,63 @@ SQLite is the default backend and requires no external services. The integration
 tests create `:memory:` or temporary file databases automatically. All `ferrule`
 commands work out of the box against `sqlite:///path/to/db`.
 
+### MySQL — start container first
+
+The MySQL backend requires a running MySQL server. The inline tests at
+`ferrule-core/src/backends/mysql.rs` connect to
+`mysql://root:ferrule@127.0.0.1:13306/ferrule` and skip gracefully when the
+container is absent.
+
+```bash
+docker run -d --name ferrule-mysql-test \
+  -e MYSQL_ROOT_PASSWORD=ferrule \
+  -e MYSQL_DATABASE=ferrule \
+  -p 127.0.0.1:13306:3306 \
+  mysql:8
+```
+
+Wait until ready, then seed:
+
+```bash
+until docker exec ferrule-mysql-test mysqladmin ping -h 127.0.0.1 -uroot -pferrule --silent >/dev/null 2>&1; do
+  sleep 1
+done
+
+docker exec -i ferrule-mysql-test mysql -uroot -pferrule ferrule <<'SQL'
+CREATE TABLE test_users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(255),
+  age INT,
+  score DECIMAL(10,2),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  active BOOLEAN,
+  meta JSON,
+  uid CHAR(36) DEFAULT (UUID())
+);
+INSERT INTO test_users (name, age, score, active, meta) VALUES
+  ('Alice', 30, 99.5,  TRUE,  '{"role": "admin"}'),
+  ('Bob',   25, 88.25, FALSE, '{"role": "user"}');
+SQL
+```
+
+Smoke commands (mirrors the Postgres section):
+
+```bash
+ferrule query    "mysql://root:ferrule@127.0.0.1:13306/ferrule" "SELECT * FROM test_users;" --format json
+ferrule query    "mysql://root:ferrule@127.0.0.1:13306/ferrule" "INSERT INTO test_users (name, age) VALUES ('Charlie', 35);"
+ferrule query    "mysql://root:ferrule@127.0.0.1:13306/ferrule" \
+  "INSERT INTO test_users (name, age) VALUES ('Dave', 40); SELECT COUNT(*) FROM test_users;" --format table
+ferrule tables   "mysql://root:ferrule@127.0.0.1:13306/ferrule" --format table
+ferrule describe "mysql://root:ferrule@127.0.0.1:13306/ferrule" test_users
+ferrule conn test "mysql://root:ferrule@127.0.0.1:13306/ferrule"
+```
+
+Clean up when done:
+
+```bash
+docker stop ferrule-mysql-test && docker rm ferrule-mysql-test
+```
+
 ### Postgres — start container first
 
 The Postgres backend requires a running Postgres server for runtime validation.
@@ -119,10 +176,228 @@ Clean up when done:
 docker stop ferrule-pg-test && docker rm ferrule-pg-test
 ```
 
-### MySQL, MSSQL, Oracle
+### MSSQL — start container first
 
-These backends are currently stubs (`todo!()`) and have no runtime tests yet.
-They compile-gate cleanly via Cargo features (`mysql`, `mssql`, `oracle`).
+The MSSQL backend requires a running SQL Server instance. The inline tests at
+`ferrule-core/src/backends/mssql.rs` connect to
+`mssql://sa:Ferrule123!@127.0.0.1:11433/ferrule` and skip gracefully when the
+container is absent. The credentials and port are pinned to that constant —
+do not change them without also updating `TEST_MSSQL_URL`.
+
+```bash
+docker run -d --name ferrule-mssql-test \
+  -e ACCEPT_EULA=Y \
+  -e MSSQL_SA_PASSWORD='Ferrule123!' \
+  -e MSSQL_PID=Developer \
+  -p 127.0.0.1:11433:1433 \
+  mcr.microsoft.com/mssql/server:2022-latest
+```
+
+Notes:
+- The `sa` password must satisfy SQL Server's complexity policy (≥8 chars,
+  three of: upper/lower/digit/special). `Ferrule123!` does.
+- `MSSQL_PID=Developer` selects the free Developer edition — full feature
+  set, no production license.
+- `2022-latest` ships `sqlcmd` at `/opt/mssql-tools18/bin/sqlcmd` and
+  defaults to a self-signed TLS cert (hence the `-C` / `trustServerCertificate`
+  flags below).
+
+Wait until ready (the image takes ~15–25s on first run; longer on slow disks),
+then create the database and seed it:
+
+```bash
+until docker exec ferrule-mssql-test /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P 'Ferrule123!' -C -Q "SELECT 1" >/dev/null 2>&1; do
+  sleep 1
+done
+
+docker exec -i ferrule-mssql-test /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P 'Ferrule123!' -C <<'SQL'
+IF DB_ID('ferrule') IS NULL CREATE DATABASE ferrule;
+GO
+USE ferrule;
+GO
+CREATE TABLE test_users (
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  name NVARCHAR(255),
+  age INT,
+  score DECIMAL(10,2),
+  created_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+  active BIT,
+  meta NVARCHAR(MAX),
+  uid UNIQUEIDENTIFIER DEFAULT NEWID()
+);
+INSERT INTO test_users (name, age, score, active, meta) VALUES
+  ('Alice', 30, 99.5,  1, '{"role": "admin"}'),
+  ('Bob',   25, 88.25, 0, '{"role": "user"}');
+GO
+SQL
+```
+
+Schema deviations from Postgres: MSSQL has no native `BOOLEAN` (use `BIT`),
+no native JSON type (store JSON in `NVARCHAR(MAX)` — the type-mapping test
+at `mssql.rs` already accepts `Json | String`), and uses `UNIQUEIDENTIFIER`
+in place of `UUID`. `DATETIMEOFFSET` is the closest analog to Postgres
+`TIMESTAMP WITH TIME ZONE`.
+
+Smoke commands (use `?trustServerCertificate=true` because the image's TLS
+cert is self-signed):
+
+```bash
+ferrule query    "mssql://sa:Ferrule123!@127.0.0.1:11433/ferrule?trustServerCertificate=true" "SELECT * FROM test_users;" --format json
+ferrule query    "mssql://sa:Ferrule123!@127.0.0.1:11433/ferrule?trustServerCertificate=true" "INSERT INTO test_users (name, age) VALUES ('Charlie', 35);"
+ferrule tables   "mssql://sa:Ferrule123!@127.0.0.1:11433/ferrule?trustServerCertificate=true" --format table
+ferrule describe "mssql://sa:Ferrule123!@127.0.0.1:11433/ferrule?trustServerCertificate=true" test_users
+ferrule conn test "mssql://sa:Ferrule123!@127.0.0.1:11433/ferrule?trustServerCertificate=true"
+```
+
+Clean up when done:
+
+```bash
+docker stop ferrule-mssql-test && docker rm ferrule-mssql-test
+```
+
+### Oracle — start container AND install Instant Client
+
+Oracle has *two* setup steps the other backends don't: the container **and**
+the host-side Oracle Instant Client. The `oracle` crate is a thin wrapper
+around ODPI-C, which `dlopen`s `libclntsh.so` on the *first* `oracle://`
+connection — `cargo build --features oracle` does not require Instant Client,
+but the first runtime connection does.
+
+The Oracle backend (`ferrule-core/src/backends/oracle.rs`) is fully
+implemented, including an explicit Instant-Client-missing diagnostic in
+`map_oracle_error` (oracle.rs). Inline tests at oracle.rs:296-445
+use the `ORACLE_TEST_URL` environment variable (defaults to
+`oracle://ferrule:ferrule@127.0.0.1:11521/FREEPDB1`) and use the same
+`try_connect()` graceful-skip pattern as `mysql.rs` / `mssql.rs`. They
+include a dedicated `test_oracle_missing_client_error` that asserts the
+diagnostic fires when no client / no DB is reachable.
+
+#### Container (gvenzl/oracle-free)
+
+```bash
+docker run -d --name ferrule-oracle-test \
+  -e ORACLE_PASSWORD=ferrule \
+  -e APP_USER=ferrule \
+  -e APP_USER_PASSWORD=ferrule \
+  -p 127.0.0.1:11521:1521 \
+  gvenzl/oracle-free:latest
+```
+
+Behaviour:
+- `ORACLE_PASSWORD` sets the `SYS` / `SYSTEM` password (admin only — ferrule
+  tests do not use these).
+- `APP_USER` + `APP_USER_PASSWORD` create a regular user inside pluggable
+  database `FREEPDB1`. This is the user ferrule connects as.
+- Service name is `FREEPDB1` (the default PDB on Oracle Database Free 23ai).
+- First boot is slow (~60–120s) while Oracle initialises the PDB.
+
+Wait until ready, then seed:
+
+```bash
+until docker exec ferrule-oracle-test ./healthcheck.sh >/dev/null 2>&1; do
+  sleep 2
+done
+
+docker exec -i ferrule-oracle-test \
+  sqlplus -S ferrule/ferrule@//localhost:1521/FREEPDB1 <<'SQL'
+CREATE TABLE test_users (
+  id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name VARCHAR2(255),
+  age NUMBER(10),
+  score NUMBER(10,2),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP,
+  active NUMBER(1),
+  meta CLOB CONSTRAINT meta_is_json CHECK (meta IS JSON),
+  guid RAW(16) DEFAULT SYS_GUID()
+);
+INSERT INTO test_users (name, age, score, active, meta) VALUES ('Alice', 30, 99.5,  1, '{"role": "admin"}');
+INSERT INTO test_users (name, age, score, active, meta) VALUES ('Bob',   25, 88.25, 0, '{"role": "user"}');
+COMMIT;
+EXIT
+SQL
+```
+
+Schema deviations from Postgres: Oracle has no native `BOOLEAN` until 23c
+(`NUMBER(1)`), no `UUID` type (use `RAW(16)` + `SYS_GUID()` -- note `guid` not
+`uid` since `uid` is an Oracle reserved keyword), and JSON is a `CLOB` with
+an `IS JSON` check constraint (Oracle 12c+).
+
+#### Host-side Oracle client libraries (Linux x64)
+
+Without `libclntsh.so` on the host, the `oracle` crate fails at first
+connection and `ferrule` will surface a `miette` diagnostic (see "Oracle
+Runtime Behavior" below). ODPI-C accepts client libs from any of: Oracle
+Instant Client Basic, Instant Client Basic Light, a full Oracle Database
+Client install, or a full Oracle Database install.
+
+**Recommended: Oracle Instant Client Basic**
+
+1. Go to <https://www.oracle.com/database/technologies/instant-client/linux-x64-downloads.html>,
+   accept the license agreement, and download the **Basic** package for your
+   architecture (`instantclient-basic-linux.x64-<version>.zip`).
+2. Extract and install:
+
+```bash
+sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+mkdir -p ~/opt/oracle
+unzip -q instantclient-basic-linux.x64-*.zip -d ~/opt/oracle
+# Symlink libaio if Ubuntu 24.04+ renamed it:
+ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 \
+       ~/opt/oracle/instantclient_23_26/libaio.so.1
+export LD_LIBRARY_PATH="$HOME/opt/oracle/instantclient_23_26:$LD_LIBRARY_PATH"
+```
+
+> **Note:** `libaio1` is required by `libclntsh.so`. On Ubuntu 24.04+ the
+> package was renamed `libaio1t64`; the symlink above lets the Instant
+> Client find it even when the dynamic linker cache does not include it.
+
+Verify:
+
+```bash
+ldd ~/opt/oracle/instantclient_23_26/libclntsh.so | grep "not found"   # should print nothing
+ls ~/opt/oracle/instantclient_*   # e.g. instantclient_23_26
+```
+
+**Not recommended:** Extracting `libclntsh.so` from a running database
+container (e.g. `gvenzl/oracle-free`) and using it on the host will
+usually **segfault** during ODPI-C init (`SIGSEGV` at `NULL`).
+Database-home libraries expect the full Oracle home directory hierarchy
+(`$ORACLE_HOME/network/admin`, `$ORACLE_HOME/nls/data`, etc.) and cannot
+be used standalone. Use the official Instant Client package instead.
+
+#### Smoke commands
+
+```bash
+ferrule query    "oracle://ferrule:ferrule@127.0.0.1:11521/FREEPDB1" "SELECT * FROM test_users" --format json
+ferrule tables   "oracle://ferrule:ferrule@127.0.0.1:11521/FREEPDB1" --format table
+ferrule describe "oracle://ferrule:ferrule@127.0.0.1:11521/FREEPDB1" test_users
+ferrule conn test "oracle://ferrule:ferrule@127.0.0.1:11521/FREEPDB1"
+```
+
+Run the inline integration tests (will skip if container or Instant Client
+missing):
+
+```bash
+cargo test -p ferrule-core --features oracle -- oracle::tests
+```
+
+Clean up when done:
+
+```bash
+docker stop ferrule-oracle-test && docker rm ferrule-oracle-test
+```
+
+### Backend test status
+
+- **SQLite, Postgres, MySQL, MSSQL, Oracle** — runtime-tested via the Docker
+  setups above. Inline integration tests in each backend module skip
+  gracefully when the container is absent.
+- **Oracle** additionally requires Oracle Instant Client on the host
+  (`libclntsh.so` / `.dylib` / `.dll`) for the runtime tests to actually
+  execute — see the Oracle section above. `cargo build --features oracle`
+  itself does not need Instant Client.
 
 ## Wave Structure
 

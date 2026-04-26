@@ -41,11 +41,11 @@ uuid = { workspace = true, optional = true }
 mysql_async = { version = "0.35", optional = true }
 
 # MSSQL
-tiberius = { version = "0.12", optional = true }
+tiberius = { version = "0.12", optional = true, features = ["chrono"] }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 
 # SQLite
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"], optional = true }
 
 # Oracle
-oracle = { version = "0.6", optional = true }
+oracle = { version = "0.6", optional = true, features = ["chrono"] }
