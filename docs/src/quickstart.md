@@ -4,7 +4,7 @@
 
 ```bash
 # SQLite works without any setup
-ferrule query "sqlite::memory:" "SELECT 42 AS answer;"
+ferrule query "sqlite::memory:" "SELECT 1 + 1 AS answer;"
 ```
 
 Output (TTY defaults to table format):
@@ -12,6 +12,19 @@ Output (TTY defaults to table format):
  answer
 --------
  42
+```
+
+## Save a Named Connection
+
+Typing full URLs repeatedly is tedious. Save the ones you use often:
+
+```bash
+ferrule conn add production "postgres://user@db.example.com/app"
+
+# Now use the name instead of the full URL
+ferrule query production "SELECT * FROM customers LIMIT 5;"
+ferrule tables production
+ferrule repl production
 ```
 
 ## Pipe-Friendly Defaults
@@ -23,16 +36,14 @@ ferrule query "sqlite::memory:" "SELECT 1" | jq '.[]."1"'
 # > 1
 ```
 
-## Named Connections
+## Save a Bookmark
 
-Save frequently-used connections:
+For queries you run all the time:
 
 ```bash
-ferrule conn add production "postgres://user@db.example.com/app"
-ferrule conn list
+ferrule bookmark add daily-count "SELECT COUNT(*) FROM events;" --connection production
 
-# Now use the name instead of the full URL
-ferrule query production "SELECT * FROM customers LIMIT 5;"
+ferrule bookmark run daily-count
 ```
 
 ## Password Resolution
@@ -64,4 +75,14 @@ ferrule query production "SELECT * FROM events" \
 
 ```bash
 ferrule query production "SELECT * FROM events" --output events.json
+```
+
+## Explore Schema
+
+```bash
+# List tables
+ferrule tables production
+
+# Describe a table
+ferrule describe production events
 ```
