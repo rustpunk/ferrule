@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod daemon;
 mod error;
 mod output;
 
@@ -13,6 +14,10 @@ use error::CliError;
 #[command(version)]
 #[command(about = "A Rust-native database query CLI")]
 struct Cli {
+    /// Path to config file
+    #[arg(short, long, global = true)]
+    config: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -34,7 +39,24 @@ enum Commands {
     Describe(DescribeArgs),
 }
 
+fn run_daemon_mode() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(daemon::run_daemon_server())?;
+    Ok(())
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "__daemon" {
+        if let Err(e) = run_daemon_mode() {
+            eprintln!("Daemon error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     miette::set_hook(Box::new(|_| {
         Box::new(
             miette::MietteHandlerOpts::new()
@@ -51,11 +73,14 @@ fn main() {
 
     let result: Result<(), CliError> = rt.block_on(async {
         let cli = Cli::parse();
+        let global_config = ferrule_config::GlobalConfig::load(cli.config.as_deref())
+            .unwrap_or_default();
+
         match cli.command {
-            Commands::Connection(args) => commands::conn::run(args).await,
-            Commands::Query(args) => commands::query::run(args).await,
-            Commands::Tables(args) => commands::tables::run(args).await,
-            Commands::Describe(args) => commands::describe::run(args).await,
+            Commands::Connection(args) => commands::conn::run(args, &global_config).await,
+            Commands::Query(args) => commands::query::run(args, &global_config).await,
+            Commands::Tables(args) => commands::tables::run(args, &global_config).await,
+            Commands::Describe(args) => commands::describe::run(args, &global_config).await,
         }
     });
 

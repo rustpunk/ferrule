@@ -7,11 +7,14 @@ pub mod formatter;
 pub mod url;
 pub mod value;
 
+pub mod query_builder;
+
 mod backends;
 
 pub use backend::{Backend, connect};
 pub use connection::{Connection, ExecutionSummary, QueryResult, ConnectOptions, StatementResult};
 pub use error::CoreError;
 pub use formatter::{OutputFormat, format_result};
+pub use query_builder::apply_paging;
 pub use url::DatabaseUrl;
 pub use value::{ColumnInfo, Row, TypeHint, Value};

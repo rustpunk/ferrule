@@ -63,8 +63,11 @@ impl ConnectionRegistry {
             return Ok(Self::new());
         }
         let content = std::fs::read_to_string(&path)?;
-        let registry: ConnectionRegistry = toml::from_str(&content)
+        let mut registry: ConnectionRegistry = toml::from_str(&content)
             .map_err(|e| ConfigError::InvalidConfig(e.to_string()))?;
+        for entry in registry.entries.values_mut() {
+            entry.url = interpolate_env_vars(&entry.url);
+        }
         Ok(registry)
     }
 
@@ -86,4 +89,102 @@ fn default_config_path() -> Result<std::path::PathBuf, ConfigError> {
         .ok_or_else(|| ConfigError::ConfigNotFound("could not determine config directory".into()))?
         .join("ferrule");
     Ok(config_dir.join("connections.toml"))
+}
+
+/// Interpolate `${VAR}` and `${VAR:-default}` patterns in a string.
+/// Also supports `$$` as an escaped literal `$`.
+/// Unknown variables are left unchanged.
+pub fn interpolate_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            if chars.next_if_eq(&'$').is_some() {
+                out.push('$');
+                continue;
+            }
+            if chars.next_if_eq(&'{').is_some() {
+                let var_spec: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                if let Some((var, default)) = var_spec.split_once(":-") {
+                    match std::env::var(var) {
+                        Ok(val) if !val.is_empty() => out.push_str(&val),
+                        _ => out.push_str(default),
+                    }
+                } else {
+                    match std::env::var(&var_spec) {
+                        Ok(val) => out.push_str(&val),
+                        Err(_) => {
+                            out.push_str("${");
+                            out.push_str(&var_spec);
+                            out.push('}');
+                        }
+                    }
+                }
+            } else {
+                out.push('$');
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_interpolate_basic() {
+        std::env::set_var("FERRULE_TEST_DB", "mydb");
+        assert_eq!(
+            interpolate_env_vars("postgres://u@h/${FERRULE_TEST_DB}"),
+            "postgres://u@h/mydb"
+        );
+    }
+
+    #[test]
+    fn test_interpolate_default() {
+        std::env::remove_var("FERRULE_TEST_MISSING");
+        assert_eq!(
+            interpolate_env_vars("host=${FERRULE_TEST_MISSING:-localhost}"),
+            "host=localhost"
+        );
+    }
+
+    #[test]
+    fn test_interpolate_default_override() {
+        std::env::set_var("FERRULE_TEST_HOST", "prod.example.com");
+        assert_eq!(
+            interpolate_env_vars("host=${FERRULE_TEST_HOST:-localhost}"),
+            "host=prod.example.com"
+        );
+        std::env::remove_var("FERRULE_TEST_HOST");
+    }
+
+    #[test]
+    fn test_interpolate_escape() {
+        assert_eq!(
+            interpolate_env_vars("cost is $$5.00"),
+            "cost is $5.00"
+        );
+    }
+
+    #[test]
+    fn test_interpolate_unknown() {
+        std::env::remove_var("FERRULE_TEST_UNKNOWN");
+        assert_eq!(
+            interpolate_env_vars("host=${FERRULE_TEST_UNKNOWN}"),
+            "host=${FERRULE_TEST_UNKNOWN}"
+        );
+    }
+
+    #[test]
+    fn test_interpolate_no_braces() {
+        // Bare $VAR is left as-is (not interpolated)
+        assert_eq!(
+            interpolate_env_vars("host=$VAR"),
+            "host=$VAR"
+        );
+    }
 }

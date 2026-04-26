@@ -3,18 +3,32 @@ use crate::error::CliError;
 use ferrule_core::backend::connect;
 use ferrule_core::connection::{ConnectOptions, QueryResult, StatementResult};
 use ferrule_core::formatter::{OutputFormat, format_result};
+use ferrule_config::profile::GlobalConfig;
 
 fn render_query_result(
     result: &QueryResult,
     format: OutputFormat,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<String, CliError> {
     let mut qr = result.clone();
+
+    // Apply client-side offset
+    if let Some(off) = offset {
+        if off >= qr.rows.len() {
+            qr.rows.clear();
+        } else {
+            qr.rows = qr.rows.split_off(off);
+        }
+    }
+
+    // Apply client-side limit
     if let Some(n) = limit {
         if qr.rows.len() > n {
             qr.rows.truncate(n);
         }
     }
+
     format_result(&qr, format).map_err(CliError::query)
 }
 
@@ -22,22 +36,20 @@ fn render_single_result(
     result: &StatementResult,
     format: OutputFormat,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<String, CliError> {
     match result {
-        StatementResult::Query(qr) => render_query_result(qr, format, limit),
+        StatementResult::Query(qr) => render_query_result(qr, format, limit, offset),
         StatementResult::Summary(s) => {
             Ok(format!("{} rows affected", s.rows_affected.unwrap_or(0)))
         }
     }
 }
 
-pub async fn run(args: QueryArgs) -> Result<(), CliError> {
-    let format = args
-        .output
-        .format
-        .as_deref()
-        .and_then(OutputFormat::parse)
-        .unwrap_or_else(crate::output::default_format);
+pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+    let format = args.output.resolve_format(global_config);
+    let limit = args.output.resolve_limit(global_config);
+    let offset = args.output.offset;
 
     let total_start = std::time::Instant::now();
 
@@ -47,9 +59,11 @@ pub async fn run(args: QueryArgs) -> Result<(), CliError> {
             .map_err(CliError::Io)?
     } else if args.stdin {
         let mut buf = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut buf)
-            .await
-            .map_err(CliError::Io)?;
+        tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(),
+            &mut buf,
+        )
+        .await
+        .map_err(CliError::Io)?;
         buf
     } else if let Some(sql) = args.sql {
         sql
@@ -70,10 +84,29 @@ pub async fn run(args: QueryArgs) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let url = super::resolve_connection(&args.connection, args.password).await?;
+    let url = super::resolve_connection(&args.connection,
+        args.password,
+        global_config,
+    ).await?;
 
     if args.output.verbose {
         eprintln!("[ferrule] Resolved URL: {}", url.redacted());
+    }
+
+    // Route through daemon if requested
+    if args.conn_flags.daemon {
+        eprintln!("[ferrule] Routing via daemon...");
+        let payload = crate::daemon::daemon_query(
+            &sql,
+            &url,
+            args.conn_flags.insecure,
+            format,
+            limit,
+            offset,
+        )
+        .await?;
+        println!("{}", payload);
+        return Ok(());
     }
 
     let opts = ConnectOptions {
@@ -83,14 +116,23 @@ pub async fn run(args: QueryArgs) -> Result<(), CliError> {
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
+    let backend = ferrule_core::Backend::from_scheme(url.scheme())
+        .ok_or_else(|| CliError::usage(format!(
+            "Unsupported scheme: {}", url.scheme()
+        )))?;
+
     let conn_start = std::time::Instant::now();
     let mut conn = connect(&url, &opts).await.map_err(CliError::connection)?;
     let conn_time = conn_start.elapsed();
 
-    // Strategy:
-    // 1. Try query() first — gives typed values via extended protocol.
-    // 2. If that fails, try execute() — for DML that returns no rows.
-    // 3. If both fail, try execute_multi() — handles multi-statement batches.
+    // Inject server-side paging into the SQL
+    let sql = ferrule_core::apply_paging(&sql, limit, offset, backend)
+        .map_err(CliError::query)?;
+
+    if (limit.is_some() || offset.is_some()) && args.output.verbose {
+        eprintln!("[ferrule] Paged SQL: {}", sql);
+    }
+
     let query_start = std::time::Instant::now();
     let results = match conn.query(&sql).await {
         Ok(qr) => vec![StatementResult::Query(qr)],
@@ -111,9 +153,11 @@ pub async fn run(args: QueryArgs) -> Result<(), CliError> {
     let format_start = std::time::Instant::now();
 
     if results.len() == 1 {
-        let rendered = render_single_result(&results[0],
+        let rendered = render_single_result(
+            &results[0],
             format,
-            args.output.limit,
+            limit,
+            offset,
         )?;
         match &results[0] {
             StatementResult::Query(_) => println!("{}", rendered),
@@ -124,7 +168,7 @@ pub async fn run(args: QueryArgs) -> Result<(), CliError> {
             match result {
                 StatementResult::Query(_) => {
                     let rendered = render_single_result(
-                        result, format, args.output.limit)?;
+                        result, format, limit, offset)?;
                     println!("-- Result set {}\n", i + 1);
                     println!("{}", rendered);
                     println!();
@@ -145,7 +189,7 @@ pub async fn run(args: QueryArgs) -> Result<(), CliError> {
     if let Some(path) = args.output.output {
         eprintln!("Warning: file output with multi-statement uses first result only.");
         let rendered = render_single_result(
-            &results[0], format, args.output.limit)?;
+            &results[0], format, limit, offset)?;
         tokio::fs::write(&path, rendered)
             .await
             .map_err(CliError::Io)?;

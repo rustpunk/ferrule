@@ -2,23 +2,34 @@ use super::TablesArgs;
 use crate::error::CliError;
 use ferrule_core::backend::connect;
 use ferrule_core::connection::{ConnectOptions, QueryResult};
-use ferrule_core::formatter::{OutputFormat, format_result};
+use ferrule_core::formatter::format_result;
 use ferrule_core::value::{ColumnInfo, TypeHint, Value};
+use ferrule_config::profile::GlobalConfig;
 
-pub async fn run(args: TablesArgs) -> Result<(), CliError> {
-    let format = args
-        .output
-        .format
-        .as_deref()
-        .and_then(OutputFormat::parse)
-        .unwrap_or_else(crate::output::default_format);
+pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+    let format = args.output.resolve_format(global_config);
+    let limit = args.output.resolve_limit(global_config);
+    let offset = args.output.offset;
 
     let total_start = std::time::Instant::now();
 
-    let url = super::resolve_connection(&args.connection, None).await?;
+    let url = super::resolve_connection(&args.connection, None, global_config).await?;
 
     if args.output.verbose {
         eprintln!("[ferrule] Resolved URL: {}", url.redacted());
+    }
+
+    // Route through daemon if requested
+    if args.conn_flags.daemon {
+        eprintln!("[ferrule] Routing via daemon...");
+        let payload = crate::daemon::daemon_tables(
+            &url,
+            args.conn_flags.insecure,
+            None,
+        )
+        .await?;
+        println!("{}", payload);
+        return Ok(());
     }
 
     let opts = ConnectOptions {
@@ -51,7 +62,17 @@ pub async fn run(args: TablesArgs) -> Result<(), CliError> {
             .collect(),
     };
 
-    if let Some(limit) = args.output.limit {
+    // Apply client-side offset
+    if let Some(off) = offset {
+        if off >= result.rows.len() {
+            result.rows.clear();
+        } else {
+            result.rows = result.rows.split_off(off);
+        }
+    }
+
+    // Apply client-side limit
+    if let Some(limit) = limit {
         if result.rows.len() > limit {
             result.rows.truncate(limit);
         }

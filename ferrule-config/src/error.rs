@@ -15,6 +15,12 @@ pub enum ConfigError {
     #[error("duplicate connection name: {0}")]
     DuplicateConnection(String),
 
+    #[error("profile '{0}' not found")]
+    ProfileNotFound(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("keyring error: {0}")]
+    KeyringError(String),
 }

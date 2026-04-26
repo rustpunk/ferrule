@@ -713,6 +713,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -878,6 +892,8 @@ name = "ferrule-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dashmap",
+ "dirs",
  "ferrule-config",
  "ferrule-core",
  "is-terminal",
@@ -897,8 +913,10 @@ dependencies = [
  "chrono",
  "dirs",
  "indexmap",
+ "keyring",
  "secrecy",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "toml",
 ]
@@ -1412,6 +1430,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee7893dab2e44ae5f9d0173f26ff4aa327c10b01b06a72b52dd9405b628640d"
 dependencies = [
  "indexmap",
+]
+
+[[package]]
+name = "keyring"
+version = "3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
+dependencies = [
+ "log",
+ "zeroize",
 ]
 
 [[package]]

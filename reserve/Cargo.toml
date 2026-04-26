@@ -1,0 +1,17 @@
+[package]
+name = "ferrule"
+version = "0.1.0-alpha"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Ferrule Contributors"]
+description = "Rust-native database query CLI for Postgres, MySQL, MSSQL, SQLite, and Oracle. Part of the rustpunk portfolio."
+repository = "https://github.com/rustpunk/ferrule"
+homepage = "https://github.com/rustpunk/ferrule"
+readme = "README.md"
+keywords = ["database", "sql", "cli", "rustpunk"]
+categories = ["command-line-utilities", "database"]
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

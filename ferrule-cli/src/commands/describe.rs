@@ -2,22 +2,32 @@ use super::DescribeArgs;
 use crate::error::CliError;
 use ferrule_core::backend::connect;
 use ferrule_core::connection::ConnectOptions;
-use ferrule_core::formatter::{OutputFormat, format_result};
+use ferrule_core::formatter::format_result;
+use ferrule_config::profile::GlobalConfig;
 
-pub async fn run(args: DescribeArgs) -> Result<(), CliError> {
-    let format = args
-        .output
-        .format
-        .as_deref()
-        .and_then(OutputFormat::parse)
-        .unwrap_or_else(crate::output::default_format);
+pub async fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+    let format = args.output.resolve_format(global_config);
 
     let total_start = std::time::Instant::now();
 
-    let url = super::resolve_connection(&args.connection, None).await?;
+    let url = super::resolve_connection(&args.connection, None, global_config).await?;
 
     if args.output.verbose {
         eprintln!("[ferrule] Resolved URL: {}", url.redacted());
+    }
+
+    // Route through daemon if requested
+    if args.conn_flags.daemon {
+        eprintln!("[ferrule] Routing via daemon...");
+        let payload = crate::daemon::daemon_describe(
+            &url,
+            args.conn_flags.insecure,
+            None,
+            &args.table,
+        )
+        .await?;
+        println!("{}", payload);
+        return Ok(());
     }
 
     let opts = ConnectOptions {

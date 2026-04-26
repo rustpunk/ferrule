@@ -120,3 +120,9 @@ fn interpolate_env_vars(input: &str) -> String {
 ---
 
 *Plan generated after Wave 1 completion.*
+
+---
+
+## Status
+
+**Completed** ✅
