@@ -1,13 +1,17 @@
 pub mod bookmark;
 pub mod conn;
 pub mod describe;
+pub mod dump;
 pub mod explain;
+pub mod load;
 pub mod query;
 pub mod repl;
 pub mod tables;
 
 pub use bookmark::BookmarkArgs;
+pub use dump::DumpArgs;
 pub use explain::ExplainArgs;
+pub use load::LoadArgs;
 pub use repl::ReplArgs;
 
 use crate::error::CliError;

@@ -7,7 +7,8 @@ mod output;
 mod repl;
 
 use commands::{
-    BookmarkArgs, ConnArgs, DescribeArgs, ExplainArgs, QueryArgs, ReplArgs, TablesArgs,
+    BookmarkArgs, ConnArgs, DescribeArgs, DumpArgs, ExplainArgs, LoadArgs, QueryArgs, ReplArgs,
+    TablesArgs,
 };
 use error::CliError;
 
@@ -36,6 +37,12 @@ enum Commands {
 
     /// Explain a query execution plan
     Explain(ExplainArgs),
+
+    /// Dump a table to CSV/JSON/SQL
+    Dump(DumpArgs),
+
+    /// Load data from CSV/JSON into a table
+    Load(LoadArgs),
 
     /// Interactive REPL
     #[command(alias = "r")]
@@ -95,6 +102,8 @@ fn main() {
             Commands::Bookmark(args) => commands::bookmark::run(args, &global_config).await,
             Commands::Explain(args) => commands::explain::run(args, &global_config).await,
             Commands::Repl(args) => commands::repl::run(args, &global_config).await,
+            Commands::Dump(args) => commands::dump::run(args, &global_config).await,
+            Commands::Load(args) => commands::load::run(args, &global_config).await,
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,
             Commands::Describe(args) => commands::describe::run(args, &global_config).await,
         }

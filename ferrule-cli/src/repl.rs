@@ -460,6 +460,25 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 }
             }
         }
+        "dump" => {
+            if args.is_empty() {
+                eprintln!("Usage: \\dump <table> [--format <fmt>]");
+            } else {
+                let table = args[0];
+                let fmt = args.get(1).copied();
+                cmd_dump(repl, table, fmt, rt);
+            }
+        }
+        "load" => {
+            if args.len() < 3 || !args[1].eq_ignore_ascii_case("into") {
+                eprintln!("Usage: \\load <file> INTO <table> [--create-table]");
+            } else {
+                let file = args[0];
+                let table = args[2];
+                let create_table = args.contains(&"--create-table");
+                cmd_load(repl, file, table, create_table, rt);
+            }
+        }
         "explain" => {
             if args.is_empty() {
                 // Toggle explain mode
@@ -698,6 +717,62 @@ fn cmd_explain(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
     }
 }
 
+fn cmd_dump(repl: &mut Repl, table: &str, fmt: Option<&str>, rt: &tokio::runtime::Handle) {
+    let format = fmt
+        .and_then(ferrule_core::DumpFormat::parse)
+        .unwrap_or(ferrule_core::DumpFormat::Csv);
+    let opts = ferrule_core::DumpOptions {
+        format,
+        ..ferrule_core::DumpOptions::default()
+    };
+    let result = rt.block_on(async {
+        ferrule_core::dump_table(repl.conn.as_mut(), table, repl.backend, &opts).await
+    });
+    match result {
+        Ok(text) => println!("{text}"),
+        Err(e) => eprintln!("Dump failed: {e}"),
+    }
+}
+
+fn cmd_load(
+    repl: &mut Repl,
+    file: &str,
+    table: &str,
+    create_table: bool,
+    rt: &tokio::runtime::Handle,
+) {
+    let data = match std::fs::read_to_string(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Cannot read file '{}': {}", file, e);
+            return;
+        }
+    };
+    let fmt = match std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        Some("csv") => ferrule_core::LoadFormat::Csv,
+        Some("json") => ferrule_core::LoadFormat::Json,
+        _ => {
+            eprintln!("Cannot infer format from file extension. Use .csv or .json.");
+            return;
+        }
+    };
+    let opts = ferrule_core::LoadOptions {
+        format: fmt,
+        table: table.to_string(),
+        create_table,
+        ..ferrule_core::LoadOptions::default()
+    };
+    let result = rt.block_on(async {
+        ferrule_core::load_data(repl.conn.as_mut(), &data, repl.backend, &opts).await
+    });
+    match result {
+        Ok(n) => println!("Loaded {} rows into '{}'.", n, table),
+        Err(e) => eprintln!("Load failed: {e}"),
+    }
+}
 // ---------------------------------------------------------------------------
 // REPL loop
 // ---------------------------------------------------------------------------

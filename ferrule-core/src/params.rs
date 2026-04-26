@@ -55,7 +55,7 @@ pub fn substitute(sql: &str, params: &ParameterSet, backend: Backend) -> Result<
 }
 
 /// Render a `Value` into a SQL literal suitable for inline substitution.
-fn render_value(value: &Value, backend: Backend) -> String {
+pub fn render_value(value: &Value, backend: Backend) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => match backend {
