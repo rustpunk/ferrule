@@ -156,18 +156,34 @@ impl Repl {
         let start = std::time::Instant::now();
         let query_start = std::time::Instant::now();
 
-        let results = rt.block_on(async {
-            match self.conn.query(&paged).await {
-                Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
-                Err(ferrule_core::CoreError::QueryFailed(_)) => {
-                    match self.conn.execute(&paged).await {
-                        Ok(summary) => Ok(vec![StatementResult::Summary(summary)]),
-                        Err(_) => self.conn.execute_multi(&paged).await,
-                    }
+        let results = if self.state.explain_mode {
+            let (wrapped, _out) = match ferrule_core::explain_sql(&paged, self.backend, false) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Explain error: {e}");
+                    return;
                 }
-                Err(e) => Err(e),
-            }
-        });
+            };
+            rt.block_on(async {
+                match self.conn.query(&wrapped).await {
+                    Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
+                    Err(e) => Err(e),
+                }
+            })
+        } else {
+            rt.block_on(async {
+                match self.conn.query(&paged).await {
+                    Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
+                    Err(ferrule_core::CoreError::QueryFailed(_)) => {
+                        match self.conn.execute(&paged).await {
+                            Ok(summary) => Ok(vec![StatementResult::Summary(summary)]),
+                            Err(_) => self.conn.execute_multi(&paged).await,
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+        };
 
         let query_time = query_start.elapsed();
 
@@ -444,6 +460,22 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 }
             }
         }
+        "explain" => {
+            if args.is_empty() {
+                // Toggle explain mode
+                repl.state.explain_mode = !repl.state.explain_mode;
+                println!(
+                    "Explain mode: {}",
+                    if repl.state.explain_mode { "on" } else { "off" }
+                );
+            } else if args[0] == "off" {
+                repl.state.explain_mode = false;
+                println!("Explain mode: off");
+            } else {
+                let sql = args.join(" ");
+                cmd_explain(repl, &sql, rt);
+            }
+        }
         "help" | "h" | "?" => print_help(),
         _ => eprintln!("Unknown meta-command: \\{}. Type \\help for help.", cmd),
     }
@@ -467,7 +499,10 @@ fn print_help() {
     println!("  \\param <name> <value>   Set session parameter");
     println!("  \\param clear           Clear all session parameters");
     println!("  \\param list            List session parameters");
-    println!("  \\help                Show this help");
+    println!("  \\explain <name>        Explain a query");
+    println!("  \\explain               Toggle explain mode");
+    println!("  \\explain off           Disable explain mode");
+    println!("  \\help                 Show this help");
 }
 
 fn cmd_describe_table(repl: &mut Repl, table: &str, rt: &tokio::runtime::Handle) {
@@ -627,6 +662,39 @@ fn cmd_bookmark_delete(name: &str) {
             }
         }
         Err(e) => eprintln!("Failed to delete bookmark: {e}"),
+    }
+}
+
+fn cmd_explain(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        eprintln!("No SQL to explain.");
+        return;
+    }
+    let substituted = match substitute(trimmed, &repl.state.params, repl.backend) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Parameter error: {e}");
+            return;
+        }
+    };
+    let (wrapped, _out) = match ferrule_core::explain_sql(&substituted, repl.backend, false) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Explain error: {e}");
+            return;
+        }
+    };
+    if repl.state.verbose {
+        eprintln!("[ferrule] explain SQL: {wrapped}");
+    }
+    let result = rt.block_on(async { repl.conn.query(&wrapped).await });
+    match result {
+        Ok(qr) => match format_result(&qr, repl.state.format) {
+            Ok(text) => println!("{text}"),
+            Err(e) => eprintln!("Format error: {e}"),
+        },
+        Err(e) => eprintln!("Explain failed: {e}"),
     }
 }
 

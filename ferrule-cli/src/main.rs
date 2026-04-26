@@ -6,7 +6,9 @@ mod error;
 mod output;
 mod repl;
 
-use commands::{BookmarkArgs, ConnArgs, DescribeArgs, QueryArgs, ReplArgs, TablesArgs};
+use commands::{
+    BookmarkArgs, ConnArgs, DescribeArgs, ExplainArgs, QueryArgs, ReplArgs, TablesArgs,
+};
 use error::CliError;
 
 /// Ferrule — the collar that joins you to your data.
@@ -31,6 +33,11 @@ enum Commands {
 
     /// Manage query bookmarks
     Bookmark(BookmarkArgs),
+
+    /// Explain a query execution plan
+    Explain(ExplainArgs),
+
+    /// Interactive REPL
     #[command(alias = "r")]
     Repl(ReplArgs),
 
@@ -86,6 +93,7 @@ fn main() {
             Commands::Connection(args) => commands::conn::run(args, &global_config).await,
             Commands::Query(args) => commands::query::run(args, &global_config).await,
             Commands::Bookmark(args) => commands::bookmark::run(args, &global_config).await,
+            Commands::Explain(args) => commands::explain::run(args, &global_config).await,
             Commands::Repl(args) => commands::repl::run(args, &global_config).await,
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,
             Commands::Describe(args) => commands::describe::run(args, &global_config).await,

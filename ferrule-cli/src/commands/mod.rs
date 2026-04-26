@@ -1,11 +1,13 @@
 pub mod bookmark;
 pub mod conn;
 pub mod describe;
+pub mod explain;
 pub mod query;
 pub mod repl;
 pub mod tables;
 
 pub use bookmark::BookmarkArgs;
+pub use explain::ExplainArgs;
 pub use repl::ReplArgs;
 
 use crate::error::CliError;
@@ -233,6 +235,10 @@ pub struct QueryArgs {
     /// Read parameters from a JSON file
     #[arg(long, value_name = "PATH")]
     pub param_file: Option<String>,
+
+    /// Explain the query instead of executing it
+    #[arg(long)]
+    pub explain: bool,
 
     #[command(flatten)]
     pub output: OutputFlags,

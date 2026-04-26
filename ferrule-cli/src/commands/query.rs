@@ -3,6 +3,7 @@ use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::connect;
 use ferrule_core::connection::{ConnectOptions, QueryResult, StatementResult};
+use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::{infer_type, parse_param, substitute, ParameterSet};
 
@@ -44,6 +45,21 @@ fn render_single_result(
         StatementResult::Summary(s) => {
             Ok(format!("{} rows affected", s.rows_affected.unwrap_or(0)))
         }
+    }
+}
+
+fn print_explain_payload(payload: &str, out: ExplainOutput) {
+    match out {
+        ExplainOutput::Json => {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) {
+                if let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                    println!("{}", pretty);
+                    return;
+                }
+            }
+            println!("{}", payload);
+        }
+        _ => println!("{}", payload),
     }
 }
 
@@ -111,6 +127,37 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
 
     if args.output.verbose && !param_set.map.is_empty() {
         eprintln!("[ferrule] substituted SQL: {}", sql);
+    }
+
+    if args.explain {
+        let (wrapped, out) = explain_sql(&sql, backend, false).map_err(CliError::query)?;
+        if is_modifying(&sql) {
+            eprintln!(
+                "Warning: EXPLAIN on modifying statement uses estimated plan (ANALYZE disabled)."
+            );
+        }
+        if args.conn_flags.daemon {
+            eprintln!("[ferrule] Routing via daemon...");
+            let payload = crate::daemon::daemon_query(
+                &wrapped,
+                &url,
+                args.conn_flags.insecure,
+                format,
+                None,
+                None,
+            )
+            .await?;
+            print_explain_payload(&payload, out);
+            return Ok(());
+        }
+        let opts = ConnectOptions {
+            insecure: args.conn_flags.insecure,
+        };
+        let mut conn = connect(&url, &opts).await.map_err(CliError::connection)?;
+        let result = conn.query(&wrapped).await.map_err(CliError::query)?;
+        let rendered = format_result(&result, format).map_err(CliError::query)?;
+        print_explain_payload(&rendered, out);
+        return Ok(());
     }
 
     // Route through daemon if requested
