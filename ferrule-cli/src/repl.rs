@@ -6,9 +6,9 @@ use ferrule_config::registry::ConnectionRegistry;
 use ferrule_core::backend::{connect, Backend};
 use ferrule_core::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
+use ferrule_core::params::{infer_type, substitute, ParameterSet};
 use ferrule_core::url::DatabaseUrl;
 use ferrule_core::value::{ColumnInfo, TypeHint, Value};
-use indexmap::IndexMap;
 use std::io::Write;
 
 /// Mutable REPL session state.
@@ -18,8 +18,8 @@ pub struct ReplState {
     pub offset: Option<usize>,
     pub timing: bool,
     pub verbose: bool,
-    /// FE-011 placeholder — will become `ParameterSet`.
-    pub params: IndexMap<String, String>,
+    /// FE-011 session parameters.
+    pub params: ParameterSet,
     /// FE-012 placeholder.
     pub explain_mode: bool,
     /// FE-010 placeholder — last successfully executed SQL.
@@ -34,7 +34,7 @@ impl Default for ReplState {
             offset: None,
             timing: false,
             verbose: false,
-            params: IndexMap::new(),
+            params: ParameterSet::default(),
             explain_mode: false,
             last_sql: None,
         }
@@ -117,6 +117,19 @@ impl Repl {
             return;
         }
 
+        // Apply parameter substitution before paging
+        let substituted = match substitute(trimmed, &self.state.params, self.backend) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Parameter error: {e}");
+                return;
+            }
+        };
+
+        if self.state.verbose && substituted != trimmed {
+            eprintln!("[ferrule] substituted SQL: {substituted}");
+        }
+
         // Verify connection is alive.
         if let Err(e) = rt.block_on(self.conn.ping()) {
             eprintln!("Connection lost: {e}. Use \\conn to reconnect.");
@@ -124,7 +137,7 @@ impl Repl {
         }
 
         let paged = match ferrule_core::apply_paging(
-            trimmed,
+            &substituted,
             self.state.limit,
             self.state.offset,
             self.backend,
@@ -399,6 +412,38 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 }
             }
         }
+        "param" => {
+            if args.is_empty() {
+                eprintln!("Usage: \\param <name> <value> | clear | list");
+            } else {
+                match args[0] {
+                    "clear" => {
+                        repl.state.params.clear();
+                        println!("Parameters cleared.");
+                    }
+                    "list" => {
+                        if repl.state.params.map.is_empty() {
+                            println!("No parameters set.");
+                        } else {
+                            for (name, value) in &repl.state.params.map {
+                                println!("{} = {:?}", name, value);
+                            }
+                        }
+                    }
+                    _ => {
+                        if args.len() < 2 {
+                            eprintln!("Usage: \\param <name> <value>");
+                        } else {
+                            let name = args[0].to_string();
+                            let value = args[1..].join(" ");
+                            let inferred = infer_type(&value);
+                            repl.state.params.set(name.clone(), inferred);
+                            println!("Parameter {} set.", name);
+                        }
+                    }
+                }
+            }
+        }
         "help" | "h" | "?" => print_help(),
         _ => eprintln!("Unknown meta-command: \\{}. Type \\help for help.", cmd),
     }
@@ -419,6 +464,9 @@ fn print_help() {
     println!("  \\bookmark list          List bookmarks");
     println!("  \\bookmark run <name>   Run a bookmark with optional params");
     println!("  \\bookmark delete <name>  Delete a bookmark");
+    println!("  \\param <name> <value>   Set session parameter");
+    println!("  \\param clear           Clear all session parameters");
+    println!("  \\param list            List session parameters");
     println!("  \\help                Show this help");
 }
 

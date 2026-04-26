@@ -4,6 +4,7 @@ use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::connect;
 use ferrule_core::connection::{ConnectOptions, QueryResult, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
+use ferrule_core::{infer_type, parse_param, substitute, ParameterSet};
 
 fn render_query_result(
     result: &QueryResult,
@@ -75,6 +76,20 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         eprintln!("[ferrule] SQL: {}", sql);
     }
 
+    // Build parameter set from --param-file and --param
+    let mut param_set = ParameterSet::default();
+    if let Some(ref path) = args.param_file {
+        let path = std::path::Path::new(path);
+        let file_set = ferrule_core::load_from_json(path).map_err(CliError::query)?;
+        for (k, v) in file_set.map {
+            param_set.set(k, v);
+        }
+    }
+    for p in &args.params {
+        let (name, value) = parse_param(p).map_err(CliError::query)?;
+        param_set.set(name, infer_type(&value));
+    }
+
     if args.dry_run {
         println!("-- Dry run");
         println!("-- Connection: {}", args.connection);
@@ -86,6 +101,16 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
 
     if args.output.verbose {
         eprintln!("[ferrule] Resolved URL: {}", url.redacted());
+    }
+
+    let backend = ferrule_core::Backend::from_scheme(url.scheme())
+        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", url.scheme())))?;
+
+    // Substitute parameters into SQL before paging
+    let sql = substitute(&sql, &param_set, backend).map_err(CliError::query)?;
+
+    if args.output.verbose && !param_set.map.is_empty() {
+        eprintln!("[ferrule] substituted SQL: {}", sql);
     }
 
     // Route through daemon if requested
@@ -110,9 +135,6 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     if opts.insecure {
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
-
-    let backend = ferrule_core::Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", url.scheme())))?;
 
     let conn_start = std::time::Instant::now();
     let mut conn = connect(&url, &opts).await.map_err(CliError::connection)?;

@@ -226,6 +226,14 @@ pub struct QueryArgs {
     #[arg(long)]
     pub stdin: bool,
 
+    /// Named parameter (repeatable)
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub params: Vec<String>,
+
+    /// Read parameters from a JSON file
+    #[arg(long, value_name = "PATH")]
+    pub param_file: Option<String>,
+
     #[command(flatten)]
     pub output: OutputFlags,
 
