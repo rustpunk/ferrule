@@ -15,12 +15,12 @@ pub struct DumpArgs {
     pub table: String,
 
     /// Output file (stdout if omitted)
-    #[arg(short, long)]
+    #[arg(long)]
     pub file: Option<String>,
 
     /// Dump format
-    #[arg(short, long, value_name = "FORMAT")]
-    pub format: Option<String>,
+    #[arg(long, value_name = "FORMAT")]
+    pub dump_format: Option<String>,
 
     /// Schema name (if applicable)
     #[arg(long)]
@@ -35,7 +35,7 @@ pub struct DumpArgs {
 
 pub async fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args
-        .format
+        .dump_format
         .as_deref()
         .and_then(DumpFormat::parse)
         .unwrap_or(DumpFormat::Csv);

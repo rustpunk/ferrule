@@ -25,6 +25,9 @@ pub fn apply_paging(
     offset: Option<usize>,
     backend: Backend,
 ) -> Result<String, CoreError> {
+    let limit = limit.filter(|n| *n > 0);
+    let offset = offset.filter(|n| *n > 0);
+
     if limit.is_none() && offset.is_none() {
         return Ok(sql.to_string());
     }
@@ -87,6 +90,7 @@ fn has_existing_paging(upper: &str) -> bool {
 }
 
 fn build_limit_offset_paging(sql: &str, limit: usize, offset: usize) -> String {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
     let mut clauses = Vec::new();
     if limit > 0 {
         clauses.push(format!("LIMIT {limit}"));
@@ -98,9 +102,9 @@ fn build_limit_offset_paging(sql: &str, limit: usize, offset: usize) -> String {
         clauses.push(format!("OFFSET {offset}"));
     }
     if clauses.is_empty() {
-        sql.to_string()
+        trimmed.to_string()
     } else {
-        format!("{} {}", sql.trim(), clauses.join(" "))
+        format!("{} {}", trimmed, clauses.join(" "))
     }
 }
 
@@ -111,7 +115,8 @@ fn build_mssql_paging(
     offset: usize,
 ) -> Result<String, CoreError> {
     let needs_order_by = !upper.contains("ORDER BY");
-    let mut result = sql.trim().to_string();
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let mut result = trimmed.to_string();
     if needs_order_by {
         result.push_str(" ORDER BY (SELECT NULL)");
     }
@@ -130,7 +135,8 @@ fn build_oracle_paging(
     offset: usize,
 ) -> Result<String, CoreError> {
     let needs_order_by = !upper.contains("ORDER BY");
-    let mut result = sql.trim().to_string();
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let mut result = trimmed.to_string();
     if needs_order_by {
         result.push_str(" ORDER BY 1");
     }
