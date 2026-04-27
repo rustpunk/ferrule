@@ -1,8 +1,7 @@
-use super::{resolve_connection, ConnectionFlags, OutputFlags};
+use super::{check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags, OutputFlags};
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::connect;
 use ferrule_core::connection::ConnectOptions;
 use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::format_result;
@@ -33,14 +32,23 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
         eprintln!("[ferrule] SQL: {}", args.sql);
     }
 
-    let url = resolve_connection(&args.connection, None, global_config).await?;
+    let resolved = resolve_connection(
+        &args.connection,
+        None,
+        args.conn_flags.ssh_tunnel.as_deref(),
+        args.conn_flags.ssh_key.as_deref(),
+        global_config,
+    )
+    .await?;
+    check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     if args.output.verbose {
-        eprintln!("[ferrule] Resolved URL: {}", url.redacted());
+        eprintln!("[ferrule] Resolved URL: {}", resolved.url.redacted());
     }
 
-    let backend = ferrule_core::Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", url.scheme())))?;
+    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
+        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
+    })?;
 
     let (wrapped_sql, explain_out) =
         explain_sql(&args.sql, backend, args.analyze).map_err(CliError::query)?;
@@ -59,7 +67,7 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
         eprintln!("[ferrule] Routing via daemon...");
         let payload = crate::daemon::daemon_query(
             &wrapped_sql,
-            &url,
+            &resolved.url,
             args.conn_flags.insecure,
             format,
             None,
@@ -78,7 +86,7 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let mut conn = connect(&url, &opts).await.map_err(CliError::connection)?;
+    let mut conn = connect_resolved(resolved, &opts).await?;
 
     let result = conn.query(&wrapped_sql).await.map_err(CliError::query)?;
 

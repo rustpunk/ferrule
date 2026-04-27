@@ -1,8 +1,7 @@
-use super::{resolve_connection, ConnectionFlags};
+use super::{check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags};
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::connect;
 use ferrule_core::connection::ConnectOptions;
 use ferrule_core::{LoadFormat, LoadOptions};
 use std::path::Path;
@@ -69,10 +68,19 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
         .await
         .map_err(|e| CliError::usage(format!("Cannot read file '{}': {}", args.file, e)))?;
 
-    let url = resolve_connection(&args.connection, None, global_config).await?;
+    let resolved = resolve_connection(
+        &args.connection,
+        None,
+        args.conn_flags.ssh_tunnel.as_deref(),
+        args.conn_flags.ssh_key.as_deref(),
+        global_config,
+    )
+    .await?;
+    check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
-    let backend = ferrule_core::Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", url.scheme())))?;
+    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
+        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
+    })?;
 
     let opts = LoadOptions {
         format,
@@ -96,9 +104,7 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let mut conn = connect(&url, &opts_conn)
-        .await
-        .map_err(CliError::connection)?;
+    let mut conn = connect_resolved(resolved, &opts_conn).await?;
 
     let loaded = ferrule_core::load_data(conn.as_mut(), &data, backend, &opts)
         .await

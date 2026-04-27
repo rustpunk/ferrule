@@ -67,8 +67,18 @@ pub async fn run(args: WatchArgs, global_config: &GlobalConfig) -> Result<(), Cl
         print_lock: print_lock.clone(),
     };
 
-    // Resolve connection once to validate before entering the loop
-    let _url = resolve_connection(&args.connection, args.password, global_config).await?;
+    // Resolve connection once to validate before entering the loop.
+    // Discard the resolved tunnel handle (if any): the watch loop
+    // re-resolves on every iteration via `crate::watch::watch_loop`,
+    // which spins up a fresh tunnel per poll.
+    let _resolved = resolve_connection(
+        &args.connection,
+        args.password,
+        args.conn_flags.ssh_tunnel.as_deref(),
+        args.conn_flags.ssh_key.as_deref(),
+        global_config,
+    )
+    .await?;
 
     let r = running.clone();
     tokio::spawn(async move {

@@ -1,7 +1,7 @@
 use super::DiffArgs;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::{connect, Backend};
+use ferrule_core::backend::Backend;
 use ferrule_core::connection::{ConnectOptions, Connection, QueryResult};
 use ferrule_core::formatter::OutputFormat;
 use ferrule_core::value::Value;
@@ -259,22 +259,48 @@ fn render_text(diff: &SchemaDiff) -> String {
 pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);
 
-    let url_a =
-        super::resolve_connection(&args.connection_a, args.password_a, global_config).await?;
-    let url_b =
-        super::resolve_connection(&args.connection_b, args.password_b, global_config).await?;
+    // Both sides share the same `--ssh-tunnel` / `--ssh-key`: in
+    // practice users diffing against a bastion-isolated DB tunnel
+    // both ends through the same bastion. Cross-bastion diffs would
+    // need per-side SSH flags; out of scope for now.
+    let resolved_a = super::resolve_connection(
+        &args.connection_a,
+        args.password_a,
+        args.conn_flags.ssh_tunnel.as_deref(),
+        args.conn_flags.ssh_key.as_deref(),
+        global_config,
+    )
+    .await?;
+    let resolved_b = super::resolve_connection(
+        &args.connection_b,
+        args.password_b,
+        args.conn_flags.ssh_tunnel.as_deref(),
+        args.conn_flags.ssh_key.as_deref(),
+        global_config,
+    )
+    .await?;
+    super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved_a)?;
+    super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved_b)?;
 
-    let backend_a = Backend::from_scheme(url_a.scheme())
-        .ok_or_else(|| CliError::usage(format!("Unsupported scheme A: {}", url_a.scheme())))?;
-    let backend_b = Backend::from_scheme(url_b.scheme())
-        .ok_or_else(|| CliError::usage(format!("Unsupported scheme B: {}", url_b.scheme())))?;
+    let backend_a = Backend::from_scheme(resolved_a.url.scheme()).ok_or_else(|| {
+        CliError::usage(format!(
+            "Unsupported scheme A: {}",
+            resolved_a.url.scheme()
+        ))
+    })?;
+    let backend_b = Backend::from_scheme(resolved_b.url.scheme()).ok_or_else(|| {
+        CliError::usage(format!(
+            "Unsupported scheme B: {}",
+            resolved_b.url.scheme()
+        ))
+    })?;
 
     if args.output.verbose {
         eprintln!(
             "[ferrule] Diff: {} ({}) vs {} ({})",
-            url_a.redacted(),
+            resolved_a.url.redacted(),
             backend_a.name(),
-            url_b.redacted(),
+            resolved_b.url.redacted(),
             backend_b.name()
         );
     }
@@ -286,8 +312,8 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let mut conn_a = connect(&url_a, &opts).await.map_err(CliError::connection)?;
-    let mut conn_b = connect(&url_b, &opts).await.map_err(CliError::connection)?;
+    let mut conn_a = super::connect_resolved(resolved_a, &opts).await?;
+    let mut conn_b = super::connect_resolved(resolved_b, &opts).await?;
 
     let diff = build_schema_diff(
         conn_a.as_mut(),
@@ -411,8 +437,8 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut a = connect(&url_a, &ConnectOptions::default()).await.unwrap();
-        let mut b = connect(&url_b, &ConnectOptions::default()).await.unwrap();
+        let mut a = ferrule_core::connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut b = ferrule_core::connect(&url_b, &ConnectOptions::default()).await.unwrap();
 
         a.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
         b.execute("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").await.unwrap();

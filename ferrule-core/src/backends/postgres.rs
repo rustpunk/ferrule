@@ -268,6 +268,54 @@ pub async fn connect(
     Ok(PostgresConnection { client })
 }
 
+/// Connect over a pre-built `AsyncRead + AsyncWrite` stream
+/// instead of opening a TCP socket. Used by the SSH tunnel `Stream`
+/// transport: tokio-postgres negotiates Postgres protocol (and TLS,
+/// if `sslmode` requires it) end-to-end through the SSH channel.
+///
+/// Reuses the same TLS connector logic as [`connect`], so a URL like
+/// `postgres://app:pwd@db/myapp?sslmode=require` gets SSH transport
+/// AND TLS to the database — the two layers compose.
+#[cfg(feature = "ssh")]
+pub async fn connect_with_stream<S>(
+    url: &DatabaseUrl,
+    opts: &ConnectOptions,
+    stream: S,
+) -> Result<PostgresConnection, CoreError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio_postgres::tls::MakeTlsConnect;
+
+    let config = match url.raw().parse::<tokio_postgres::Config>() {
+        Ok(cfg) => cfg,
+        Err(_) => build_config_from_url(url)?,
+    };
+
+    let mut make_tls = build_tls_connector(opts)
+        .await
+        .map_err(CoreError::TlsError)?;
+    let hostname = url.host().unwrap_or("localhost");
+    let tls = <tokio_postgres_rustls::MakeRustlsConnect as MakeTlsConnect<S>>::make_tls_connect(
+        &mut make_tls,
+        hostname,
+    )
+    .map_err(|e| CoreError::TlsError(format!("make_tls_connect failed: {e:?}")))?;
+
+    let (client, connection) = config
+        .connect_raw(stream, tls)
+        .await
+        .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("[ferrule] Postgres background connection error: {}", e);
+        }
+    });
+
+    Ok(PostgresConnection { client })
+}
+
 fn build_config_from_url(url: &DatabaseUrl) -> Result<tokio_postgres::Config, CoreError> {
     let mut config = tokio_postgres::Config::new();
     if let Some(host) = url.host() {

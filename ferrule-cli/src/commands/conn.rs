@@ -26,16 +26,22 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
             println!("Connection '{}' removed.", name);
         }
         ConnCommand::Test { name, conn_flags } => {
-            let url = super::resolve_connection(&name, None, _global_config).await?;
+            let resolved = super::resolve_connection(
+                &name,
+                None,
+                conn_flags.ssh_tunnel.as_deref(),
+                conn_flags.ssh_key.as_deref(),
+                _global_config,
+            )
+            .await?;
+            super::check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
             let opts = ferrule_core::connection::ConnectOptions {
                 insecure: conn_flags.insecure,
             };
             if opts.insecure {
                 eprintln!("Warning: --insecure disables TLS certificate verification.");
             }
-            let mut conn = ferrule_core::backend::connect(&url, &opts)
-                .await
-                .map_err(CliError::connection)?;
+            let mut conn = super::connect_resolved(resolved, &opts).await?;
             conn.ping().await.map_err(CliError::connection)?;
             println!("Connection '{}' is alive.", name);
         }

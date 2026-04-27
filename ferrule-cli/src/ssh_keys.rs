@@ -29,6 +29,20 @@ pub enum KeySource {
     Agent(PathBuf),
 }
 
+/// Conversion to the core-side type that `setup_tunnel` consumes.
+/// Same shape; the duplication exists because the cli-side enum is
+/// always compiled while the core-side enum is gated behind the
+/// `ssh` feature.
+#[cfg(feature = "ssh")]
+impl From<KeySource> for ferrule_core::KeySource {
+    fn from(src: KeySource) -> ferrule_core::KeySource {
+        match src {
+            KeySource::File(p) => ferrule_core::KeySource::File(p),
+            KeySource::Agent(p) => ferrule_core::KeySource::Agent(p),
+        }
+    }
+}
+
 /// Resolve the SSH key source. Pure logic; all environmental inputs
 /// are passed in explicitly so tests can control them without env
 /// races against parallel test threads.

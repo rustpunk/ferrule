@@ -18,14 +18,146 @@ pub use repl::ReplArgs;
 pub use watch::WatchArgs;
 
 use crate::error::CliError;
+use crate::ssh_keys::KeySource;
 use clap::{Args, Subcommand};
 use ferrule_config::profile::GlobalConfig;
 use ferrule_config::registry::ConnectionRegistry;
+use ferrule_core::tunnel::SshConfig;
 use ferrule_core::url::DatabaseUrl;
 use secrecy::ExposeSecret;
 
-/// Resolve a connection string — either a raw URL or a registry/profile entry.
+/// SSH inputs collected by [`resolve_connection`]: the merged SSH
+/// configuration plus the resolved [`KeySource`]. The caller hands
+/// these to the dispatch layer (which converts to the core-side
+/// types and calls `connect_with_tunnel`).
+#[derive(Debug, Clone)]
+pub struct SshTunnelInputs {
+    pub config: SshConfig,
+    pub key_source: KeySource,
+}
+
+/// Bundled output of [`resolve_connection`]: the URL (possibly with
+/// password injected from the credential stack) plus optional SSH
+/// tunnel inputs. When `ssh` is `Some`, the dispatch layer will set
+/// up the tunnel before connecting; when `None`, it connects
+/// directly.
+#[derive(Debug, Clone)]
+pub struct ResolvedConnection {
+    pub url: DatabaseUrl,
+    pub ssh: Option<SshTunnelInputs>,
+}
+
+/// Resolve a connection string — either a raw URL or a registry/profile
+/// entry — into a [`ResolvedConnection`].
+///
+/// `ssh_tunnel` and `ssh_key` are the optional `--ssh-tunnel` and
+/// `--ssh-key` CLI flag values; pass `None`/`None` from call sites
+/// that don't expose those flags (e.g. `conn list`).
 pub async fn resolve_connection(
+    connection: &str,
+    password: Option<String>,
+    ssh_tunnel: Option<&str>,
+    ssh_key: Option<&str>,
+    global_config: &GlobalConfig,
+) -> Result<ResolvedConnection, CliError> {
+    let url = resolve_url(connection, password, global_config).await?;
+
+    let ssh_config = crate::ssh_flags::resolve_ssh_config(
+        connection,
+        ssh_tunnel,
+        ssh_key,
+        global_config,
+    )?;
+
+    let ssh = match ssh_config {
+        Some(cfg) => {
+            let key_source = crate::ssh_keys::resolve_key_source_default(
+                connection,
+                cfg.key_path.as_deref(),
+            )?;
+            Some(SshTunnelInputs {
+                config: cfg,
+                key_source,
+            })
+        }
+        None => None,
+    };
+
+    Ok(ResolvedConnection { url, ssh })
+}
+
+/// Per Wave 3 B3 §2d: reject `--daemon` together with any SSH
+/// tunnel configuration. The connection pooling daemon does not
+/// pool tunneled connections, so the combination would silently
+/// either ignore the tunnel or queue connections behind a single
+/// shared session that is fragile under SSH idle timeouts. Either
+/// is a bad UX; we surface the conflict clearly instead.
+pub fn check_daemon_ssh_compat(
+    daemon: bool,
+    resolved: &ResolvedConnection,
+) -> Result<(), CliError> {
+    if daemon && resolved.ssh.is_some() {
+        return Err(CliError::usage(
+            "SSH tunnels bypass the connection pooling daemon. The tunnel \
+             session lifecycle is tied to the request, so pooling tunneled \
+             connections would introduce a class of failure modes around \
+             session timeout that ferrule does not currently handle. Either \
+             drop --daemon or open without a tunnel."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Establish a [`Connection`](ferrule_core::Connection) from a
+/// [`ResolvedConnection`]. Routes through the SSH tunnel when
+/// `resolved.ssh` is `Some` (gated behind the `ssh` feature; without
+/// it, this returns a "compiled without SSH support" diagnostic).
+pub async fn connect_resolved(
+    resolved: ResolvedConnection,
+    opts: &ferrule_core::ConnectOptions,
+) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
+    if let Some(ssh) = resolved.ssh {
+        return connect_via_ssh_tunnel(resolved.url, ssh, opts).await;
+    }
+    ferrule_core::connect(&resolved.url, opts)
+        .await
+        .map_err(CliError::connection)
+}
+
+#[cfg(feature = "ssh")]
+async fn connect_via_ssh_tunnel(
+    url: DatabaseUrl,
+    ssh: SshTunnelInputs,
+    opts: &ferrule_core::ConnectOptions,
+) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
+    let core_key_source: ferrule_core::KeySource = ssh.key_source.into();
+    ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &core_key_source)
+        .await
+        .map_err(CliError::connection)
+}
+
+#[cfg(not(feature = "ssh"))]
+async fn connect_via_ssh_tunnel(
+    _url: DatabaseUrl,
+    ssh: SshTunnelInputs,
+    _opts: &ferrule_core::ConnectOptions,
+) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
+    // Read the fields so they aren't flagged as dead code in
+    // ssh-feature-off builds; the struct exists in both feature
+    // modes because `ResolvedConnection.ssh` is non-gated.
+    let _ = (&ssh.config, &ssh.key_source);
+    Err(CliError::usage(
+        "This ferrule binary was built without the `ssh` feature. \
+         Rebuild with `cargo build --features ferrule-cli/ssh` (or `--features all`)."
+            .to_string(),
+    ))
+}
+
+/// Resolve just the URL (and credential stack) without touching SSH.
+/// Internal to `resolve_connection`; split out so the SSH branch
+/// reuses it cleanly.
+async fn resolve_url(
     connection: &str,
     password: Option<String>,
     global_config: &GlobalConfig,

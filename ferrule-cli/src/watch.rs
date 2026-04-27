@@ -1,7 +1,6 @@
-use crate::commands::{resolve_connection, ConnectionFlags};
+use crate::commands::{check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::connect;
 use ferrule_core::connection::{ConnectOptions, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use is_terminal::IsTerminal;
@@ -50,9 +49,20 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             opts.interval_secs.load(Ordering::Relaxed),
         );
 
-        // Resolve connection each iteration
-        let url = match resolve_connection(&opts.connection, None, &opts.global_config).await {
-            Ok(u) => u,
+        // Resolve connection each iteration. SSH tunnels are spun
+        // up fresh per poll: the previous iteration's session and
+        // forwarder were dropped when the previous `conn` went out
+        // of scope.
+        let resolved = match resolve_connection(
+            &opts.connection,
+            None,
+            opts.conn_flags.ssh_tunnel.as_deref(),
+            opts.conn_flags.ssh_key.as_deref(),
+            &opts.global_config,
+        )
+        .await
+        {
+            Ok(r) => r,
             Err(e) => {
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] connection error: {e}");
@@ -60,12 +70,18 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                 continue;
             }
         };
+        if let Err(e) = check_daemon_ssh_compat(opts.conn_flags.daemon, &resolved) {
+            let _guard = opts.print_lock.lock();
+            eprintln!("[watch] {e}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
 
-        let backend = match ferrule_core::Backend::from_scheme(url.scheme()) {
+        let backend = match ferrule_core::Backend::from_scheme(resolved.url.scheme()) {
             Some(b) => b,
             None => {
                 let _guard = opts.print_lock.lock();
-                eprintln!("[watch] unsupported scheme: {}", url.scheme());
+                eprintln!("[watch] unsupported scheme: {}", resolved.url.scheme());
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -87,8 +103,8 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
         }
 
         let conn_start = Instant::now();
-        let mut conn = match connect(
-            &url,
+        let mut conn = match connect_resolved(
+            resolved,
             &ConnectOptions {
                 insecure: opts.conn_flags.insecure,
             },

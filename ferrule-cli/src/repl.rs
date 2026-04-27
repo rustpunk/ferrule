@@ -1,9 +1,11 @@
-use crate::commands::{resolve_connection, OutputFlags};
+use crate::commands::{
+    check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags, OutputFlags,
+};
 use crate::error::CliError;
 use ferrule_config::bookmarks::BookmarkStore;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_config::registry::ConnectionRegistry;
-use ferrule_core::backend::{connect, Backend};
+use ferrule_core::backend::Backend;
 use ferrule_core::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::params::{infer_type, substitute, ParameterSet};
@@ -52,20 +54,35 @@ pub struct Repl {
     pub state: ReplState,
     pub global_config: GlobalConfig,
     pub insecure: bool,
+    /// SSH bits and other connection flags carried through `\conn`
+    /// switches so the bastion stays consistent across the session.
+    pub conn_flags: ConnectionFlags,
 }
 
 impl Repl {
     pub async fn new(
         connection_str: &str,
         output: OutputFlags,
-        insecure: bool,
+        conn_flags: ConnectionFlags,
         global_config: &GlobalConfig,
     ) -> Result<Self, CliError> {
-        let url = resolve_connection(connection_str, None, global_config).await?;
-        let opts = ConnectOptions { insecure };
-        let backend = Backend::from_scheme(url.scheme())
-            .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", url.scheme())))?;
-        let conn = connect(&url, &opts).await.map_err(CliError::connection)?;
+        let resolved = resolve_connection(
+            connection_str,
+            None,
+            conn_flags.ssh_tunnel.as_deref(),
+            conn_flags.ssh_key.as_deref(),
+            global_config,
+        )
+        .await?;
+        check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
+        let opts = ConnectOptions {
+            insecure: conn_flags.insecure,
+        };
+        let backend = Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
+            CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
+        })?;
+        let url = resolved.url.clone();
+        let conn = connect_resolved(resolved, &opts).await?;
 
         let format = output.resolve_format(global_config);
         let limit = output.resolve_limit(global_config);
@@ -82,33 +99,45 @@ impl Repl {
                 ..ReplState::default()
             },
             global_config: global_config.clone(),
-            insecure,
+            insecure: conn_flags.insecure,
+            conn_flags,
         })
     }
 
-    /// Switch to a different connection.
+    /// Switch to a different connection. Inherits the SSH bits from
+    /// the original session — a bastion-attached REPL stays on that
+    /// bastion across `\conn`.
     pub async fn switch_connection(&mut self, name_or_url: &str) {
-        match resolve_connection(name_or_url, None, &self.global_config).await {
-            Ok(url) => {
-                let opts = ConnectOptions {
-                    insecure: self.insecure,
-                };
-                match connect(&url, &opts).await {
-                    Ok(conn) => {
-                        if let Some(b) = Backend::from_scheme(url.scheme()) {
-                            self.backend = b;
-                        }
-                        self.url = url;
-                        self.conn = conn;
-                        println!("Switched to: {}", self.url.redacted());
-                    }
-                    Err(e) => {
-                        eprintln!("Connection failed: {e}");
-                    }
-                }
-            }
+        let resolved = match resolve_connection(
+            name_or_url,
+            None,
+            self.conn_flags.ssh_tunnel.as_deref(),
+            self.conn_flags.ssh_key.as_deref(),
+            &self.global_config,
+        )
+        .await
+        {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("Could not resolve connection: {e}");
+                return;
+            }
+        };
+        let new_url = resolved.url.clone();
+        let opts = ConnectOptions {
+            insecure: self.insecure,
+        };
+        match connect_resolved(resolved, &opts).await {
+            Ok(conn) => {
+                if let Some(b) = Backend::from_scheme(new_url.scheme()) {
+                    self.backend = b;
+                }
+                self.url = new_url;
+                self.conn = conn;
+                println!("Switched to: {}", self.url.redacted());
+            }
+            Err(e) => {
+                eprintln!("Connection failed: {e}");
             }
         }
     }

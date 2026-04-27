@@ -1,7 +1,6 @@
 use super::QueryArgs;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::connect;
 use ferrule_core::connection::{ConnectOptions, QueryResult, StatementResult};
 use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::{format_result, OutputFormat};
@@ -157,25 +156,23 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         return Ok(());
     }
 
-    let url = super::resolve_connection(&args.connection, args.password, global_config).await?;
-
-    // Resolve SSH tunnel configuration (profile keys + CLI flag merge).
-    // Errors out cleanly when the user requests SSH but the russh
-    // tunnel layer is not yet wired (Wave 3 B3 step 2c). Plain
-    // connections see Ok(None) and proceed unaffected.
-    let _ssh_config = crate::ssh_flags::resolve_ssh_config(
+    let resolved = super::resolve_connection(
         &args.connection,
+        args.password,
         args.conn_flags.ssh_tunnel.as_deref(),
         args.conn_flags.ssh_key.as_deref(),
         global_config,
-    )?;
+    )
+    .await?;
+    super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     if args.output.verbose {
-        eprintln!("[ferrule] Resolved URL: {}", url.redacted());
+        eprintln!("[ferrule] Resolved URL: {}", resolved.url.redacted());
     }
 
-    let backend = ferrule_core::Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", url.scheme())))?;
+    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
+        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
+    })?;
 
     // Substitute parameters into SQL before paging
     let sql = substitute(&sql, &param_set, backend).map_err(CliError::query)?;
@@ -195,7 +192,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             eprintln!("[ferrule] Routing via daemon...");
             let payload = crate::daemon::daemon_query(
                 &wrapped,
-                &url,
+                &resolved.url,
                 args.conn_flags.insecure,
                 format,
                 None,
@@ -208,7 +205,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         let opts = ConnectOptions {
             insecure: args.conn_flags.insecure,
         };
-        let mut conn = connect(&url, &opts).await.map_err(CliError::connection)?;
+        let mut conn = super::connect_resolved(resolved, &opts).await?;
         let result = conn.query(&wrapped).await.map_err(CliError::query)?;
         let rendered = format_result(&result, format).map_err(CliError::query)?;
         print_explain_payload(&rendered, out);
@@ -220,7 +217,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         eprintln!("[ferrule] Routing via daemon...");
         let payload = crate::daemon::daemon_query(
             &sql,
-            &url,
+            &resolved.url,
             args.conn_flags.insecure,
             format,
             limit,
@@ -240,7 +237,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     }
 
     let conn_start = std::time::Instant::now();
-    let mut conn = connect(&url, &opts).await.map_err(CliError::connection)?;
+    let mut conn = super::connect_resolved(resolved, &opts).await?;
     let conn_time = conn_start.elapsed();
 
     // Inject server-side paging into the SQL

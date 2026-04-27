@@ -33,7 +33,7 @@ pub async fn run(args: ReplArgs, global_config: &GlobalConfig) -> Result<(), Cli
     let mut repl = Repl::new(
         &connection_str,
         args.output,
-        args.conn_flags.insecure,
+        args.conn_flags.clone(),
         global_config,
     )
     .await?;

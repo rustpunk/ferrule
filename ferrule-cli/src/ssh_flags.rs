@@ -141,14 +141,8 @@ pub fn merge_ssh_config(
 }
 
 /// Look up the connection's profile (if any) and merge it with CLI
-/// flags into a final [`SshConfig`].
-///
-/// **Staging guard:** while the russh tunnel lifecycle is unimplemented
-/// (Wave 3 B3 step 2c), this function returns a clear "not yet wired"
-/// error rather than silently dropping the SSH configuration on the
-/// floor. That avoids the UX trap where a user passes `--ssh-tunnel`
-/// and gets a direct connection that ignores the bastion. The guard
-/// will be removed when the tunnel layer lands.
+/// flags into a final [`SshConfig`]. Returns `Ok(None)` when no SSH
+/// bits are configured anywhere.
 pub fn resolve_ssh_config(
     connection_name: &str,
     cli_ssh_tunnel: Option<&str>,
@@ -156,23 +150,7 @@ pub fn resolve_ssh_config(
     global_config: &GlobalConfig,
 ) -> Result<Option<SshConfig>, CliError> {
     let profile = global_config.connection.get(connection_name);
-    let cfg = merge_ssh_config(profile, cli_ssh_tunnel, cli_ssh_key)?;
-    if let Some(ref c) = cfg {
-        // Validate the SSH key resolution before surfacing the
-        // staging error — "no key found" is a more fundamental issue
-        // and the user should fix it first.
-        let _key_source = crate::ssh_keys::resolve_key_source_default(
-            connection_name,
-            c.key_path.as_deref(),
-        )?;
-        return Err(CliError::usage(
-            "SSH tunnel configuration parses and the SSH key resolves, \
-             but the russh tunnel lifecycle is not yet wired up. The \
-             implementation is staged; see the plan at Wave 3 B3 step 2c."
-                .to_string(),
-        ));
-    }
-    Ok(cfg)
+    merge_ssh_config(profile, cli_ssh_tunnel, cli_ssh_key)
 }
 
 fn default_ssh_user() -> String {

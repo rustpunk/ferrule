@@ -1,9 +1,11 @@
-use super::{resolve_connection, ConnectionFlags, OutputFlags};
+use super::{
+    check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags, OutputFlags,
+};
 use crate::error::CliError;
 use clap::{Args, Subcommand};
 use ferrule_config::bookmarks::BookmarkStore;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::{connect, Backend};
+use ferrule_core::backend::Backend;
 use ferrule_core::connection::{ConnectOptions, StatementResult};
 use ferrule_core::formatter::format_result;
 
@@ -133,17 +135,31 @@ async fn cmd_run(
     let limit = output.resolve_limit(global_config);
     let offset = output.offset;
 
+    let resolved = resolve_connection(
+        &connection_str,
+        None,
+        conn_flags.ssh_tunnel.as_deref(),
+        conn_flags.ssh_key.as_deref(),
+        global_config,
+    )
+    .await?;
+    check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
+
     if conn_flags.daemon {
         eprintln!("[ferrule] Routing via daemon...");
-        let url = resolve_connection(&connection_str, None, global_config).await?;
-        let payload =
-            crate::daemon::daemon_query(&sql, &url, conn_flags.insecure, format, limit, offset)
-                .await?;
+        let payload = crate::daemon::daemon_query(
+            &sql,
+            &resolved.url,
+            conn_flags.insecure,
+            format,
+            limit,
+            offset,
+        )
+        .await?;
         println!("{}", payload);
         return Ok(());
     }
 
-    let url = resolve_connection(&connection_str, None, global_config).await?;
     let opts = ConnectOptions {
         insecure: conn_flags.insecure,
     };
@@ -151,10 +167,11 @@ async fn cmd_run(
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let backend = Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", url.scheme())))?;
+    let backend = Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
+        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
+    })?;
 
-    let mut conn = connect(&url, &opts).await.map_err(CliError::connection)?;
+    let mut conn = connect_resolved(resolved, &opts).await?;
 
     let sql = ferrule_core::apply_paging(&sql, limit, offset, backend).map_err(CliError::query)?;
 

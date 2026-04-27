@@ -172,17 +172,68 @@ mod ssh_impl {
         Stream { stream: Box<TunnelStream> },
     }
 
-    /// Wraps an inner backend connection plus the [`TunnelHandle`].
-    /// The SSH session and (for path a) the forwarder task share the
-    /// connection's lifetime: dropping the [`TunneledConnection`]
-    /// drops everything in tandem.
+    /// Wraps a backend [`Connection`](crate::Connection) plus the
+    /// SSH session (and, for the LocalListener transport, the
+    /// forwarder task) so the entire stack drops together.
     ///
-    /// Wave 3 B3 step 2c only adds the wrapper struct. The
-    /// blanket `Connection` impl (delegating every method to
-    /// `inner`) lands with the dispatch wiring in Commit C.
-    pub struct TunneledConnection<C> {
-        pub inner: C,
-        pub handle: TunnelHandle,
+    /// Why this is non-generic: dispatch returns `Box<dyn
+    /// Connection>` regardless of backend, so an outer wrapper that
+    /// already holds the inner as `Box<dyn Connection>` saves us
+    /// from adding a blanket `impl<C: Connection> Connection for
+    /// TunneledConnection<C>` and the matching `impl<C> Connection
+    /// for Box<C>` (which `async_trait` doesn't synthesize).
+    pub struct TunneledConnection {
+        pub inner: Box<dyn crate::Connection>,
+        /// Held for `Drop` only — lifetime guard for the SSH session.
+        pub session: SshSession,
+        /// `Some` for the LocalListener transport, `None` for the
+        /// Stream transport (Postgres feeds the stream directly into
+        /// `tokio_postgres::Connection`'s task, no separate
+        /// forwarder needed).
+        pub forwarder: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Connection for TunneledConnection {
+        async fn execute(
+            &mut self,
+            sql: &str,
+        ) -> Result<crate::ExecutionSummary, crate::CoreError> {
+            self.inner.execute(sql).await
+        }
+
+        async fn query(
+            &mut self,
+            sql: &str,
+        ) -> Result<crate::QueryResult, crate::CoreError> {
+            self.inner.query(sql).await
+        }
+
+        async fn execute_multi(
+            &mut self,
+            sql: &str,
+        ) -> Result<Vec<crate::StatementResult>, crate::CoreError> {
+            self.inner.execute_multi(sql).await
+        }
+
+        async fn ping(&mut self) -> Result<(), crate::CoreError> {
+            self.inner.ping().await
+        }
+
+        async fn list_tables(
+            &mut self,
+            schema: Option<&str>,
+        ) -> Result<Vec<String>, crate::CoreError> {
+            self.inner.list_tables(schema).await
+        }
+
+        async fn describe_table(
+            &mut self,
+            schema: Option<&str>,
+            table: &str,
+        ) -> Result<crate::QueryResult, crate::CoreError> {
+            self.inner.describe_table(schema, table).await
+        }
     }
 
     /// russh client handler.
