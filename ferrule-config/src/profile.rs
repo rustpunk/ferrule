@@ -34,9 +34,18 @@ impl GlobalConfig {
             .map_err(|e| ConfigError::ConfigNotFound(format!("{}: {}", path.display(), e)))?;
         let mut config: GlobalConfig =
             toml::from_str(&content).map_err(|e| ConfigError::InvalidConfig(e.to_string()))?;
-        // Apply env interpolation to profile URLs
+        // Apply env interpolation to profile URLs and SSH config strings.
         for profile in config.connection.values_mut() {
             profile.url = crate::registry::interpolate_env_vars(&profile.url);
+            if let Some(host) = &profile.ssh_host {
+                profile.ssh_host = Some(crate::registry::interpolate_env_vars(host));
+            }
+            if let Some(user) = &profile.ssh_user {
+                profile.ssh_user = Some(crate::registry::interpolate_env_vars(user));
+            }
+            if let Some(key) = &profile.ssh_key {
+                profile.ssh_key = Some(crate::registry::interpolate_env_vars(key));
+            }
         }
         Ok(config)
     }
@@ -120,6 +129,23 @@ pub struct ConnectionProfile {
     pub password_url: Option<String>,
     #[serde(default)]
     pub headers: IndexMap<String, String>,
+
+    /// SSH bastion hostname or IP. When set, ferrule opens an SSH session
+    /// to this host and forwards a local port to `url`'s host:port. The
+    /// rest of the `ssh_*` keys configure the SSH session.
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    /// SSH login username. Defaults to `$USER` at connect time.
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    /// SSH server port. Defaults to 22.
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    /// Path to the SSH private key. Tilde and `${VAR}` expansion happens
+    /// at connect time. When `None`, the key is resolved through the key
+    /// stack (CLI flag → env → default identity files → SSH agent).
+    #[serde(default)]
+    pub ssh_key: Option<String>,
 }
 
 #[cfg(test)]
@@ -183,5 +209,81 @@ url = "postgres://user@${FERRULE_TEST_PROFILE_HOST}/db"
         let test = config.connection.get("test").unwrap();
         assert_eq!(test.url, "postgres://user@myhost/db");
         std::env::remove_var("FERRULE_TEST_PROFILE_HOST");
+    }
+
+    #[test]
+    fn ssh_keys_default_to_none() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = r#"
+[connection.plain]
+url = "postgres://user:pass@host/db"
+"#;
+        tmp.write_all(content.as_bytes()).unwrap();
+        let config = GlobalConfig::load_from(tmp.path()).unwrap();
+        let plain = config.connection.get("plain").unwrap();
+        assert!(plain.ssh_host.is_none());
+        assert!(plain.ssh_user.is_none());
+        assert!(plain.ssh_port.is_none());
+        assert!(plain.ssh_key.is_none());
+    }
+
+    #[test]
+    fn ssh_keys_parse_when_present() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = r#"
+[connection.tunneled]
+url = "postgres://app:pwd@10.0.0.5:5432/myapp"
+ssh_host = "bastion.example.com"
+ssh_user = "ec2-user"
+ssh_port = 2222
+ssh_key  = "/home/me/.ssh/id_ed25519"
+"#;
+        tmp.write_all(content.as_bytes()).unwrap();
+        let config = GlobalConfig::load_from(tmp.path()).unwrap();
+        let tunneled = config.connection.get("tunneled").unwrap();
+        assert_eq!(tunneled.ssh_host.as_deref(), Some("bastion.example.com"));
+        assert_eq!(tunneled.ssh_user.as_deref(), Some("ec2-user"));
+        assert_eq!(tunneled.ssh_port, Some(2222));
+        assert_eq!(tunneled.ssh_key.as_deref(), Some("/home/me/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn ssh_partial_keys_parse_independently() {
+        // Only ssh_host set; the other ssh_* keys default to None and the
+        // tunnel layer fills the gaps (ssh_user → $USER, ssh_port → 22,
+        // ssh_key → resolved via key stack).
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = r#"
+[connection.minimal]
+url = "postgres://app@db-host/myapp"
+ssh_host = "bastion"
+"#;
+        tmp.write_all(content.as_bytes()).unwrap();
+        let config = GlobalConfig::load_from(tmp.path()).unwrap();
+        let minimal = config.connection.get("minimal").unwrap();
+        assert_eq!(minimal.ssh_host.as_deref(), Some("bastion"));
+        assert!(minimal.ssh_user.is_none());
+        assert!(minimal.ssh_port.is_none());
+        assert!(minimal.ssh_key.is_none());
+    }
+
+    #[test]
+    fn ssh_host_and_key_get_env_interpolation() {
+        std::env::set_var("FERRULE_TEST_BASTION", "bastion.prod");
+        std::env::set_var("FERRULE_TEST_KEYDIR", "/keys");
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = r#"
+[connection.tmpl]
+url = "postgres://app@db/myapp"
+ssh_host = "${FERRULE_TEST_BASTION}"
+ssh_key  = "${FERRULE_TEST_KEYDIR}/id_rsa"
+"#;
+        tmp.write_all(content.as_bytes()).unwrap();
+        let config = GlobalConfig::load_from(tmp.path()).unwrap();
+        let tmpl = config.connection.get("tmpl").unwrap();
+        assert_eq!(tmpl.ssh_host.as_deref(), Some("bastion.prod"));
+        assert_eq!(tmpl.ssh_key.as_deref(), Some("/keys/id_rsa"));
+        std::env::remove_var("FERRULE_TEST_BASTION");
+        std::env::remove_var("FERRULE_TEST_KEYDIR");
     }
 }
