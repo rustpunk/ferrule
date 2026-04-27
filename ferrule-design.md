@@ -179,7 +179,7 @@ all = ["postgres", "mysql", "mssql", "sqlite", "oracle"]
 | `ferrule schema <conn>` | List schemas/databases |
 | Transaction support | `--begin`, `--commit`, `--rollback` flags per-session (script mode) |
 | Multi-statement execution | Split `;`-delimited statements, execute sequentially |
-| Exit code convention | 0=success, 1=usage, 2=connection, 3=query error, 4=no rows (optional) |
+| Exit code convention | 0=success, 1=notable result (GNU diff convention; e.g. `ferrule diff` differences, future `--fail-on-empty`), 2=usage, 3=connection, 4=query error |
 
 ### Wave 1.5 — Performance & QoL
 

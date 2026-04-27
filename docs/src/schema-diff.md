@@ -114,13 +114,15 @@ twice (once per side). For non-interactive contexts, use
 - `0` — schemas are identical (no differences in tables or columns).
 - `1` — differences were found. Suitable for CI gates: a non-zero
   exit makes the job fail when staging and prod drift.
-- `2` — connection or query failure (couldn't read either schema).
-- `3` — internal SQL error during introspection.
+- `2` — usage error (bad arguments, unknown connection name).
+- `3` — connection error (TLS, auth, network — couldn't reach a side).
+- `4` — query / introspection error.
 
-Note that exit `1` here overlaps with the generic CLI usage error.
-This is deliberate — it matches what GNU diff/grep do — but it means
-a script can't distinguish "schemas differ" from "you typed the
-command wrong" by exit code alone. Read stderr for the diagnostic.
+Exit `1` is reserved across ferrule for "command succeeded with a
+notable result" — diff today, future `--fail-on-empty` and check /
+validate commands tomorrow. Real errors live at codes `2..=4`, so a
+diff-found result is unambiguously distinguishable from a malformed
+invocation.
 
 ## Wrapping into CI
 

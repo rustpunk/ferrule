@@ -400,7 +400,7 @@ pub struct QueryArgs {
 
     /// JMESPath expression applied to JSON output before printing.
     ///
-    /// Implies --format json. Errors fail with exit code 3.
+    /// Implies --format json. Errors fail with exit code 4 (query class).
     #[arg(long, value_name = "EXPR")]
     pub filter: Option<String>,
 

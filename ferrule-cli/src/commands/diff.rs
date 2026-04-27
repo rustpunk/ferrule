@@ -328,11 +328,10 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
     println!("{}", rendered);
 
     // GNU diff convention: exit 0 when no differences, exit 1 when any are
-    // found. This deliberately overlaps with ferrule's USAGE exit code (1);
-    // the convention is widely expected for diff-style tools and lets users
-    // chain diff output into shell pipelines and CI gates.
+    // found. Code 1 is `exit::RESULT_NOTABLE` — reserved for diff-class
+    // commands that succeed with a caller-gateable result.
     if !diff.is_empty() {
-        std::process::exit(1);
+        std::process::exit(crate::error::exit::RESULT_NOTABLE);
     }
 
     Ok(())

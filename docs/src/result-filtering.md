@@ -94,7 +94,7 @@ ferrule query demo "SELECT * FROM users ORDER BY created_at DESC LIMIT 1" \
 | `--filter` + `INSERT/UPDATE/DELETE` (summary) | Rejected — "requires a SELECT-style query that returns rows" |
 | `--filter` + multi-statement | Rejected — "cannot be applied to multi-statement queries" |
 | `--filter` + `--explain` | Rejected — explain payloads are XML/text/JSON-of-plan, not row data |
-| Invalid JMESPath syntax | Exits with code 3 (query error class) and a clear diagnostic |
+| Invalid JMESPath syntax | Exits with code 4 (query error class) and a clear diagnostic |
 
 The output is always re-serialized as pretty-printed JSON (two-space
 indentation), so the result is human-readable AND pipe-friendly for
@@ -122,6 +122,6 @@ language is much larger — see [the JMESPath tutorial][tutorial].
 
 - `0` — filter ran successfully and produced output (even if the
   filtered output is an empty array `[]`).
-- `3` — JMESPath parse error, JMESPath evaluation error, or output
+- `4` — JMESPath parse error, JMESPath evaluation error, or output
   could not be re-serialized as JSON. Same class as a SQL query
   failure.

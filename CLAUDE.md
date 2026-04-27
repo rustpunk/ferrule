@@ -32,7 +32,7 @@ Three-crate workspace:
 - Zero runtime deps for default features. Oracle alone requires external Instant Client.
 - All passwords wrapped in `SecretString` — zeroize on drop, redact in Debug.
 - Connection URLs: password component redacted in every log/diagnostic.
-- Exit codes: 0=success, 1=usage, 2=connection, 3=query error, 4=no rows (optional).
+- Exit codes: 0=success, 1=notable result (diff differences, future `--fail-on-empty`, future check/validate findings — GNU diff convention), 2=usage, 3=connection, 4=query error.
 - `--format table` is default when TTY; `--format json` when piped.
 - `--insecure` flag required to disable TLS verification. Warns on stderr.
 - `#[tokio::main(flavor = "current_thread")]` in `main.rs`.

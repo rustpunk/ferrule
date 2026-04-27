@@ -7,17 +7,17 @@ When something goes wrong, the fastest path is usually:
    format.
 3. Match the symptom to one of the entries below.
 
-Exit codes (`echo $?`) tell you which class of failure you hit:
+Exit codes (`echo $?`) tell you which class of result you hit:
 
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | Usage / argument error |
-| 2 | Connection error (TLS, auth, network) |
-| 3 | Query error (SQL syntax, constraint, schema) |
-| 4 | Reserved for `--expect-rows`-style assertions |
+| 1 | Notable result — `ferrule diff` found differences, future `--expect-rows`-style assertions. GNU `diff` / `grep` convention. Not an error |
+| 2 | Usage / argument error (matches clap's parse-error exit) |
+| 3 | Connection error (TLS, auth, network) |
+| 4 | Query error (SQL syntax, constraint, schema) |
 
-## Connection errors (exit code 2)
+## Connection errors (exit code 3)
 
 ### `connection refused` / `host unreachable`
 
@@ -95,7 +95,7 @@ The keyring is locked, or there's no Secret Service to talk to.
 - **macOS:** Run `security unlock-keychain` once per session if
   you're invoking from a non-GUI shell.
 
-## Query errors (exit code 3)
+## Query errors (exit code 4)
 
 ### `Multi-statement SQL does not support --limit / --offset`
 

@@ -81,7 +81,10 @@ fn main() {
     if args.len() > 1 && args[1] == "__daemon" {
         if let Err(e) = run_daemon_mode() {
             eprintln!("Daemon error: {e}");
-            std::process::exit(1);
+            // Internal __daemon-mode failure is consumed by the parent
+            // ferrule process, but pick a category-correct code so
+            // a hand-invoked `ferrule __daemon` still classifies right.
+            std::process::exit(error::exit::QUERY);
         }
         return;
     }

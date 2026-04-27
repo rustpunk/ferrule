@@ -214,10 +214,10 @@ Available on every command that opens a connection.
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | Usage error (invalid CLI arguments, malformed SQL parsing) |
-| 2 | Connection error (network, TLS, authentication, backend unavailable) |
-| 3 | Query error (SQL syntax, constraint violation, schema mismatch) |
-| 4 | Reserved for `--expect-rows`-style assertions |
+| 1 | Notable result — `ferrule diff` found schema differences. Reserved for future `--expect-rows`-style assertions and any future check / validate / lint commands. Follows the GNU `diff` / `grep` / `kubectl diff` convention: the command ran correctly and produced a result you likely want to gate on. **Not an error.** |
+| 2 | Usage error (invalid CLI arguments, malformed SQL parsing). Matches clap's default exit code for argument-parse failures |
+| 3 | Connection error (network, TLS, authentication, backend unavailable) |
+| 4 | Query error (SQL syntax, constraint violation, schema mismatch) |
 
 ## Environment variables
 

@@ -4,12 +4,23 @@ use thiserror::Error;
 /// Exit codes used by the ferrule binary.
 ///
 /// `0` (success) is implicit via Rust's normal `main()` return.
-/// `4` (no rows) is reserved by the design contract for a future
-/// `--fail-on-empty` flag and will be re-added when that flag is wired up.
+///
+/// Code `1` is reserved for "command succeeded with a notable result"
+/// — the GNU `diff` / `grep` / `kubectl diff` convention. It covers
+/// `ferrule diff` finding schema differences today, and is the slot
+/// for a future `--fail-on-empty` flag and any future check / validate
+/// / lint commands. The semantic is "the command ran correctly and
+/// the result is something the caller likely wants to gate on" — not
+/// an error.
+///
+/// Codes `2..=N` are real errors. `2` matches clap's default exit for
+/// argument-parse failures, so usage errors raised by ferrule itself
+/// and usage errors raised by clap end up at the same code.
 pub mod exit {
-    pub const USAGE: i32 = 1;
-    pub const CONNECTION: i32 = 2;
-    pub const QUERY: i32 = 3;
+    pub const RESULT_NOTABLE: i32 = 1;
+    pub const USAGE: i32 = 2;
+    pub const CONNECTION: i32 = 3;
+    pub const QUERY: i32 = 4;
 }
 
 /// CLI-level error type.
