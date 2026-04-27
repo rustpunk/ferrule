@@ -38,7 +38,7 @@ impl Backend {
 
     /// Human-readable name.
     pub fn name(&self) -> &'static str {
-        match self {
+        match *self {
             #[cfg(feature = "postgres")]
             Self::Postgres => "PostgreSQL",
             #[cfg(feature = "mysql")]

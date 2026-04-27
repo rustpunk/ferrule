@@ -237,6 +237,7 @@ mod tests {
         assert!(parse_param("no_equals").is_err());
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn test_substitute_completes() {
         let mut params = ParameterSet::default();
@@ -251,6 +252,7 @@ mod tests {
         assert_eq!(sql, "SELECT * FROM t WHERE n = 'Alice' AND a = 30");
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn test_substitute_missing_errors() {
         let params = ParameterSet::default();
@@ -269,6 +271,7 @@ mod tests {
         assert_eq!(sql, "SELECT 1");
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn test_substitute_postgres_bool() {
         let mut params = ParameterSet::default();
@@ -277,6 +280,7 @@ mod tests {
         assert_eq!(sql, "SELECT FALSE");
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn test_substitute_no_recursive() {
         let mut params = ParameterSet::default();

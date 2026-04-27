@@ -152,6 +152,7 @@ fn build_oracle_paging(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn test_no_paging_needed() {
         let sql = apply_paging("SELECT 1", None, None, Backend::Postgres).unwrap();
@@ -222,6 +223,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn test_multistatement_rejected() {
         let result = apply_paging("SELECT 1; SELECT 2", Some(10), None, Backend::Postgres);

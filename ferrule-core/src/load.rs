@@ -200,7 +200,8 @@ pub fn infer_schema(objects: &[serde_json::Value], backend: Backend) -> Vec<(Str
     schema
 }
 
-fn infer_json_type(val: &serde_json::Value, _backend: Backend) -> TypeHint {
+#[cfg_attr(not(feature = "oracle"), allow(unused_variables))]
+fn infer_json_type(val: &serde_json::Value, backend: Backend) -> TypeHint {
     match val {
         serde_json::Value::Null => TypeHint::String,
         serde_json::Value::Bool(_) => {
@@ -236,7 +237,8 @@ fn build_create_table(table: &str, schema: &[(String, TypeHint)], backend: Backe
     format!("CREATE TABLE {quoted_table} ({});", cols.join(", "))
 }
 
-fn type_hint_to_sql(hint: &TypeHint, _backend: Backend) -> &'static str {
+#[cfg_attr(not(feature = "oracle"), allow(unused_variables))]
+fn type_hint_to_sql(hint: &TypeHint, backend: Backend) -> &'static str {
     match hint {
         TypeHint::Int64 => "INTEGER",
         TypeHint::Float64 | TypeHint::Decimal => "NUMERIC(18,6)",
