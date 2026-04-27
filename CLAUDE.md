@@ -389,6 +389,72 @@ Clean up when done:
 docker stop ferrule-oracle-test && docker rm ferrule-oracle-test
 ```
 
+### SSH tunnel — start an OpenSSH server in Docker
+
+Wave 3 B3 wires `--ssh-tunnel`, `--ssh-key`, and the profile keys
+(`ssh_host`, `ssh_user`, `ssh_port`, `ssh_key`) through a russh client
+that opens a `direct-tcpip` channel and either pipes the russh
+`ChannelStream` straight into `tokio_postgres::Config::connect_raw`
+(Postgres), or binds a local TCP listener and forwards bytes through
+the SSH session (every other backend). The `ssh` Cargo feature is
+opt-in: build with `--features ferrule-cli/ssh` (or `--features all`).
+
+Manual integration test: pair a `linuxserver/openssh-server` container
+with the existing Postgres container and confirm `ferrule conn test`
+goes through the tunnel.
+
+```bash
+# 1. Start an SSH server with key auth (no password auth — ferrule
+#    requires keys per project policy).
+docker run -d --name ferrule-ssh-test -p 127.0.0.1:12222:2222 \
+  -e USER_NAME=ferrule \
+  -e PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)" \
+  -e PASSWORD_ACCESS=false \
+  linuxserver/openssh-server
+
+# 2. Wait for the server to come up.
+until docker logs ferrule-ssh-test 2>&1 | grep -q "Server listening on"; do
+  sleep 1
+done
+
+# 3. (Re)start the Postgres container from the Postgres section above
+#    if it is not already running.
+
+# 4. Connect through the bastion. The Postgres container itself stays
+#    on 127.0.0.1:15432 — but with --ssh-tunnel, ferrule first opens
+#    an SSH session to 127.0.0.1:12222 and then asks the bastion to
+#    open a direct-tcpip channel to 127.0.0.1:15432.
+ferrule conn test \
+  --ssh-tunnel ferrule@127.0.0.1:12222 \
+  --ssh-key ~/.ssh/id_ed25519 \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable"
+
+ferrule query \
+  --ssh-tunnel ferrule@127.0.0.1:12222 \
+  --ssh-key ~/.ssh/id_ed25519 \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "SELECT name, age FROM test_users" --format json
+```
+
+Expected: `[ferrule] Warning: SSH host key verification is disabled`
+on stderr (TOFU/known_hosts is staged separately), then the query
+result on stdout. Clean up:
+
+```bash
+docker stop ferrule-ssh-test && docker rm ferrule-ssh-test
+```
+
+Notes:
+- The `linuxserver/openssh-server` image listens on `2222` inside the
+  container by default (not 22), which is why the host port mapping
+  is `12222:2222`.
+- `PASSWORD_ACCESS=false` is required because ferrule's russh client
+  only attempts publickey auth — password auth is intentionally not
+  implemented to keep the credential surface narrow.
+- For other backends (MySQL / MSSQL), swap the URL scheme. Ferrule
+  picks the `LocalListener` transport automatically; the database
+  driver sees `127.0.0.1:<random>` instead of the original host.
+
 ### Backend test status
 
 - **SQLite, Postgres, MySQL, MSSQL, Oracle** — runtime-tested via the Docker

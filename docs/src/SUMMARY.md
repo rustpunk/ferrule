@@ -25,6 +25,9 @@
 
 - [EXPLAIN, Dump, Watch](advanced.md)
 - [Connection Pooling Daemon](daemon.md)
+- [Filtering Results with JMESPath](result-filtering.md)
+- [Schema Diff](schema-diff.md)
+- [SSH Tunnels](ssh-tunnels.md)
 
 # Reference
 
