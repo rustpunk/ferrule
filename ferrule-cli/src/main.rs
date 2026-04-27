@@ -6,6 +6,7 @@ mod error;
 mod output;
 mod repl;
 mod ssh_flags;
+mod ssh_keys;
 mod watch;
 
 use commands::{
