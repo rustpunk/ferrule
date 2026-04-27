@@ -12,8 +12,9 @@ path = "src/main.rs"
 
 [features]
 default = ["ferrule-core/postgres", "ferrule-core/mysql", "ferrule-core/mssql", "ferrule-core/sqlite"]
-all = ["ferrule-core/oracle"]
+all = ["ferrule-core/oracle", "ferrule-core/ssh"]
 oracle = ["ferrule-core/oracle"]
+ssh = ["ferrule-core/ssh"]
 
 [dependencies]
 ferrule-core = { path = "../ferrule-core" }

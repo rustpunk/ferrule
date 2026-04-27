@@ -13,6 +13,7 @@ mysql = ["dep:mysql_async"]
 mssql = ["dep:tiberius", "dep:tokio-util"]
 sqlite = ["dep:rusqlite"]
 oracle = ["dep:oracle"]
+ssh = ["dep:russh", "dep:pkcs5"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -49,3 +50,16 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"], o
 
 # Oracle
 oracle = { version = "0.6", optional = true, features = ["chrono"] }
+
+# SSH tunnel (opt-in via the `ssh` feature). russh 0.60 ships the
+# `keys` module in the main crate (russh-keys is a separate-but-stale
+# 0.49.x crate; do not pull it in).
+russh = { version = "0.60", optional = true }
+
+# Resolver pin: russh 0.60.1's transitive pkcs8 0.11.0-rc.11 calls
+# the pre-rename `pkcs5::pbes2::Parameters::recommended` API. pkcs5
+# 0.8.0 (released 2026-04-24, after russh 0.60.1) renamed it to
+# `generate_recommended`. Pin pkcs5 to the last pre-release until
+# pkcs8 ships an RC that uses the new name; bump together with
+# the next russh upgrade.
+pkcs5 = { version = "=0.8.0-rc.13", optional = true }
