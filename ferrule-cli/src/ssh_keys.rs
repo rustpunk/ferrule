@@ -37,7 +37,7 @@ pub enum KeySource {
 impl From<KeySource> for ferrule_core::KeySource {
     fn from(src: KeySource) -> ferrule_core::KeySource {
         match src {
-            KeySource::File(p) => ferrule_core::KeySource::File(p),
+            KeySource::File(p) => ferrule_core::KeySource::File(p, None),
             KeySource::Agent(p) => ferrule_core::KeySource::Agent(p),
         }
     }

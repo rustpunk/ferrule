@@ -39,6 +39,7 @@ pub struct SshConfig {
 #[cfg(feature = "ssh")]
 mod ssh_impl {
     use super::SshConfig;
+    use secrecy::{ExposeSecret, SecretString};
     use std::io;
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -49,11 +50,13 @@ mod ssh_impl {
     /// `FERRULE_<NAME>_SSH_KEY`, default identity files, and
     /// `SSH_AUTH_SOCK` into one of these variants before reaching
     /// [`setup_tunnel`].
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone)]
     pub enum KeySource {
         /// A private key file on disk. The russh layer loads and (if
         /// encrypted) decrypts it via [`russh::keys::load_secret_key`].
-        File(PathBuf),
+        /// `None` means probe first and error if encrypted;
+        /// `Some` means attempt decryption with the provided passphrase.
+        File(PathBuf, Option<SecretString>),
         /// SSH agent socket. The russh layer routes signing requests
         /// through the agent at this socket path.
         Agent(PathBuf),
@@ -321,8 +324,8 @@ mod ssh_impl {
         };
 
         match key_source {
-            KeySource::File(path) => {
-                let key = load_secret_key(path, None).map_err(|e| {
+            KeySource::File(path, passphrase) => {
+                let key = load_secret_key(path, passphrase.as_ref().map(|s| s.expose_secret())).map_err(|e| {
                     TunnelError::Key(format!(
                         "load SSH key from {}: {}",
                         path.display(),
@@ -467,10 +470,49 @@ mod ssh_impl {
             }
         }
     }
+
+    /// Probe whether an SSH private key file requires a passphrase.
+    ///
+    /// Returns `Ok(true)` if the key is encrypted, `Ok(false)` if it
+    /// loads without a passphrase, and `Err(TunnelError::Key(...))`
+    /// for I/O or parse errors.
+    pub fn ssh_key_needs_passphrase(path: impl AsRef<std::path::Path>) -> Result<bool, TunnelError> {
+        match russh::keys::load_secret_key(path.as_ref(), None) {
+            Ok(_) => Ok(false),
+            Err(russh::keys::Error::KeyIsEncrypted) => Ok(true),
+            Err(e) => Err(TunnelError::Key(format!(
+                "load SSH key from {}: {}",
+                path.as_ref().display(),
+                e
+            ))),
+        }
+    }
 }
 
 #[cfg(feature = "ssh")]
 pub use ssh_impl::{
-    setup_tunnel, ClientHandler, KeySource, SshSession, TunnelError, TunnelHandle, TunnelStream,
-    TunnelTransport, TunnelTransportResult, TunneledConnection,
+    setup_tunnel, ssh_key_needs_passphrase, ClientHandler, KeySource, SshSession, TunnelError,
+    TunnelHandle, TunnelStream, TunnelTransport, TunnelTransportResult, TunneledConnection,
 };
+
+#[cfg(feature = "ssh")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_key_needs_passphrase_unencrypted() {
+        let path = std::path::PathBuf::from("/tmp/ferrule-test-unencrypted");
+        if path.exists() {
+            assert!(!ssh_key_needs_passphrase(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn ssh_key_needs_passphrase_encrypted() {
+        let path = std::path::PathBuf::from("/tmp/ferrule-test-encrypted");
+        if path.exists() {
+            assert!(ssh_key_needs_passphrase(&path).unwrap());
+        }
+    }
+}

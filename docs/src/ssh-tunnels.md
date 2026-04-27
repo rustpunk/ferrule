@@ -109,9 +109,22 @@ no SSH key resolved for connection 'prod-pg'. Provide one of:
 
 ### Encrypted keys
 
-Encrypted private keys are not currently prompted for. If
-`load_secret_key` reports the key needs a passphrase, ferrule
-returns an error. Workarounds:
+If `load_secret_key` reports the key needs a passphrase, ferrule
+prompts for it interactively:
+
+```text
+Enter passphrase for SSH key /home/user/.ssh/id_ed25519:
+```
+
+In non-interactive contexts (CI, scripts, pipes) the prompt is
+skipped and ferrule returns an error:
+
+```text
+SSH key /path/to/key is encrypted. Passphrase prompting requires an interactive terminal.
+Use an SSH agent or decrypt the key on disk.
+```
+
+Workarounds when a terminal is not available:
 
 - Use the SSH agent. `ssh-add ~/.ssh/encrypted-key` once per shell
   session, then ferrule will route signing requests through the
@@ -119,9 +132,6 @@ returns an error. Workarounds:
 - Decrypt the key on disk: `ssh-keygen -p -f ~/.ssh/encrypted-key`
   removes the passphrase (don't do this for keys you don't
   exclusively control).
-
-A future release will add an interactive passphrase prompt at the
-CLI layer.
 
 ## Transport: how the bytes flow
 
@@ -245,7 +255,8 @@ with `cargo build --features ferrule-cli/ssh` (or `--features all`).
 | `connect to <host>:<port>: Connection refused` | Bastion isn't listening on that port, or you're not on its allow-list | Confirm with plain `ssh -p <port> user@host` |
 | `publickey auth failed for user 'X' (server rejected key)` | Key not in `~user/.ssh/authorized_keys` on the bastion | Confirm with plain `ssh -i <key> user@host` |
 | `SSH agent at <sock> has no identities loaded` | Agent is running but empty | `ssh-add ~/.ssh/id_ed25519` |
-| `load SSH key from <path>: ...` | Encrypted key, no passphrase | Use the agent or decrypt on disk (see above) |
+| `load SSH key from <path>: ...` | Wrong passphrase or corrupted key | Check the passphrase or regenerate the key |
+| `SSH key <path> is encrypted. Passphrase prompting requires an interactive terminal.` | Encrypted key in a non-interactive context | Use the agent or decrypt on disk (see above) |
 | `SSH tunneling is not applicable to SQLite` | The URL is a sqlite:// scheme | Drop `--ssh-tunnel` for sqlite |
 | Long hang then "connection failed" | DB host unreachable from the bastion | Confirm with `ssh user@host -- nc -zv <db-host> <db-port>` |
 

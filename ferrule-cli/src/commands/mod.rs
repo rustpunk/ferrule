@@ -131,10 +131,44 @@ async fn connect_via_ssh_tunnel(
     ssh: SshTunnelInputs,
     opts: &ferrule_core::ConnectOptions,
 ) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
-    let core_key_source: ferrule_core::KeySource = ssh.key_source.into();
-    ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &core_key_source)
-        .await
-        .map_err(CliError::connection)
+    let key_source = match &ssh.key_source {
+        KeySource::File(path) => {
+            match ferrule_core::tunnel::ssh_key_needs_passphrase(path) {
+                Ok(false) => ferrule_core::KeySource::File(path.clone(), None),
+                Ok(true) => {
+                    let tty = is_terminal::IsTerminal::is_terminal(&std::io::stdin());
+                    if !tty {
+                        return Err(CliError::usage(format!(
+                            "SSH key {} is encrypted. Passphrase prompting requires \
+                             an interactive terminal.\n\
+                             Use an SSH agent or decrypt the key on disk.",
+                            path.display()
+                        )));
+                    }
+                    let cloned = path.clone();
+                    let passphrase = tokio::task::spawn_blocking(move || {
+                        rpassword::prompt_password(format!(
+                            "Enter passphrase for SSH key {}: ",
+                            cloned.display()
+                        ))
+                    })
+                    .await
+                    .map_err(|e| CliError::usage(format!("Passphrase prompt failed: {e}")))?
+                    .map_err(CliError::Io)?;
+                    ferrule_core::KeySource::File(
+                        path.clone(),
+                        Some(secrecy::SecretString::new(passphrase.into())),
+                    )
+                }
+                Err(e) => return Err(CliError::usage(e.to_string())),
+            }
+        }
+        KeySource::Agent(path) => ferrule_core::KeySource::Agent(path.clone()),
+    };
+    ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source,
+    )
+    .await
+    .map_err(CliError::connection)
 }
 
 #[cfg(not(feature = "ssh"))]
