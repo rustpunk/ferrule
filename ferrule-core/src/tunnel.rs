@@ -185,31 +185,45 @@ mod ssh_impl {
         pub handle: TunnelHandle,
     }
 
-    /// Internal russh client handler. Server-key verification policy
-    /// (currently trust-on-first-use; production should compare
-    /// against `~/.ssh/known_hosts`) lives here. The handler is
-    /// fleshed out in Commit B; for now it provides only the
-    /// associated `Error` type so [`SshSession`] has a concrete
-    /// `Handle<ClientHandler>` to hold.
+    /// russh client handler.
+    ///
+    /// **Server-key verification:** [`Self::check_server_key`]
+    /// returns `Ok(true)` for every key — i.e. blanket-accept. This
+    /// is dev-quality only. Production should compare against
+    /// `~/.ssh/known_hosts`; that is its own design discussion and
+    /// is intentionally deferred. A one-line stderr warning is
+    /// emitted on every tunnel setup so users notice.
     pub struct ClientHandler;
 
     impl russh::client::Handler for ClientHandler {
         type Error = TunnelError;
-        // All methods use the trait defaults until Commit B adds
-        // explicit `check_server_key` and (optionally) auth-event
-        // hooks. The default `check_server_key` rejects every key,
-        // which is fine because `setup_tunnel` is `unimplemented!()`
-        // — no caller can invoke the handler until Commit B.
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            // Blanket accept — see struct docstring. The known_hosts
+            // policy is staged separately; remove this method body
+            // and replace with a real comparison once that lands.
+            Ok(true)
+        }
     }
 
     /// Establish an SSH session and a direct-tcpip channel to
     /// `target_host:target_port`. Returns a [`TunnelHandle`] whose
     /// shape depends on `transport`.
     ///
-    /// **Stub:** the russh wiring lands in Commit B of Wave 3 B3
-    /// step 2c. The CLI dispatch path (Commit C) is the only
-    /// caller, so callers in commits A/B see no observable
-    /// difference.
+    /// Auth flow:
+    /// - [`KeySource::File`] — load via [`russh::keys::load_secret_key`]
+    ///   (no passphrase support yet — encrypted keys error out with a
+    ///   diagnostic), then `authenticate_publickey`. RSA hash
+    ///   algorithm is auto-negotiated via
+    ///   [`russh::client::Handle::best_supported_rsa_hash`] and
+    ///   defaults to SHA-256 when the server doesn't advertise.
+    /// - [`KeySource::Agent`] — connect to the agent socket, request
+    ///   identities, try `authenticate_publickey_with` against each
+    ///   public key (skipping certificate identities for now) until
+    ///   one succeeds.
     pub async fn setup_tunnel(
         config: &SshConfig,
         key_source: &KeySource,
@@ -217,8 +231,190 @@ mod ssh_impl {
         target_port: u16,
         transport: TunnelTransport,
     ) -> Result<TunnelHandle, TunnelError> {
-        let _ = (config, key_source, target_host, target_port, transport);
-        unimplemented!("setup_tunnel — russh wiring lands in Commit B")
+        use russh::client;
+        use russh::client::AuthResult;
+        use russh::keys::agent::client::AgentClient;
+        use russh::keys::agent::AgentIdentity;
+        use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg};
+        use std::sync::Arc;
+
+        // Surface the dev-quality host-key policy on every tunnel
+        // setup; matches the project's `--insecure` warning style.
+        eprintln!(
+            "[ferrule] Warning: SSH host key verification is disabled \
+             (known_hosts comparison not yet implemented). Connecting to \
+             {}:{} on faith.",
+            config.host, config.port
+        );
+
+        let cfg = Arc::new(client::Config::default());
+        let mut handle = client::connect(
+            cfg,
+            (config.host.as_str(), config.port),
+            ClientHandler,
+        )
+        .await
+        .map_err(|e| {
+            TunnelError::Session(format!(
+                "connect to {}:{}: {}",
+                config.host, config.port, e
+            ))
+        })?;
+
+        // RSA hash auto-negotiation. Server's advertised value wins;
+        // fall back to SHA-256 (modern default) if the server didn't
+        // send `server-sig-algs`. ed25519 / ecdsa keys ignore this.
+        let rsa_hash = match handle.best_supported_rsa_hash().await {
+            Ok(Some(advertised)) => advertised,
+            Ok(None) | Err(_) => Some(HashAlg::Sha256),
+        };
+
+        match key_source {
+            KeySource::File(path) => {
+                let key = load_secret_key(path, None).map_err(|e| {
+                    TunnelError::Key(format!(
+                        "load SSH key from {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+                let auth = handle
+                    .authenticate_publickey(
+                        &config.user,
+                        PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
+                    )
+                    .await?;
+                if !auth.success() {
+                    return Err(TunnelError::Auth(format!(
+                        "publickey auth failed for user '{}' (server rejected key {})",
+                        config.user,
+                        path.display()
+                    )));
+                }
+            }
+            KeySource::Agent(sock_path) => {
+                let mut agent =
+                    AgentClient::connect_uds(sock_path).await.map_err(|e| {
+                        TunnelError::Auth(format!(
+                            "connect to SSH agent at {}: {}",
+                            sock_path.display(),
+                            e
+                        ))
+                    })?;
+                let identities = agent.request_identities().await.map_err(|e| {
+                    TunnelError::Auth(format!("agent request_identities: {}", e))
+                })?;
+                if identities.is_empty() {
+                    return Err(TunnelError::Auth(format!(
+                        "SSH agent at {} has no identities loaded",
+                        sock_path.display()
+                    )));
+                }
+                let mut authed = false;
+                let mut last_err: Option<String> = None;
+                for ident in &identities {
+                    let pk = match ident {
+                        AgentIdentity::PublicKey { key, .. } => key.clone(),
+                        // Certificate identities require a different
+                        // auth call (`authenticate_certificate_with`);
+                        // skip for now to keep commit B narrow.
+                        AgentIdentity::Certificate { .. } => continue,
+                    };
+                    match handle
+                        .authenticate_publickey_with(
+                            &config.user,
+                            pk,
+                            rsa_hash,
+                            &mut agent,
+                        )
+                        .await
+                    {
+                        Ok(AuthResult::Success) => {
+                            authed = true;
+                            break;
+                        }
+                        Ok(AuthResult::Failure { .. }) => continue,
+                        Err(e) => {
+                            last_err = Some(format!("{:?}", e));
+                        }
+                    }
+                }
+                if !authed {
+                    return Err(TunnelError::Auth(format!(
+                        "agent publickey auth failed for user '{}' \
+                         (all {} identit{} rejected{})",
+                        config.user,
+                        identities.len(),
+                        if identities.len() == 1 { "y" } else { "ies" },
+                        last_err
+                            .map(|e| format!(": last error: {e}"))
+                            .unwrap_or_default(),
+                    )));
+                }
+            }
+        }
+
+        let channel = handle
+            .channel_open_direct_tcpip(
+                target_host,
+                u32::from(target_port),
+                "127.0.0.1",
+                0,
+            )
+            .await
+            .map_err(|e| {
+                TunnelError::Channel(format!(
+                    "direct-tcpip to {}:{}: {}",
+                    target_host, target_port, e
+                ))
+            })?;
+
+        let session = SshSession { handle };
+
+        match transport {
+            TunnelTransport::Stream => Ok(TunnelHandle {
+                session,
+                transport: TunnelTransportResult::Stream {
+                    stream: Box::new(TunnelStream {
+                        inner: channel.into_stream(),
+                    }),
+                },
+            }),
+            TunnelTransport::LocalListener => {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let port = listener.local_addr()?.port();
+                let forwarder = tokio::spawn(async move {
+                    // Accept exactly one inbound connection — the
+                    // database driver opens a single socket. If the
+                    // driver retries (rare in our one-shot CLI), the
+                    // user re-runs the command to set up a fresh
+                    // tunnel.
+                    let (mut tcp, _addr) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!(
+                                "[ferrule] SSH tunnel listener accept failed: {}",
+                                e
+                            );
+                            return;
+                        }
+                    };
+                    let mut ssh = channel.into_stream();
+                    if let Err(e) =
+                        tokio::io::copy_bidirectional(&mut tcp, &mut ssh).await
+                    {
+                        eprintln!(
+                            "[ferrule] SSH tunnel forwarder closed: {}",
+                            e
+                        );
+                    }
+                });
+                Ok(TunnelHandle {
+                    session,
+                    transport: TunnelTransportResult::LocalPort { port, forwarder },
+                })
+            }
+        }
     }
 }
 
