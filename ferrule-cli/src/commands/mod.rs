@@ -170,6 +170,22 @@ pub struct ConnectionFlags {
     /// Route through the connection pooling daemon.
     #[arg(long)]
     pub daemon: bool,
+
+    /// Open the connection through an SSH tunnel.
+    ///
+    /// Accepts `[user@]host[:port]` (matches pgcli). User defaults to
+    /// `$USER`; port defaults to 22. Overrides the corresponding
+    /// `ssh_host` / `ssh_user` / `ssh_port` profile keys atomically.
+    #[arg(long, value_name = "USER@HOST[:PORT]")]
+    pub ssh_tunnel: Option<String>,
+
+    /// Path to the SSH private key for the tunnel.
+    ///
+    /// Overrides the profile's `ssh_key`. When neither this flag nor
+    /// the profile sets a key, the tunnel layer falls back to
+    /// `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, then `SSH_AUTH_SOCK`.
+    #[arg(long, value_name = "PATH")]
+    pub ssh_key: Option<String>,
 }
 
 /// Connection management subcommands.

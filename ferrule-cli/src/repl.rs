@@ -774,6 +774,8 @@ fn cmd_watch(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
         conn_flags: crate::commands::ConnectionFlags {
             insecure: repl.insecure,
             daemon: false,
+            ssh_tunnel: None,
+            ssh_key: None,
         },
         global_config: repl.global_config.clone(),
         print_lock: print_lock.clone(),

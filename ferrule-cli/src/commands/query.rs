@@ -159,6 +159,17 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
 
     let url = super::resolve_connection(&args.connection, args.password, global_config).await?;
 
+    // Resolve SSH tunnel configuration (profile keys + CLI flag merge).
+    // Errors out cleanly when the user requests SSH but the russh
+    // tunnel layer is not yet wired (Wave 3 B3 step 2c). Plain
+    // connections see Ok(None) and proceed unaffected.
+    let _ssh_config = crate::ssh_flags::resolve_ssh_config(
+        &args.connection,
+        args.conn_flags.ssh_tunnel.as_deref(),
+        args.conn_flags.ssh_key.as_deref(),
+        global_config,
+    )?;
+
     if args.output.verbose {
         eprintln!("[ferrule] Resolved URL: {}", url.redacted());
     }

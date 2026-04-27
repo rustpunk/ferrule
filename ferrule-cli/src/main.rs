@@ -5,6 +5,7 @@ mod daemon;
 mod error;
 mod output;
 mod repl;
+mod ssh_flags;
 mod watch;
 
 use commands::{
