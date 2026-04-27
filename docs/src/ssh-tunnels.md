@@ -156,9 +156,11 @@ that pumps bytes between the listener and the SSH channel via
 `tokio::io::copy_bidirectional`, and rewrites the URL to point at
 the local port before handing it to the driver.
 
-The listener accepts a single connection, then the forwarder runs
-for the connection's lifetime. ferrule's CLI is one-shot per
-invocation, so this matches how the drivers behave anyway.
+The listener stays open and accepts multiple inbound connections. For
+each connection a fresh `direct-tcpip` channel is opened through the
+same SSH session, so drivers that retry or pool (e.g. `mysql_async`)
+work transparently. When the tunnel handle drops, the listener closes
+and all active channels are torn down.
 
 ### Sqlite is rejected
 

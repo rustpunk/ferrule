@@ -43,6 +43,7 @@ mod ssh_impl {
     use std::io;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll};
 
     /// Where the SSH session sources its private key from. The CLI's
@@ -191,7 +192,9 @@ mod ssh_impl {
     /// it — standard Rust ownership instead of an explicit close
     /// protocol.
     pub struct SshSession {
-        pub handle: russh::client::Handle<ClientHandler>,
+        pub handle: std::sync::Arc<
+            tokio::sync::Mutex<russh::client::Handle<ClientHandler>>,
+        >,
     }
 
     /// Outcome of [`setup_tunnel`]. The session is held alongside
@@ -368,7 +371,6 @@ mod ssh_impl {
         use russh::keys::agent::client::AgentClient;
         use russh::keys::agent::AgentIdentity;
         use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg};
-        use std::sync::Arc;
 
         let cfg = Arc::new(client::Config::default());
         let mut handle = client::connect(
@@ -481,59 +483,89 @@ mod ssh_impl {
             }
         }
 
-        let channel = handle
-            .channel_open_direct_tcpip(
-                target_host,
-                u32::from(target_port),
-                "127.0.0.1",
-                0,
-            )
-            .await
-            .map_err(|e| {
-                TunnelError::Channel(format!(
-                    "direct-tcpip to {}:{}: {}",
-                    target_host, target_port, e
-                ))
-            })?;
-
-        let session = SshSession { handle };
+        // Wrap the authenticated handle in Arc<Mutex<>> so the
+        // LocalListener forwarder can open fresh direct-tcpip
+        // channels for each accepted connection while the Stream
+        // path opens a single channel upfront.
+        let handle = Arc::new(tokio::sync::Mutex::new(handle));
+        let session = SshSession {
+            handle: Arc::clone(&handle),
+        };
 
         match transport {
-            TunnelTransport::Stream => Ok(TunnelHandle {
-                session,
-                transport: TunnelTransportResult::Stream {
-                    stream: Box::new(TunnelStream {
-                        inner: channel.into_stream(),
-                    }),
-                },
-            }),
+            TunnelTransport::Stream => {
+                let channel = handle
+                    .lock()
+                    .await
+                    .channel_open_direct_tcpip(
+                        target_host,
+                        u32::from(target_port),
+                        "127.0.0.1",
+                        0,
+                    )
+                    .await
+                    .map_err(|e| {
+                        TunnelError::Channel(format!(
+                            "direct-tcpip to {}:{}: {}",
+                            target_host, target_port, e
+                        ))
+                    })?;
+                Ok(TunnelHandle {
+                    session,
+                    transport: TunnelTransportResult::Stream {
+                        stream: Box::new(TunnelStream {
+                            inner: channel.into_stream(),
+                        }),
+                    },
+                })
+            }
             TunnelTransport::LocalListener => {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
                 let port = listener.local_addr()?.port();
+                let target_host = target_host.to_string();
+                let handle = Arc::clone(&handle);
                 let forwarder = tokio::spawn(async move {
-                    // Accept exactly one inbound connection — the
-                    // database driver opens a single socket. If the
-                    // driver retries (rare in our one-shot CLI), the
-                    // user re-runs the command to set up a fresh
-                    // tunnel.
-                    let (mut tcp, _addr) = match listener.accept().await {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            eprintln!(
-                                "[ferrule] SSH tunnel listener accept failed: {}",
-                                e
-                            );
-                            return;
-                        }
-                    };
-                    let mut ssh = channel.into_stream();
-                    if let Err(e) =
-                        tokio::io::copy_bidirectional(&mut tcp, &mut ssh).await
-                    {
-                        eprintln!(
-                            "[ferrule] SSH tunnel forwarder closed: {}",
-                            e
-                        );
+                    loop {
+                        let (mut tcp, _addr) = match listener.accept().await {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                eprintln!(
+                                    "[ferrule] SSH tunnel listener accept failed: {}",
+                                    e
+                                );
+                                return;
+                            }
+                        };
+                        let handle = Arc::clone(&handle);
+                        let target_host = target_host.clone();
+                        tokio::spawn(async move {
+                            let guard = handle.lock().await;
+                            let channel = match guard.channel_open_direct_tcpip(
+                                &target_host,
+                                u32::from(target_port),
+                                "127.0.0.1",
+                                0,
+                            )
+                            .await
+                            {
+                                Ok(ch) => ch,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[ferrule] SSH tunnel direct-tcpip failed: {}",
+                                        e
+                                    );
+                                    return;
+                                }
+                            };
+                            drop(guard);
+                            let mut ssh = channel.into_stream();
+                            if let Err(e) =
+                                tokio::io::copy_bidirectional(&mut tcp, &mut ssh).await
+                            {
+                                // Normal close is expected; don't spam stderr.
+                                let _ = e;
+                            }
+                        });
                     }
                 });
                 Ok(TunnelHandle {
