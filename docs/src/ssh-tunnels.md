@@ -169,29 +169,60 @@ to. Combining `--ssh-tunnel ... sqlite:///path/to/db` produces:
 SSH tunneling is not applicable to SQLite (local-file backend)
 ```
 
-## Host-key verification: not yet
+## Host-key verification (TOFU)
 
-Ferrule's SSH client currently accepts every server key
-unconditionally. Each tunnel setup prints:
+Ferrule compares the SSH bastion's server key against your
+`~/.ssh/known_hosts` on every tunnel setup, using russh's native
+OpenSSH-format parser (hashed hosts, `[host]:port` entries, and all
+standard key algorithms are supported).
+
+### Three outcomes
+
+| Outcome | In a TTY | In a script / CI |
+|---|---|---|
+| **Host known, key matches** | Silent accept | Silent accept |
+| **Host key mismatch** | Fatal error | Fatal error |
+| **Unknown host** | Prompts once for TOFU | Fatal error with instructions |
+
+### TOFU prompt (TTY unknown host)
 
 ```text
-[ferrule] Warning: SSH host key verification is disabled
-(known_hosts comparison not yet implemented). Connecting to
-bastion.example.com:22 on faith.
+The authenticity of host 'bastion.example.com:22' can't be established.
+ED25519 key fingerprint is SHA256:abcdef1234567890abcdef1234567890abcdef12.
+Are you sure you want to continue connecting (yes/no)?
 ```
 
-This is dev-quality only. In production this means a
-man-in-the-middle on the bastion's network can intercept the SSH
-session. Mitigations:
+Type `yes` (or `y`) and ferrule writes the key to
+`~/.ssh/known_hosts` and proceeds. Any other answer aborts with
+exit code `2` (`USAGE`).
 
-- Run ferrule from a network you trust to not host an MITM.
-- Use a VPN to reach the bastion, not the open internet.
-- Wait — TOFU/known_hosts comparison is staged as its own design
-  discussion and will land in a future release.
+### Non-interactive unknown host
 
-The warning is intentionally noisy so users notice. If you find it
-distracting, either accept the silence-implies-blanket-trust
-trade-off and pipe `2>/dev/null`, or wait for the known_hosts work.
+In CI, pipes, or any non-TTY context, the prompt is skipped:
+
+```text
+SSH host bastion.example.com:22 is not in ~/.ssh/known_hosts.
+To add it, run interactively once or use:
+  ssh-keyscan -p 22 bastion.example.com >> ~/.ssh/known_hosts
+```
+
+Pre-seeding `known_hosts` before the pipeline runs is the standard
+OpenSSH-compatible workflow.
+
+### Host key mismatch
+
+If the recorded key differs from the one the server presents:
+
+```text
+SSH host key mismatch for bastion.example.com:22
+The key sent by the server does not match the one recorded in ~/.ssh/known_hosts.
+To resolve: verify the new fingerprint and remove the old key:
+  ssh-keygen -R bastion.example.com -f ~/.ssh/known_hosts
+```
+
+This is always fatal — there is no `--insecure-ssh-hosts` bypass
+flag. Treat a mismatch as a potential man-in-the-middle attack until
+you verify the new fingerprint out of band.
 
 ## SSH and the daemon don't mix
 
@@ -257,6 +288,8 @@ with `cargo build --features ferrule-cli/ssh` (or `--features all`).
 | `SSH agent at <sock> has no identities loaded` | Agent is running but empty | `ssh-add ~/.ssh/id_ed25519` |
 | `load SSH key from <path>: ...` | Wrong passphrase or corrupted key | Check the passphrase or regenerate the key |
 | `SSH key <path> is encrypted. Passphrase prompting requires an interactive terminal.` | Encrypted key in a non-interactive context | Use the agent or decrypt on disk (see above) |
+| `SSH host <host>:<port> is not in ~/.ssh/known_hosts.` | Unknown bastion in CI / script | Pre-seed with `ssh-keyscan` (see Host-key verification) |
+| `SSH host key mismatch for <host>:<port>` | Server key changed (rebuild / MITM) | Verify fingerprint and `ssh-keygen -R <host>` |
 | `SSH tunneling is not applicable to SQLite` | The URL is a sqlite:// scheme | Drop `--ssh-tunnel` for sqlite |
 | Long hang then "connection failed" | DB host unreachable from the bastion | Confirm with `ssh user@host -- nc -zv <db-host> <db-port>` |
 

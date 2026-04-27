@@ -165,10 +165,54 @@ async fn connect_via_ssh_tunnel(
         }
         KeySource::Agent(path) => ferrule_core::KeySource::Agent(path.clone()),
     };
-    ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source,
-    )
-    .await
-    .map_err(CliError::connection)
+    match ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source).await {
+        Ok(conn) => Ok(conn),
+        Err(ferrule_core::CoreError::SshUnknownHost { host, port, algorithm, fingerprint, key }) => {
+            let tty = is_terminal::IsTerminal::is_terminal(&std::io::stdin());
+            if !tty {
+                return Err(CliError::usage(format!(
+                    "SSH host {host}:{port} is not in ~/.ssh/known_hosts.\n\
+                     To add it, run interactively once or use:\
+                     \n  ssh-keyscan -p {port} {host} >> ~/.ssh/known_hosts"
+                )));
+            }
+            eprintln!(
+                "The authenticity of host '{host}:{port}' can't be established.\n\
+                 {algorithm} key fingerprint is {fingerprint}.\n\
+                 Are you sure you want to continue connecting (yes/no)? "
+            );
+            let mut answer = String::new();
+            std::io::stdin()
+                .read_line(&mut answer)
+                .map_err(|e| CliError::Io(e))?;
+            let trimmed = answer.trim().to_ascii_lowercase();
+            if trimmed != "yes" && trimmed != "y" {
+                return Err(CliError::usage(format!(
+                    "Host {host}:{port} not accepted. Aborting."
+                )));
+            }
+            ferrule_core::tunnel::learn_host_key(&host, port, &key,
+            )
+            .map_err(|e| CliError::connection(
+                ferrule_core::CoreError::ConnectionFailed(e.to_string())
+            ))?;
+            // Retry once after writing the key.
+            ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source
+            )
+            .await
+            .map_err(CliError::connection)
+        }
+        Err(ferrule_core::CoreError::SshHostKeyMismatch { host, port }) => {
+            Err(CliError::connection(ferrule_core::CoreError::ConnectionFailed(format!(
+                "SSH host key mismatch for {host}:{port}\n\
+                 The key sent by the server does not match the one recorded \
+                 in ~/.ssh/known_hosts.\n\
+                 To resolve: verify the new fingerprint and remove the old key:\
+                 \n  ssh-keygen -R {host} -f ~/.ssh/known_hosts"
+            ))))
+        }
+        Err(other) => Err(CliError::connection(other)),
+    }
 }
 
 #[cfg(not(feature = "ssh"))]

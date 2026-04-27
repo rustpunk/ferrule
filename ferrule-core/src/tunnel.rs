@@ -82,6 +82,21 @@ mod ssh_impl {
     /// for diagnostics the tunnel layer raises itself.
     #[derive(Debug, thiserror::Error)]
     pub enum TunnelError {
+        /// Host key on file matches the server's advertised key.
+        #[error("The server key has changed at line {line}")]
+        HostKeyMismatch { host: String, port: u16, line: usize },
+        /// Host not present in known_hosts — TOFU prompt required.
+        #[error(
+            "The authenticity of host '{host}:{port}' can't be established.\n\
+             {algorithm} key fingerprint is {fingerprint}."
+        )]
+        UnknownHost {
+            host: String,
+            port: u16,
+            algorithm: String,
+            fingerprint: String,
+            key: russh::keys::ssh_key::PublicKey,
+        },
         #[error("SSH session error: {0}")]
         Session(String),
         #[error("SSH authentication failed: {0}")]
@@ -94,6 +109,46 @@ mod ssh_impl {
         Russh(#[from] russh::Error),
         #[error("I/O error: {0}")]
         Io(#[from] io::Error),
+    }
+
+    /// Outcome of comparing a server public key against
+    /// `~/.ssh/known_hosts`.
+    pub enum HostKeyStatus {
+        /// Key matches an existing entry.
+        Match,
+        /// Host is present but the key differs (possible MITM).
+        Mismatch { line: usize },
+        /// Host is not present in known_hosts.
+        Unknown,
+    }
+
+    /// Check `host:port` against the user's `~/.ssh/known_hosts`.
+    pub fn check_host_key(
+        host: &str,
+        port: u16,
+        pubkey: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<HostKeyStatus, TunnelError> {
+        match russh::keys::check_known_hosts(host, port, pubkey) {
+            Ok(true) => Ok(HostKeyStatus::Match),
+            Ok(false) => Ok(HostKeyStatus::Unknown),
+            Err(russh::keys::Error::KeyChanged { line }) => Ok(HostKeyStatus::Mismatch { line }),
+            Err(e) => Err(TunnelError::Session(format!(
+                "known_hosts check for {host}:{port}: {e}"
+            ))),
+        }
+    }
+
+    /// Write a host's public key into `~/.ssh/known_hosts` (TOFU).
+    pub fn learn_host_key(
+        host: &str,
+        port: u16,
+        pubkey: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<(), TunnelError> {
+        russh::keys::known_hosts::learn_known_hosts(host, port, pubkey).map_err(|e| {
+            TunnelError::Session(format!(
+                "failed to write host key to ~/.ssh/known_hosts: {e}"
+            ))
+        })
     }
 
     /// `AsyncRead + AsyncWrite` wrapper around a russh direct-tcpip
@@ -241,25 +296,48 @@ mod ssh_impl {
 
     /// russh client handler.
     ///
-    /// **Server-key verification:** [`Self::check_server_key`]
-    /// returns `Ok(true)` for every key — i.e. blanket-accept. This
-    /// is dev-quality only. Production should compare against
-    /// `~/.ssh/known_hosts`; that is its own design discussion and
-    /// is intentionally deferred. A one-line stderr warning is
-    /// emitted on every tunnel setup so users notice.
-    pub struct ClientHandler;
+    /// [`check_server_key`] compares the server's public key against
+    /// the user's `~/.ssh/known_hosts` via russh's native parser.
+    /// Match → silent accept; mismatch → fatal error; unknown →
+    /// `Err(TunnelError::UnknownHost)` so the CLI layer can prompt
+    /// for TOFU and retry.
+    pub struct ClientHandler {
+        pub host: String,
+        pub port: u16,
+    }
 
     impl russh::client::Handler for ClientHandler {
         type Error = TunnelError;
 
         async fn check_server_key(
             &mut self,
-            _server_public_key: &russh::keys::ssh_key::PublicKey,
+            server_public_key: &russh::keys::ssh_key::PublicKey,
         ) -> Result<bool, Self::Error> {
-            // Blanket accept — see struct docstring. The known_hosts
-            // policy is staged separately; remove this method body
-            // and replace with a real comparison once that lands.
-            Ok(true)
+            match check_host_key(&self.host,
+                         self.port,
+                         server_public_key,
+            )? {
+                HostKeyStatus::Match => Ok(true),
+                HostKeyStatus::Mismatch { line } => {
+                    Err(TunnelError::HostKeyMismatch {
+                        host: self.host.clone(),
+                        port: self.port,
+                        line,
+                    })
+                }
+                HostKeyStatus::Unknown => {
+                    let fingerprint = server_public_key
+                        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                        .to_string();
+                    Err(TunnelError::UnknownHost {
+                        host: self.host.clone(),
+                        port: self.port,
+                        algorithm: server_public_key.algorithm().to_string(),
+                        fingerprint,
+                        key: server_public_key.clone(),
+                    })
+                }
+            }
         }
     }
 
@@ -292,27 +370,22 @@ mod ssh_impl {
         use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg};
         use std::sync::Arc;
 
-        // Surface the dev-quality host-key policy on every tunnel
-        // setup; matches the project's `--insecure` warning style.
-        eprintln!(
-            "[ferrule] Warning: SSH host key verification is disabled \
-             (known_hosts comparison not yet implemented). Connecting to \
-             {}:{} on faith.",
-            config.host, config.port
-        );
-
         let cfg = Arc::new(client::Config::default());
         let mut handle = client::connect(
             cfg,
             (config.host.as_str(), config.port),
-            ClientHandler,
+            ClientHandler {
+                host: config.host.clone(),
+                port: config.port,
+            },
         )
         .await
-        .map_err(|e| {
-            TunnelError::Session(format!(
+        .map_err(|e| match e {
+            TunnelError::HostKeyMismatch { .. } | TunnelError::UnknownHost { .. } => e,
+            other => TunnelError::Session(format!(
                 "connect to {}:{}: {}",
-                config.host, config.port, e
-            ))
+                config.host, config.port, other
+            )),
         })?;
 
         // RSA hash auto-negotiation. Server's advertised value wins;
@@ -491,8 +564,9 @@ mod ssh_impl {
 
 #[cfg(feature = "ssh")]
 pub use ssh_impl::{
-    setup_tunnel, ssh_key_needs_passphrase, ClientHandler, KeySource, SshSession, TunnelError,
-    TunnelHandle, TunnelStream, TunnelTransport, TunnelTransportResult, TunneledConnection,
+    check_host_key, learn_host_key, setup_tunnel, ssh_key_needs_passphrase, ClientHandler,
+    KeySource, SshSession, TunnelError, TunnelHandle, TunnelStream, TunnelTransport,
+    TunnelTransportResult, TunneledConnection,
 };
 
 #[cfg(feature = "ssh")]

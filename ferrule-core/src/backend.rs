@@ -117,7 +117,7 @@ pub async fn connect_with_tunnel(
     key_source: &crate::tunnel::KeySource,
 ) -> Result<Box<dyn Connection>, CoreError> {
     use crate::tunnel::{
-        setup_tunnel, TunnelTransport, TunnelTransportResult, TunneledConnection,
+        setup_tunnel, TunnelError, TunnelTransport, TunnelTransportResult, TunneledConnection,
     };
 
     let backend = Backend::from_scheme(url.scheme())
@@ -157,7 +157,15 @@ pub async fn connect_with_tunnel(
         transport,
     )
     .await
-    .map_err(|e| CoreError::ConnectionFailed(format!("SSH tunnel setup: {e}")))?;
+    .map_err(|e| match e {
+        TunnelError::HostKeyMismatch { host, port, .. } => {
+            CoreError::SshHostKeyMismatch { host, port }
+        }
+        TunnelError::UnknownHost { host, port, algorithm, fingerprint, key, .. } => {
+            CoreError::SshUnknownHost { host, port, algorithm, fingerprint, key }
+        }
+        other => CoreError::ConnectionFailed(format!("SSH tunnel setup: {other}")),
+    })?;
 
     let session = tunnel.session;
     match tunnel.transport {
