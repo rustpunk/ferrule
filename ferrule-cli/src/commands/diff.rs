@@ -268,6 +268,7 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
         args.password_a,
         args.conn_flags.ssh_tunnel.as_deref(),
         args.conn_flags.ssh_key.as_deref(),
+        args.conn_flags.proxy_url.as_deref(),
         global_config,
     )
     .await?;
@@ -276,6 +277,7 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
         args.password_b,
         args.conn_flags.ssh_tunnel.as_deref(),
         args.conn_flags.ssh_key.as_deref(),
+        args.conn_flags.proxy_url.as_deref(),
         global_config,
     )
     .await?;
@@ -436,8 +438,10 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut a = ferrule_core::connect(&url_a, &ConnectOptions::default()).await.unwrap();
-        let mut b = ferrule_core::connect(&url_b, &ConnectOptions::default()).await.unwrap();
+        let mut a = ferrule_core::connect(&url_a, &ConnectOptions::default(), None,
+        ).await.unwrap();
+        let mut b = ferrule_core::connect(&url_b, &ConnectOptions::default(), None,
+        ).await.unwrap();
 
         a.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
         b.execute("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").await.unwrap();

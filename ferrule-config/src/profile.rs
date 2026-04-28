@@ -146,6 +146,10 @@ pub struct ConnectionProfile {
     /// stack (CLI flag → env → default identity files → SSH agent).
     #[serde(default)]
     pub ssh_key: Option<String>,
+
+    /// HTTP CONNECT proxy URL (e.g. `http://proxy:8080`).
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[cfg(test)]

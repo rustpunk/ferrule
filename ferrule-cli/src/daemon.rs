@@ -74,7 +74,7 @@ async fn get_or_connect(pool: &Pool, url: &DatabaseUrl, insecure: bool) -> Resul
     }
 
     let opts = ConnectOptions { insecure };
-    let conn = ferrule_core::backend::connect(url, &opts)
+    let conn = ferrule_core::backend::connect(url, &opts, None)
         .await
         .map_err(|e| e.to_string())?;
 

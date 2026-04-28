@@ -76,6 +76,7 @@ pub async fn run(args: WatchArgs, global_config: &GlobalConfig) -> Result<(), Cl
         args.password,
         args.conn_flags.ssh_tunnel.as_deref(),
         args.conn_flags.ssh_key.as_deref(),
+        args.conn_flags.proxy_url.as_deref(),
         global_config,
     )
     .await?;

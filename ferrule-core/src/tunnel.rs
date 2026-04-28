@@ -365,6 +365,7 @@ mod ssh_impl {
         target_host: &str,
         target_port: u16,
         transport: TunnelTransport,
+        proxy: Option<&crate::proxy::ProxyConfig>,
     ) -> Result<TunnelHandle, TunnelError> {
         use russh::client;
         use russh::client::AuthResult;
@@ -373,22 +374,37 @@ mod ssh_impl {
         use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg};
 
         let cfg = Arc::new(client::Config::default());
-        let mut handle = client::connect(
-            cfg,
-            (config.host.as_str(), config.port),
-            ClientHandler {
-                host: config.host.clone(),
-                port: config.port,
-            },
-        )
-        .await
-        .map_err(|e| match e {
-            TunnelError::HostKeyMismatch { .. } | TunnelError::UnknownHost { .. } => e,
-            other => TunnelError::Session(format!(
-                "connect to {}:{}: {}",
-                config.host, config.port, other
-            )),
-        })?;
+        let mut handle = if let Some(proxy) = proxy {
+            let proxy_stream = crate::proxy::http_connect(proxy, &config.host, config.port)
+                .await
+                .map_err(|e| TunnelError::Session(format!("proxy: {e}")))?;
+            client::connect_stream(
+                cfg,
+                proxy_stream,
+                ClientHandler {
+                    host: config.host.clone(),
+                    port: config.port,
+                },
+            )
+            .await?
+        } else {
+            client::connect(
+                cfg,
+                (config.host.as_str(), config.port),
+                ClientHandler {
+                    host: config.host.clone(),
+                    port: config.port,
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                TunnelError::HostKeyMismatch { .. } | TunnelError::UnknownHost { .. } => e,
+                other => TunnelError::Session(format!(
+                    "connect to {}:{}: {}",
+                    config.host, config.port, other
+                )),
+            })?
+        };
 
         // RSA hash auto-negotiation. Server's advertised value wins;
         // fall back to SHA-256 (modern default) if the server didn't

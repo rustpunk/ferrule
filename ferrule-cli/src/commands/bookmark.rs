@@ -140,6 +140,7 @@ async fn cmd_run(
         None,
         conn_flags.ssh_tunnel.as_deref(),
         conn_flags.ssh_key.as_deref(),
+        conn_flags.proxy_url.as_deref(),
         global_config,
     )
     .await?;

@@ -58,6 +58,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             None,
             opts.conn_flags.ssh_tunnel.as_deref(),
             opts.conn_flags.ssh_key.as_deref(),
+            opts.conn_flags.proxy_url.as_deref(),
             &opts.global_config,
         )
         .await

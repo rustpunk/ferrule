@@ -177,6 +177,7 @@ mod tests {
             ssh_user: None,
             ssh_port: None,
             ssh_key: None,
+            proxy_url: None,
         }
     }
 
@@ -189,6 +190,7 @@ mod tests {
             ssh_user: Some("ec2-user".into()),
             ssh_port: Some(2222),
             ssh_key: Some("/home/me/.ssh/id_ed25519".into()),
+            proxy_url: None,
         }
     }
 

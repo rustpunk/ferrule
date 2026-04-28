@@ -73,6 +73,7 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
         None,
         args.conn_flags.ssh_tunnel.as_deref(),
         args.conn_flags.ssh_key.as_deref(),
+        args.conn_flags.proxy_url.as_deref(),
         global_config,
     )
     .await?;

@@ -21,6 +21,9 @@ pub enum CoreError {
     #[error("TLS error: {0}")]
     TlsError(String),
 
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     /// Host key mismatch during SSH tunnel setup (always fatal).
     #[cfg(feature = "ssh")]
     #[error("SSH host key mismatch for {host}:{port}")]

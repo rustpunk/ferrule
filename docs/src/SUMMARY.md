@@ -28,6 +28,7 @@
 - [Filtering Results with JMESPath](result-filtering.md)
 - [Schema Diff](schema-diff.md)
 - [SSH Tunnels](ssh-tunnels.md)
+- [HTTP CONNECT Proxy](proxy.md)
 
 # Reference
 

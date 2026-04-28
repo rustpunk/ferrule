@@ -71,6 +71,7 @@ impl Repl {
             None,
             conn_flags.ssh_tunnel.as_deref(),
             conn_flags.ssh_key.as_deref(),
+            conn_flags.proxy_url.as_deref(),
             global_config,
         )
         .await?;
@@ -113,6 +114,7 @@ impl Repl {
             None,
             self.conn_flags.ssh_tunnel.as_deref(),
             self.conn_flags.ssh_key.as_deref(),
+            self.conn_flags.proxy_url.as_deref(),
             &self.global_config,
         )
         .await
@@ -805,6 +807,7 @@ fn cmd_watch(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
             daemon: false,
             ssh_tunnel: None,
             ssh_key: None,
+            proxy_url: None,
         },
         global_config: repl.global_config.clone(),
         print_lock: print_lock.clone(),

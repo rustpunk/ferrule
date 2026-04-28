@@ -270,13 +270,13 @@ pub async fn connect(
 
 /// Connect over a pre-built `AsyncRead + AsyncWrite` stream
 /// instead of opening a TCP socket. Used by the SSH tunnel `Stream`
-/// transport: tokio-postgres negotiates Postgres protocol (and TLS,
-/// if `sslmode` requires it) end-to-end through the SSH channel.
+/// transport and by HTTP CONNECT proxy direct DB connections:
+/// tokio-postgres negotiates Postgres protocol (and TLS, if
+/// `sslmode` requires it) end-to-end through the supplied stream.
 ///
 /// Reuses the same TLS connector logic as [`connect`], so a URL like
 /// `postgres://app:pwd@db/myapp?sslmode=require` gets SSH transport
-/// AND TLS to the database — the two layers compose.
-#[cfg(feature = "ssh")]
+/// (or proxy) AND TLS to the database — the two layers compose.
 pub async fn connect_with_stream<S>(
     url: &DatabaseUrl,
     opts: &ConnectOptions,

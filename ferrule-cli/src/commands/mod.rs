@@ -45,6 +45,7 @@ pub struct SshTunnelInputs {
 pub struct ResolvedConnection {
     pub url: DatabaseUrl,
     pub ssh: Option<SshTunnelInputs>,
+    pub proxy: Option<ferrule_core::ProxyConfig>,
 }
 
 /// Resolve a connection string — either a raw URL or a registry/profile
@@ -58,6 +59,7 @@ pub async fn resolve_connection(
     password: Option<String>,
     ssh_tunnel: Option<&str>,
     ssh_key: Option<&str>,
+    proxy_url: Option<&str>,
     global_config: &GlobalConfig,
 ) -> Result<ResolvedConnection, CliError> {
     let url = resolve_url(connection, password, global_config).await?;
@@ -83,7 +85,63 @@ pub async fn resolve_connection(
         None => None,
     };
 
-    Ok(ResolvedConnection { url, ssh })
+    let proxy = resolve_proxy_config(connection, proxy_url, global_config, &url)?;
+
+    Ok(ResolvedConnection { url, ssh, proxy })
+}
+
+/// Resolve proxy configuration from CLI flag, profile, env vars.
+fn resolve_proxy_config(
+    connection_name: &str,
+    proxy_url: Option<&str>,
+    global_config: &GlobalConfig,
+    url: &DatabaseUrl,
+) -> Result<Option<ferrule_core::ProxyConfig>, CliError> {
+    // 1. CLI flag
+    if let Some(raw) = proxy_url {
+        return ferrule_core::ProxyConfig::parse(raw)
+            .map(Some)
+            .map_err(|e| CliError::usage(format!("Invalid --proxy-url: {e}")));
+    }
+
+    // 2. Profile
+    if let Some(profile) = global_config.connection.get(connection_name) {
+        if let Some(raw) = &profile.proxy_url {
+            return ferrule_core::ProxyConfig::parse(raw)
+                .map(Some)
+                .map_err(|e| CliError::usage(format!(
+                    "Invalid proxy_url in profile for '{connection_name}': {e}"
+                )));
+        }
+    }
+
+    // 3. FERRULE_<NAME>_PROXY_URL env var
+    let env_name = format!(
+        "FERRULE_{}_PROXY_URL",
+        connection_name.to_ascii_uppercase().replace('-', "_")
+    );
+    if let Ok(raw) = std::env::var(&env_name) {
+        if !raw.is_empty() {
+            return ferrule_core::ProxyConfig::parse(&raw)
+                .map(Some)
+                .map_err(|e| CliError::usage(format!(
+                    "{env_name} is set but invalid: {e}"
+                )));
+        }
+    }
+
+    // 4. ALL_PROXY / HTTP_PROXY / HTTPS_PROXY env vars
+    let target_scheme = url.scheme();
+    if let Some(cfg) = ferrule_core::proxy::resolve_proxy_from_env(target_scheme) {
+        if let Some(host) = url.host() {
+            if ferrule_core::proxy::is_no_proxy(host) {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(cfg));
+    }
+
+    Ok(None)
 }
 
 /// Per Wave 3 B3 §2d: reject `--daemon` together with any SSH
@@ -117,12 +175,14 @@ pub async fn connect_resolved(
     resolved: ResolvedConnection,
     opts: &ferrule_core::ConnectOptions,
 ) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
+    let proxy = resolved.proxy.as_ref();
     if let Some(ssh) = resolved.ssh {
-        return connect_via_ssh_tunnel(resolved.url, ssh, opts).await;
+        return connect_via_ssh_tunnel(resolved.url, ssh, opts, proxy).await;
     }
-    ferrule_core::connect(&resolved.url, opts)
-        .await
-        .map_err(CliError::connection)
+    ferrule_core::connect(&resolved.url, opts, proxy,
+    )
+    .await
+    .map_err(CliError::connection)
 }
 
 #[cfg(feature = "ssh")]
@@ -130,6 +190,7 @@ async fn connect_via_ssh_tunnel(
     url: DatabaseUrl,
     ssh: SshTunnelInputs,
     opts: &ferrule_core::ConnectOptions,
+    proxy: Option<&ferrule_core::ProxyConfig>,
 ) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
     let key_source = match &ssh.key_source {
         KeySource::File(path) => {
@@ -165,7 +226,7 @@ async fn connect_via_ssh_tunnel(
         }
         KeySource::Agent(path) => ferrule_core::KeySource::Agent(path.clone()),
     };
-    match ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source).await {
+    match ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy).await {
         Ok(conn) => Ok(conn),
         Err(ferrule_core::CoreError::SshUnknownHost { host, port, algorithm, fingerprint, key }) => {
             let tty = is_terminal::IsTerminal::is_terminal(&std::io::stdin());
@@ -197,7 +258,7 @@ async fn connect_via_ssh_tunnel(
                 ferrule_core::CoreError::ConnectionFailed(e.to_string())
             ))?;
             // Retry once after writing the key.
-            ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source
+            ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy
             )
             .await
             .map_err(CliError::connection)
@@ -220,6 +281,7 @@ async fn connect_via_ssh_tunnel(
     _url: DatabaseUrl,
     ssh: SshTunnelInputs,
     _opts: &ferrule_core::ConnectOptions,
+    _proxy: Option<&ferrule_core::ProxyConfig>,
 ) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
     // Read the fields so they aren't flagged as dead code in
     // ssh-feature-off builds; the struct exists in both feature
@@ -396,6 +458,15 @@ pub struct ConnectionFlags {
     /// `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, then `SSH_AUTH_SOCK`.
     #[arg(long, value_name = "PATH")]
     pub ssh_key: Option<String>,
+
+    /// HTTP CONNECT proxy URL (e.g. `http://proxy:8080`).
+    ///
+    /// May include Basic-auth credentials: `http://user:pass@proxy:8080`.
+    /// Overrides the corresponding `proxy_url` profile key and the
+    /// `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
+    /// environment variables.
+    #[arg(long, value_name = "URL")]
+    pub proxy_url: Option<String>,
 }
 
 /// Connection management subcommands.

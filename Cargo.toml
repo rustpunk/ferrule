@@ -35,5 +35,8 @@ toml = "0.8"
 # Prompt
 rpassword = "7"
 
+# Proxy
+base64 = "0.22"
+
 # Types
 uuid = "1"

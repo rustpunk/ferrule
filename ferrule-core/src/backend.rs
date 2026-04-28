@@ -1,3 +1,5 @@
+#![allow(unused_imports, unused_variables)]
+
 use crate::backends;
 use crate::connection::{ConnectOptions, Connection};
 use crate::error::CoreError;
@@ -53,8 +55,8 @@ impl Backend {
     }
 }
 
-/// Establish a connection to the given URL.
-pub async fn connect(
+/// Establish a direct (non-proxied) connection to the given URL.
+async fn connect_direct(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
 ) -> Result<Box<dyn Connection>, CoreError> {
@@ -90,7 +92,136 @@ pub async fn connect(
     }
 }
 
+/// Establish a connection to the given URL.
+///
+/// When `proxy` is `Some`, the connection is routed through the
+/// proxy via HTTP CONNECT. For Postgres this means `connect_raw`
+/// with a pre-built stream; for MySQL/MSSQL/Oracle a local TCP
+/// listener is bound and bytes are pumped through the proxy; for
+/// SQLite the proxy is ignored (local file, no network).
+pub async fn connect(
+    url: &DatabaseUrl,
+    opts: &ConnectOptions,
+    proxy: Option<&crate::proxy::ProxyConfig>,
+) -> Result<Box<dyn Connection>, CoreError> {
+    let backend = Backend::from_scheme(url.scheme())
+        .ok_or_else(|| CoreError::UnsupportedScheme(url.scheme().to_string()))?;
+
+    match backend {
+        #[cfg(feature = "postgres")]
+        Backend::Postgres => {
+            if let Some(proxy) = proxy {
+                let target_host = url.host().ok_or_else(|| {
+                    CoreError::ConnectionFailed(
+                        "URL has no host — proxy requires a network target".to_string(),
+                    )
+                })?;
+                let target_port = url.port().unwrap_or(5432);
+                let stream = crate::proxy::http_connect(proxy, target_host, target_port).await?;
+                let conn = backends::postgres::connect_with_stream(url, opts, stream).await?;
+                Ok(Box::new(conn))
+            } else {
+                connect_direct(url, opts).await
+            }
+        }
+        #[cfg(feature = "mysql")]
+        Backend::MySql => {
+            if let Some(proxy) = proxy {
+                connect_via_proxy_listener(url, opts, proxy, backend).await
+            } else {
+                connect_direct(url, opts).await
+            }
+        }
+        #[cfg(feature = "mssql")]
+        Backend::MsSql => {
+            if let Some(proxy) = proxy {
+                connect_via_proxy_listener(url, opts, proxy, backend).await
+            } else {
+                connect_direct(url, opts).await
+            }
+        }
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => {
+            // SQLite is a local-file backend; proxy is irrelevant.
+            connect_direct(url, opts).await
+        }
+        #[cfg(feature = "oracle")]
+        Backend::Oracle => {
+            if let Some(proxy) = proxy {
+                connect_via_proxy_listener(url, opts, proxy, backend).await
+            } else {
+                connect_direct(url, opts).await
+            }
+        }
+    }
+}
+
+/// Bind a local TCP listener, pump each accepted connection through
+/// a fresh HTTP CONNECT tunnel to the original host:port.
+#[cfg(any(feature = "mysql", feature = "mssql", feature = "oracle"))]
+async fn connect_via_proxy_listener(
+    url: &DatabaseUrl,
+    opts: &ConnectOptions,
+    proxy: &crate::proxy::ProxyConfig,
+    backend: Backend,
+) -> Result<Box<dyn Connection>, CoreError> {
+    let target_host = url
+        .host()
+        .ok_or_else(|| {
+            CoreError::ConnectionFailed(
+                "URL has no host — proxy requires a network target".to_string(),
+            )
+        })?
+        .to_string();
+    let target_port = url.port().unwrap_or_else(|| default_port_for(backend));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| CoreError::ConnectionFailed(format!("proxy listener bind: {e}")))?;
+    let port = listener.local_addr()?.port();
+
+    let proxy = proxy.clone();
+    let forwarder = tokio::spawn(async move {
+        loop {
+            let (mut tcp, _addr) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("[ferrule] proxy listener accept failed: {e}");
+                    return;
+                }
+            };
+            let target_host = target_host.clone();
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                let mut proxy_stream =
+                    match crate::proxy::http_connect(&proxy, &target_host, target_port).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[ferrule] proxy connect failed: {e}");
+                            return;
+                        }
+                    };
+                if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut proxy_stream).await {
+                    // Normal close is expected; don't spam stderr.
+                    let _ = e;
+                }
+            });
+        }
+    });
+
+    let local_url = rewrite_url_to_local(url, port)?;
+    let inner = connect_direct(&local_url, opts).await?;
+    Ok(Box::new(crate::proxy::ProxiedConnection {
+        inner,
+        forwarder: Some(forwarder),
+    }))
+}
+
 /// Establish a connection to `url` through an SSH tunnel.
+///
+/// An optional `proxy` routes the SSH session itself through an
+/// HTTP CONNECT proxy (corporate firewall scenario: proxy → bastion
+/// → SSH → direct-tcpip → DB).
 ///
 /// Picks the transport based on the backend:
 ///
@@ -115,6 +246,7 @@ pub async fn connect_with_tunnel(
     opts: &ConnectOptions,
     ssh_config: &crate::tunnel::SshConfig,
     key_source: &crate::tunnel::KeySource,
+    proxy: Option<&crate::proxy::ProxyConfig>,
 ) -> Result<Box<dyn Connection>, CoreError> {
     use crate::tunnel::{
         setup_tunnel, TunnelError, TunnelTransport, TunnelTransportResult, TunneledConnection,
@@ -155,6 +287,7 @@ pub async fn connect_with_tunnel(
         &target_host,
         target_port,
         transport,
+        proxy,
     )
     .await
     .map_err(|e| match e {
@@ -179,11 +312,6 @@ pub async fn connect_with_tunnel(
                     forwarder: None,
                 }));
             }
-            // The transport-selection match above only picks Stream
-            // for Postgres, so this is unreachable in practice. The
-            // explicit error keeps the code honest if a future
-            // refactor adds another `Stream`-eligible backend without
-            // wiring the receive side here.
             Err(CoreError::ConnectionFailed(
                 "Stream transport selected but no backend handler is registered \
                  (this is a ferrule bug — please report)"
@@ -192,7 +320,7 @@ pub async fn connect_with_tunnel(
         }
         TunnelTransportResult::LocalPort { port, forwarder } => {
             let local_url = rewrite_url_to_local(url, port)?;
-            let inner = connect(&local_url, opts).await?;
+            let inner = connect_direct(&local_url, opts).await?;
             Ok(Box::new(TunneledConnection {
                 inner,
                 session,
@@ -202,7 +330,7 @@ pub async fn connect_with_tunnel(
     }
 }
 
-#[cfg(feature = "ssh")]
+#[cfg(any(feature = "ssh", feature = "mysql", feature = "mssql", feature = "oracle"))]
 fn default_port_for(backend: Backend) -> u16 {
     match backend {
         #[cfg(feature = "postgres")]
@@ -212,13 +340,13 @@ fn default_port_for(backend: Backend) -> u16 {
         #[cfg(feature = "mssql")]
         Backend::MsSql => 1433,
         #[cfg(feature = "sqlite")]
-        Backend::Sqlite => 0, // unreachable — sqlite is rejected upstream
+        Backend::Sqlite => 0, // unreachable in contexts that call this
         #[cfg(feature = "oracle")]
         Backend::Oracle => 1521,
     }
 }
 
-#[cfg(feature = "ssh")]
+#[cfg(any(feature = "ssh", feature = "mysql", feature = "mssql", feature = "oracle"))]
 fn rewrite_url_to_local(url: &DatabaseUrl, port: u16) -> Result<DatabaseUrl, CoreError> {
     let mut parsed = ::url::Url::parse(url.raw())
         .map_err(|e| CoreError::InvalidUrl(format!("re-parse for tunnel rewrite: {e}")))?;

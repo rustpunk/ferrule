@@ -1419,6 +1419,7 @@ name = "ferrule-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "csv",
  "indexmap",
