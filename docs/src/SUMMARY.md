@@ -23,7 +23,7 @@
 
 # Advanced
 
-- [EXPLAIN, Dump, Watch](advanced.md)
+- [EXPLAIN, Dump, Export, Watch](advanced.md)
 - [Connection Pooling Daemon](daemon.md)
 - [Filtering Results with JMESPath](result-filtering.md)
 - [Schema Diff](schema-diff.md)

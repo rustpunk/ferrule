@@ -779,7 +779,7 @@ fn cmd_watch(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
         eprintln!("No SQL to watch.");
         return;
     }
-    let substituted = match substitute(trimmed, &repl.state.params, repl.backend) {
+    let _substituted = match substitute(trimmed, &repl.state.params, repl.backend) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Parameter error: {e}");
@@ -788,15 +788,18 @@ fn cmd_watch(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
     };
 
     let running = Arc::new(AtomicBool::new(true));
-    let interval_secs = Arc::new(AtomicU64::new(5));
+    let _interval_secs = Arc::new(AtomicU64::new(5));
     let print_lock = Arc::new(std::sync::Mutex::new(()));
 
     let opts = WatchOptions {
         connection: repl.url.as_str().to_string(),
-        sql: substituted,
-        interval_secs,
+        sql: trimmed.to_string(),
+        file_path: None,
+        interval_secs: Arc::new(AtomicU64::new(5)),
         max_iterations: None,
         diff: false,
+        exit_on_error: false,
+        bell: false,
         format: repl.state.format,
         limit: repl.state.limit,
         offset: repl.state.offset,

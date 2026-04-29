@@ -10,8 +10,8 @@ mod ssh_keys;
 mod watch;
 
 use commands::{
-    BookmarkArgs, ConnArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, LoadArgs, QueryArgs,
-    ReplArgs, TablesArgs, WatchArgs,
+    BookmarkArgs, ConnArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, ExportArgs, LoadArgs,
+    QueryArgs, ReplArgs, TablesArgs, WatchArgs,
 };
 use error::CliError;
 
@@ -63,6 +63,9 @@ enum Commands {
 
     /// Diff schemas between two connections
     Diff(DiffArgs),
+
+    /// Export query results to CSV/JSON/SQL
+    Export(ExportArgs),
 
     /// Watch a query and re-execute periodically
     Watch(WatchArgs),
@@ -116,6 +119,7 @@ fn main() {
             Commands::Repl(args) => commands::repl::run(args, &global_config).await,
             Commands::Watch(args) => commands::watch::run(args, &global_config).await,
             Commands::Dump(args) => commands::dump::run(args, &global_config).await,
+            Commands::Export(args) => commands::export::run(args, &global_config).await,
             Commands::Load(args) => commands::load::run(args, &global_config).await,
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,
             Commands::Describe(args) => commands::describe::run(args, &global_config).await,

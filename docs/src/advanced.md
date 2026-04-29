@@ -161,9 +161,47 @@ the `CREATE TABLE` by hand.
 - **No type coercion.** A CSV with `"true"` in a `Bool` column is
   fine; a CSV with `"yes"` is not. Pre-clean upstream.
 
+## Export
+
+`ferrule export` streams the result of an arbitrary SQL query directly to
+a file in CSV, JSON, JSONL, or SQL INSERT format. Unlike `dump`, which
+only handles single tables, `export` works with any SELECT statement.
+
+### Basic usage
+
+```bash
+ferrule export demo "SELECT * FROM events" --file events.csv
+ferrule export demo "SELECT * FROM events" --format json --file events.json
+ferrule export demo "SELECT * FROM events" --format jsonl
+```
+
+Page-size is tuned for the backend; it fetches rows in chunks to keep
+memory usage flat.
+
+```bash
+ferrule export demo "SELECT * FROM events" --page-size 5000 --file events.csv
+```
+
+### Formats
+
+| Format | Description |
+|---|---|
+| `csv` | Comma-separated values; newlines inside strings are escaped |
+| `json` | One JSON array of objects |
+| `jsonl` | One JSON object per line |
+| `sql` | `INSERT INTO ... VALUES (...)` statements |
+
+### Notes
+
+- `--file` is optional; without it, the result goes to stdout.
+- `--page-size` defaults to 1000 and controls the server-side
+  chunk size. Use `--page-size 0` to disable paging (not recommended
+  for huge result sets).
+- `--limit` and `--offset` are respected just like `query`.
+
 ## Watch mode
 
-Re-execute a query at fixed intervals.
+Re-execute a query at fixed intervals or whenever a watched file changes.
 
 ### When it's useful
 
@@ -172,6 +210,7 @@ Re-execute a query at fixed intervals.
 - Polling a long-running migration's progress.
 - Smoke-testing during incident response without typing `\!\!` in
   `psql` over and over.
+- Re-running a query as you edit a `.sql` file in your editor.
 
 ### Basic usage
 
@@ -189,6 +228,33 @@ ferrule watch demo "SELECT NOW();" --interval 1 --max-iterations 10
 `--interval` is in seconds; the minimum useful value is 1 (the
 backend round-trip dominates anything tighter).
 
+### `query --watch` — shorthand
+
+You can also use `--watch` on `query` itself, which delegates to the
+same watch loop:
+
+```bash
+ferrule query demo "SELECT COUNT(*) FROM events;" --watch
+ferrule query demo "SELECT COUNT(*) FROM events;" --watch --watch-interval 2
+```
+
+This is identical to `ferrule watch` with the same arguments; it's
+just a convenience when you start with a query and realize you want
+to keep polling it.
+
+### `--file-path` — watch a file for changes
+
+Instead of polling on an interval, trigger re-execution whenever a
+file changes on disk:
+
+```bash
+ferrule watch demo --file-path ./query.sql
+```
+
+The SQL is re-read from the file every time the filesystem watcher
+fires (with a 100ms debounce). Use this when you're editing the query
+in an editor and want ferrule to re-run it every time you save.
+
 ### `--diff` — only print on change
 
 Without `--diff`, watch prints a header and the full result on every
@@ -202,6 +268,32 @@ ferrule watch demo "SELECT COUNT(*) FROM events;" --interval 2 --diff
 That makes it trivial to leave a `watch --diff` running in a corner
 of your tmux session and only get noise when something actually
 changes.
+
+### `--exit-on-error` — fail fast
+
+By default, watch logs connection or query errors to stderr and
+keeps polling. With `--exit-on-error`, the command terminates on
+the first failure:
+
+```bash
+ferrule watch demo "SELECT COUNT(*) FROM events;" --exit-on-error
+```
+
+Useful in CI pipelines or wrapper scripts where a broken connection
+should stop the job immediately rather than spamming errors forever.
+
+### `--bell` — terminal bell on change
+
+When paired with `--diff`, rings the terminal bell (ASCII BEL, `\x07`)
+whenever the output changes:
+
+```bash
+ferrule watch demo "SELECT COUNT(*) FROM events;" --diff --bell
+```
+
+Pair with a terminal that flashes the window on bell (e.g. iTerm2
+"Flash visual bell") to get passive attention while you work
+elsewhere.
 
 ### Notes
 

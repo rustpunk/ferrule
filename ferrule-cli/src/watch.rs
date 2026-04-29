@@ -1,21 +1,27 @@
 use crate::commands::{check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::{ConnectOptions, StatementResult};
-use ferrule_core::formatter::{format_result, OutputFormat};
 use is_terminal::IsTerminal;
+use notify::{EventKind, RecursiveMode, Watcher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::io::Write;
+use tokio::time::Duration;
 use tokio::time::Instant;
+use ferrule_core::connection::{ConnectOptions, StatementResult};
+use ferrule_core::formatter::{format_result, OutputFormat};
 
 /// Options that drive a single watch loop.
 pub struct WatchOptions {
     pub connection: String,
     pub sql: String,
+    pub file_path: Option<PathBuf>,
     pub interval_secs: Arc<AtomicU64>,
     pub max_iterations: Option<u64>,
     pub diff: bool,
+    pub exit_on_error: bool,
+    pub bell: bool,
     pub format: OutputFormat,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -32,12 +38,67 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
     let mut prev_output: Option<String> = None;
     let is_tty = std::io::stdout().is_terminal();
 
+    // Set up file watcher if watching a file
+    let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let _watcher = if let Some(ref path) = opts.file_path {
+        let path = path.clone();
+        let tx = watch_tx.clone();
+        let mut watcher = notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if matches!(
+                        event.kind,
+                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                    ) {
+                        let _ = tx.try_send(());
+                    }
+                }
+            },
+        )
+        .map_err(|e| CliError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+
+        watcher
+            .watch(&path, RecursiveMode::NonRecursive)
+            .map_err(|e| CliError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        Some(watcher)
+    } else {
+        None
+    };
+
     while running.load(Ordering::Relaxed) {
         iteration += 1;
 
         if let Some(max) = opts.max_iterations {
             if iteration > max {
                 break;
+            }
+        }
+
+        // If watching a file, wait for a change; otherwise use interval
+        if opts.file_path.is_some() {
+            let timeout = tokio::time::Duration::from_secs(600); // 10 min fallback
+            tokio::select! {
+                _ = tokio::time::sleep(timeout) => {
+                    // Timeout — just re-run on interval as fallback
+                }
+                _ = watch_rx.recv() => {
+                    // File changed — debounce slightly
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    let _guard = opts.print_lock.lock();
+                    println!("\n[watch] stopped.");
+                    break;
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(opts.interval_secs.load(Ordering::Relaxed))) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    let _guard = opts.print_lock.lock();
+                    println!("\n[watch] stopped.");
+                    break;
+                }
             }
         }
 
@@ -48,6 +109,29 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             now.format("%Y-%m-%d %H:%M:%S %Z"),
             opts.interval_secs.load(Ordering::Relaxed),
         );
+
+        // Re-read SQL from file if watching a file
+        let sql = if let Some(ref path) = opts.file_path {
+            match tokio::fs::read_to_string(path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _guard = opts.print_lock.lock();
+                    eprintln!("[watch] read file error: {e}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            }
+        } else {
+            opts.sql.clone()
+        };
+
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if trimmed.is_empty() {
+            let _guard = opts.print_lock.lock();
+            eprintln!("[watch] SQL is empty, skipping.");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
 
         // Resolve connection each iteration. SSH tunnels are spun
         // up fresh per poll: the previous iteration's session and
@@ -67,6 +151,11 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             Err(e) => {
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] connection error: {e}");
+                if opts.exit_on_error {
+                    return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                        format!("watch connection error: {e}"),
+                    )));
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -74,6 +163,11 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
         if let Err(e) = check_daemon_ssh_compat(opts.conn_flags.daemon, &resolved) {
             let _guard = opts.print_lock.lock();
             eprintln!("[watch] {e}");
+            if opts.exit_on_error {
+                return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                    format!("watch daemon/ssh compatibility: {e}"),
+                )));
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
@@ -83,16 +177,27 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             None => {
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] unsupported scheme: {}", resolved.url.scheme());
+                if opts.exit_on_error {
+                    return Err(CliError::usage(format!(
+                        "unsupported scheme: {}",
+                        resolved.url.scheme()
+                    )));
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
 
-        let sql = match ferrule_core::apply_paging(&opts.sql, opts.limit, opts.offset, backend) {
+        let sql = match ferrule_core::apply_paging(&sql, opts.limit, opts.offset, backend) {
             Ok(s) => s,
             Err(e) => {
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] paging error: {e}");
+                if opts.exit_on_error {
+                    return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                        format!("watch paging error: {e}"),
+                    )));
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -116,6 +221,11 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             Err(e) => {
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] connection failed: {e}");
+                if opts.exit_on_error {
+                    return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                        format!("watch connection failed: {e}"),
+                    )));
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -132,6 +242,11 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                     Err(e) => {
                         let _guard = opts.print_lock.lock();
                         eprintln!("[watch] query error: {e}");
+                        if opts.exit_on_error {
+                            return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                                format!("watch query error: {e}"),
+                            )));
+                        }
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -140,6 +255,11 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             Err(e) => {
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] query error: {e}");
+                if opts.exit_on_error {
+                    return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                        format!("watch query error: {e}"),
+                    )));
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -200,6 +320,10 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             if opts.diff {
                 if Some(&output) != prev_output.as_ref() {
                     println!("{output}");
+                    if opts.bell {
+                        let _ = std::io::stdout().write_all(b"\x07");
+                        let _ = std::io::stdout().flush();
+                    }
                 }
             } else {
                 println!("{output}");
@@ -215,16 +339,6 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
         }
 
         prev_output = Some(output);
-
-        let interval_secs = opts.interval_secs.load(Ordering::Relaxed);
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
-            _ = tokio::signal::ctrl_c() => {
-                let _guard = opts.print_lock.lock();
-                println!("\n[watch] stopped.");
-                break;
-            }
-        }
     }
 
     Ok(())

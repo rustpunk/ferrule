@@ -1,4 +1,4 @@
-use super::QueryArgs;
+use super::{QueryArgs, WatchArgs};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_core::connection::{ConnectOptions, QueryResult, StatementResult};
@@ -147,6 +147,40 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     for p in &args.params {
         let (name, value) = parse_param(p).map_err(CliError::query)?;
         param_set.set(name, infer_type(&value));
+    }
+
+    if let Some(file_path) = args.watch_file {
+        let watch_args = WatchArgs {
+            connection: args.connection,
+            sql,
+            interval: args.watch_interval,
+            max_iterations: None,
+            diff: false,
+            exit_on_error: false,
+            bell: false,
+            output: args.output,
+            conn_flags: args.conn_flags,
+            password: args.password,
+            file_path: Some(file_path),
+        };
+        return crate::commands::watch::run(watch_args, global_config).await;
+    }
+
+    if args.watch {
+        let watch_args = WatchArgs {
+            connection: args.connection,
+            sql,
+            interval: args.watch_interval,
+            max_iterations: None,
+            diff: false,
+            exit_on_error: false,
+            bell: false,
+            output: args.output,
+            conn_flags: args.conn_flags,
+            password: args.password,
+            file_path: None,
+        };
+        return crate::commands::watch::run(watch_args, global_config).await;
     }
 
     if args.dry_run {

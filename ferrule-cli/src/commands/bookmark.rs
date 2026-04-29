@@ -7,7 +7,8 @@ use ferrule_config::bookmarks::BookmarkStore;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::Backend;
 use ferrule_core::connection::{ConnectOptions, StatementResult};
-use ferrule_core::formatter::format_result;
+use ferrule_core::formatter::format_result as fmt_result;
+use std::io::Write;
 
 #[derive(Args, Clone, Debug)]
 pub struct BookmarkArgs {
@@ -38,6 +39,9 @@ pub enum BookmarkCommand {
         /// Explicit connection override
         #[arg(short, long)]
         connection: Option<String>,
+        /// Edit the SQL in $EDITOR before running
+        #[arg(long)]
+        edit: bool,
         #[command(flatten)]
         output: OutputFlags,
         #[command(flatten)]
@@ -62,9 +66,10 @@ pub async fn run(args: BookmarkArgs, global_config: &GlobalConfig) -> Result<(),
             name,
             params,
             connection,
+            edit,
             output,
             conn_flags,
-        } => cmd_run(name, params, connection, output, conn_flags, global_config).await,
+        } => cmd_run(name, params, connection, edit, output, conn_flags, global_config).await,
         BookmarkCommand::Delete { name } => cmd_delete(name).await,
     }
 }
@@ -102,6 +107,7 @@ async fn cmd_run(
     name: String,
     params: Vec<String>,
     explicit_connection: Option<String>,
+    edit: bool,
     output: OutputFlags,
     conn_flags: ConnectionFlags,
     global_config: &GlobalConfig,
@@ -111,12 +117,17 @@ async fn cmd_run(
         .get(&name)
         .ok_or_else(|| CliError::usage(format!("Bookmark '{}' not found.", name)))?;
 
-    let sql = BookmarkStore::resolve_params(&bookmark.sql, &params);
+    let sql = if edit {
+        edit_in_editor(&bookmark.sql)?
+    } else {
+        bookmark.sql.clone()
+    };
+
+    let sql = BookmarkStore::resolve_params(&sql, &params);
     if sql != bookmark.sql {
         eprintln!("[ferrule] resolved SQL: {}", sql);
     }
 
-    // Resolve connection string
     let connection_str = if let Some(conn) = explicit_connection {
         conn
     } else if let Some(conn) = bookmark.connection.as_deref() {
@@ -186,16 +197,16 @@ async fn cmd_run(
     };
 
     if results.len() == 1 {
-        let text = render_single_result(&results[0], format, limit, offset)?;
+        let rendered = render_one(&results[0], format, limit, offset)?;
         match &results[0] {
-            StatementResult::Query(_) => println!("{}", text),
-            StatementResult::Summary(_) => eprintln!("{}", text),
+            StatementResult::Query(_) => println!("{}", rendered),
+            StatementResult::Summary(_) => eprintln!("{}", rendered),
         }
     } else {
         for (i, result) in results.iter().enumerate() {
             match result {
                 StatementResult::Query(_) => {
-                    let rendered = render_single_result(result, format, limit, offset)?;
+                    let rendered = render_one(result, format, limit, offset)?;
                     println!("-- Result set {}\n", i + 1);
                     println!("{}", rendered);
                     println!();
@@ -222,7 +233,7 @@ async fn cmd_delete(name: String) -> Result<(), CliError> {
     Ok(())
 }
 
-fn render_single_result(
+fn render_one(
     result: &StatementResult,
     format: ferrule_core::formatter::OutputFormat,
     limit: Option<usize>,
@@ -243,10 +254,46 @@ fn render_single_result(
                     qr.rows.truncate(n);
                 }
             }
-            format_result(&qr, format).map_err(CliError::query)
+            fmt_result(&qr, format).map_err(CliError::query)
         }
         StatementResult::Summary(s) => {
             Ok(format!("{} rows affected", s.rows_affected.unwrap_or(0)))
         }
     }
+}
+
+/// Open a temporary file with the given SQL in the user's $EDITOR,
+/// wait for them to save and quit, then return the edited contents.
+fn edit_in_editor(initial: &str) -> Result<String, CliError> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| String::from("vi"));
+
+    let tmp = tempfile::Builder::new()
+        .prefix("ferrule_bookmark_")
+        .suffix(".sql")
+        .tempfile()
+        .map_err(CliError::Io)?;
+
+    let path = tmp.path().to_owned();
+    {
+        let mut file = std::fs::File::create(&path).map_err(CliError::Io)?;
+        file.write_all(initial.as_bytes()).map_err(CliError::Io)?;
+    }
+
+    let status = std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+        .map_err(|e| CliError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to launch editor '{}': {}", editor, e),
+        )))?;
+
+    if !status.success() {
+        return Err(CliError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Editor '{}' exited with status: {}", editor, status),
+        )));
+    }
+
+    let edited = std::fs::read_to_string(&path).map_err(CliError::Io)?;
+    Ok(edited)
 }

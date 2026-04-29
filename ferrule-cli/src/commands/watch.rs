@@ -27,6 +27,18 @@ pub struct WatchArgs {
     #[arg(long)]
     pub diff: bool,
 
+    /// Watch a file for changes instead of polling on interval
+    #[arg(long, value_name = "PATH")]
+    pub file_path: Option<std::path::PathBuf>,
+
+    /// Exit immediately on connection/query failure
+    #[arg(long)]
+    pub exit_on_error: bool,
+
+    /// Ring terminal bell when output changes
+    #[arg(long)]
+    pub bell: bool,
+
     #[command(flatten)]
     pub output: OutputFlags,
 
@@ -57,6 +69,8 @@ pub async fn run(args: WatchArgs, global_config: &GlobalConfig) -> Result<(), Cl
         interval_secs: interval_secs.clone(),
         max_iterations: args.max_iterations,
         diff: args.diff,
+        exit_on_error: args.exit_on_error,
+        bell: args.bell,
         format,
         limit,
         offset,
@@ -65,6 +79,7 @@ pub async fn run(args: WatchArgs, global_config: &GlobalConfig) -> Result<(), Cl
         conn_flags: args.conn_flags.clone(),
         global_config: global_config.clone(),
         print_lock: print_lock.clone(),
+        file_path: args.file_path.clone(),
     };
 
     // Resolve connection once to validate before entering the loop.

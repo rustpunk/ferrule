@@ -4,6 +4,7 @@ pub mod describe;
 pub mod diff;
 pub mod dump;
 pub mod explain;
+pub mod export;
 pub mod load;
 pub mod query;
 pub mod repl;
@@ -13,6 +14,7 @@ pub mod watch;
 pub use bookmark::BookmarkArgs;
 pub use dump::DumpArgs;
 pub use explain::ExplainArgs;
+pub use export::ExportArgs;
 pub use load::LoadArgs;
 pub use repl::ReplArgs;
 pub use watch::WatchArgs;
@@ -556,6 +558,18 @@ pub struct QueryArgs {
     /// Dry run — print without executing
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Watch a file for changes instead of polling on interval
+    #[arg(long, value_name = "PATH")]
+    pub watch_file: Option<std::path::PathBuf>,
+
+    /// Watch mode — re-run the query periodically
+    #[arg(long)]
+    pub watch: bool,
+
+    /// Watch interval in seconds (default: 5)
+    #[arg(long, value_name = "SECS", default_value_t = 5)]
+    pub watch_interval: u64,
 }
 
 /// Tables command arguments.

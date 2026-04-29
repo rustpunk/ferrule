@@ -19,6 +19,8 @@ ferrule query <connection> [<sql>]
   [--file <path>] [--stdin]
   [--param NAME=VALUE]... [--param-file <json>]
   [--explain] [--dry-run]
+  [--filter <expr>]
+  [--watch] [--watch-interval <secs>]
   [--format <fmt>] [--output <file>]
   [--limit <n>] [--offset <n>]
   [--timing] [--verbose]
@@ -28,14 +30,15 @@ ferrule query <connection> [<sql>]
 
 See [Querying Data](querying.md).
 
-### `tables` / `describe` — schema introspection
+### `tables` / `describe` / `diff` — schema introspection
 
 ```bash
 ferrule tables   <connection> [output flags] [connection flags]
 ferrule describe <connection> <table> [output flags] [connection flags]
+ferrule diff     <connection-a> <connection-b> [diff flags] [output flags] [connection flags]
 ```
 
-See [Schema Introspection](schema.md).
+See [Schema Introspection](schema.md) and [Schema Diff](schema-diff.md).
 
 ### `explain` — execution plans
 
@@ -76,6 +79,9 @@ ferrule watch <connection> <sql>
   [--interval <seconds>]
   [--max-iterations <n>]
   [--diff]
+  [--exit-on-error]
+  [--bell]
+  [--file-path <path>]
   [--format <fmt>] [--output <file>]
   [--timing] [--verbose]
   [--insecure] [--daemon]
@@ -103,6 +109,7 @@ ferrule bookmark add <name> <sql> [--connection <name>]
 ferrule bookmark list
 ferrule bookmark run <name> [<arg>...]
   [--connection <name>]
+  [--edit]
   [--format <fmt>] [--output <file>]
   [--limit <n>] [--offset <n>]
   [--timing] [--verbose]
@@ -111,6 +118,32 @@ ferrule bookmark delete <name>
 ```
 
 See [Bookmarks](bookmarks.md).
+
+### `export` — streaming SQL-to-file export
+
+```bash
+ferrule export <connection> <sql>
+  [--file <path>]
+  [--format csv|json|jsonl|sql]
+  [--page-size <n>]
+  [--timing] [--verbose]
+  [--insecure] [--daemon]
+```
+
+See [Export](advanced.md#export).
+
+### `diff` — schema comparison between two connections
+
+```bash
+ferrule diff <connection-a> <connection-b>
+  [--table <name>]
+  [--password-a <pwd>] [--password-b <pwd>]
+  [--format <fmt>] [--output <file>]
+  [--timing] [--verbose]
+  [--insecure] [--daemon]
+```
+
+See [Schema Diff](schema-diff.md).
 
 ### `connection` (alias `conn`) — registry and daemon
 
@@ -172,6 +205,9 @@ Available on every command that opens a connection.
 | `--param-file <path>` | Load parameters from a JSON object file |
 | `--explain` | Wrap the SQL in EXPLAIN before sending |
 | `--dry-run` | Print the resolved SQL and URL; do not connect |
+| `--filter <expr>` | JMESPath expression to filter/reshape JSON output before printing. Implies `--format json` |
+| `--watch` | Re-run the query periodically (delegates to `watch` command) |
+| `--watch-interval <secs>` | Polling interval when `--watch` is set. Default: 5 |
 
 ### Explain-only flags
 
@@ -202,6 +238,26 @@ Available on every command that opens a connection.
 | `-i, --interval <seconds>` | Polling interval. Default: `5`. Minimum: `1` |
 | `--max-iterations <n>` | Stop after `<n>` iterations |
 | `--diff` | Only print output when the result differs from the previous iteration |
+| `--file-path <path>` | Watch the given SQL file and re-run when it changes |
+| `--exit-on-error` | Terminate on the first connection or query failure |
+| `--bell` | Ring the terminal bell (ASCII BEL) when `--diff` detects a change |
+
+### Export-only flags
+
+| Flag | Description |
+|---|---|
+| `--file <path>` | Output file (stdout if omitted) |
+| `--format <fmt>` | One of `csv`, `json`, `jsonl`, `sql`. Default: `csv` |
+| `--page-size <n>` | Server-side page size. Default: `1000` |
+| `--schema <name>` | Schema name; affects qualified table names in SQL dumps |
+| `--table <name>` | Target table name for SQL-format output. Default: `exported` |
+
+### Diff-only flags
+
+| Flag | Description |
+|---|---|
+| `--password-a <pwd>` | Override credential stack for connection A (left side) |
+| `--password-b <pwd>` | Override credential stack for connection B (right side) |
 
 ### Daemon-only flags
 

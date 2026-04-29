@@ -84,6 +84,9 @@ ferrule bookmark run pg.select_users --connection staging
 
 # Combine with paging
 ferrule bookmark run active-users --limit 10 --offset 20
+
+# Edit before running — opens your $EDITOR
+ferrule bookmark run active-users --edit
 ```
 
 `${1}`, `${2}`, … are replaced with the positional arguments you
@@ -94,6 +97,10 @@ intact (which the database will then reject).
 > the named `${name}` placeholders that `ferrule query --param` uses.
 > Named params are CLI-only because they require explicit `name=value`
 > mapping at call time.
+
+> **`--edit`** opens the bookmarked SQL in your `$EDITOR`.  You can modify
+> the statement before it runs.  This is useful for ad-hoc tweaks without
+> creating a new bookmark.
 
 ## Common patterns
 
