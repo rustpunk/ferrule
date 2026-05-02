@@ -128,6 +128,9 @@ The full credential stack and security trade-offs live in
 - Profiles take precedence over the registry. If a project-local
   `.ferrule.toml` and `~/.config/ferrule/connections.toml` both
   define `prod`, the profile wins.
+- **Typos are now hard errors.** Every `[default]` and `[connection]`
+  key is validated; a misspelled field like `ssh_hostt` produces an
+  error at config-load time instead of being silently ignored.
 
 ## Per-profile output defaults
 

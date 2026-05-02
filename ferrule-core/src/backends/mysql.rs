@@ -495,6 +495,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mysql_execute_multi() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("MySQL test container not available, skipping test_mysql_execute_multi");
+            return;
+        };
+        // Clean up any previous test row
+        let _ = conn
+            .execute("DELETE FROM test_users WHERE name = 'MultiUser'")
+            .await;
+        let results = conn
+            .execute_multi("INSERT INTO test_users (name, age) VALUES ('MultiUser', 42); SELECT COUNT(*) FROM test_users;")
+            .await
+            .expect("execute_multi should succeed");
+        assert_eq!(results.len(), 2, "should have two result sets");
+        // First result: DML summary
+        assert!(
+            matches!(&results[0], StatementResult::Summary(s) if s.rows_affected.is_some_and(|n| n > 0)),
+            "first result should be a DML summary with affected rows"
+        );
+        // Second result: SELECT query
+        assert!(
+            matches!(&results[1], StatementResult::Query(_)),
+            "second result should be a Query"
+        );
+    }
+
+    #[tokio::test]
     async fn test_mysql_type_mapping() {
         let Some(mut conn) = try_connect().await else {
             eprintln!("MySQL test container not available, skipping test_mysql_type_mapping");

@@ -46,12 +46,11 @@ which to use when.
 - TLS handled by the driver; opt in via the URL or server config.
 - JSON column type maps to `Value::Json`.
 - ENUM columns map to `Value::String` (the variant name).
-- **Multi-statement batches not supported** at the ferrule layer —
-  the driver allows it, but we don't expose it to keep behavior
-  consistent across backends. Issue separate `ferrule query` calls.
+- **Multi-statement batches supported** — `;`-separated statements
+  in one call via `mysql_async` native multi-result API.
 
 ```bash
-ferrule query "mysql://root:pass@127.0.0.1:3306/mydb" "SELECT * FROM users;"
+ferrule query "mysql://root:pass@127.0.0.1:3306/mydb" "SELECT 1; SELECT 2;"
 ```
 
 If you hit `caching_sha2_password` errors, see
@@ -146,8 +145,8 @@ query parameter is preferred where it applies.
 | Backend | Batch via `;` | Notes |
 |---|---|---|
 | PostgreSQL | ✅ | First-class; result sets and DML row counts both reported |
+| MySQL | ✅ | Via `mysql_async` multi-result API |
 | MSSQL | ✅ | Via TDS row-set framing |
-| MySQL | ❌ | Driver supports it; ferrule does not surface it. Issue separate calls |
 | SQLite | ❌ | Use a script via `--file` if needed; one statement per `query` call |
 | Oracle | ✅ | Semicolon-split with PL/SQL block awareness; `BEGIN … END`, `IF … END IF`, `LOOP … END LOOP`, and `CASE … END CASE` are kept intact |
 

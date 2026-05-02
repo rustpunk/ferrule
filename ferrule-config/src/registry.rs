@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Lightweight entry for a single connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionEntry {
     pub name: String,
     pub url: String,

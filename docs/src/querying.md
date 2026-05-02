@@ -76,8 +76,9 @@ A few quirks worth knowing:
 
 ## Multi-statement batches
 
-Backends with native multi-statement support (PostgreSQL, MSSQL) can
-take several `;`-separated statements in one round trip:
+Backends with native multi-statement support (PostgreSQL, MySQL, MSSQL) or
+PL/SQL block support (Oracle) can take several `;`-separated
+statements in one round trip:
 
 ```bash
 ferrule query demo --limit 0 "
@@ -92,7 +93,7 @@ Behavior:
   a `-- Result set N` separator.
 - **DML row counts** print to stderr as `-- Statement N: K rows
   affected`.
-- **MySQL and SQLite** at the current driver layer don't
+- **SQLite** at the current driver layer doesn't
   multiplex multiple statements per query — split into separate
   `ferrule query` calls or use a stored procedure / script
   invocation specific to that backend.

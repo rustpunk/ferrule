@@ -103,9 +103,8 @@ contents.
 
 ## Multi-statement semantics
 
-Some backends (PostgreSQL, MSSQL) accept multiple `;`-separated
-statements in a single round-trip. Ferrule supports this for those
-backends:
+All backends except SQLite accept multiple `;`-separated statements in a
+single round-trip. Ferrule supports this natively:
 
 ```bash
 ferrule query prod "
@@ -121,11 +120,13 @@ A few rules:
   `--limit 0` to disable paging for batches.
 - **Each result is reported separately.** Result sets print to stdout;
   DML row counts ("`N rows affected`") print to stderr.
-- **Backends that don't support batches** (MySQL, SQLite in
-  the current driver layer) reject the SQL — split it into separate
-  `ferrule query` calls or wrap it in a stored procedure.
-- **Oracle** now supports multi-statement batches with PL/SQL block
-  awareness; see [Querying](querying.md#multi-statement-batches).
+- **SQLite** is the only backend that does not support multi-statement
+  batches at the ferrule layer — split into separate `ferrule query`
+  calls or use a script via `--file`.
+- **Oracle** uses a custom semicolon splitter that understands PL/SQL
+  blocks (`BEGIN … END`, `IF … END IF`, `LOOP … END LOOP`,
+  `CASE … END CASE`) so internal semicolons do not split prematurely.
+  See [Backends](backends.md#multi-statement-support).
 
 ## Where to next
 

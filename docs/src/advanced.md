@@ -86,7 +86,9 @@ imports CSV / JSON back into a table.
 - **Cross-backend portability.** Dump from MySQL, load into
   Postgres, no manual schema translation needed (within ferrule's
   unified `Value` types).
-- **Snapshots** of small to medium tables for offline inspection.
+- **Snapshots** of tables of any size. The implementation fetches
+  rows in paged batches and formats them incrementally, so memory
+  usage stays flat (proportional to `batch_size`, not table size).
 
 For larger jobs, the native shells win on raw throughput:
 `pg_dump` / `pg_restore`, `psql \copy`, `mysqldump`, `bcp`. Ferrule

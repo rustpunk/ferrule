@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Global configuration + per-connection profiles.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalConfig {
     #[serde(default)]
     pub default: DefaultProfile,
@@ -80,6 +81,7 @@ impl GlobalConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DefaultProfile {
     #[serde(default = "default_format")]
     pub format: String,
@@ -123,6 +125,7 @@ fn default_timeout() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionProfile {
     pub url: String,
     #[serde(default)]

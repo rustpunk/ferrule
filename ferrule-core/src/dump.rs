@@ -1,8 +1,8 @@
 use crate::backend::Backend;
-use crate::connection::{Connection, QueryResult};
+use crate::connection::Connection;
 use crate::error::CoreError;
 use crate::params::render_value;
-use crate::value::Value;
+use crate::value::{ColumnInfo, Value};
 
 /// Supported dump formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,9 @@ pub async fn dump_table(
 }
 
 /// Dump the results of an arbitrary SELECT query.
+///
+/// Rows are fetched in paged batches and formatted incrementally so the
+/// entire result set never has to reside in memory at once.
 pub async fn dump_query(
     conn: &mut dyn Connection,
     sql: &str,
@@ -61,57 +64,162 @@ pub async fn dump_query(
     opts: &DumpOptions,
     table_name: Option<&str>,
 ) -> Result<String, CoreError> {
-    let mut all_results = Vec::new();
     let mut offset = 0usize;
-    loop {
-        let paged =
-            crate::query_builder::apply_paging(sql, Some(opts.batch_size), Some(offset), backend)?;
-        let page = conn.query(&paged).await?;
-        if page.rows.is_empty() {
-            break;
-        }
-        all_results.push(page);
-        let fetched = all_results.last().unwrap().rows.len();
-        offset += fetched;
-        if fetched < opts.batch_size {
-            break;
-        }
-    }
-
-    // Merge pages into one QueryResult
-    let mut columns = Vec::new();
-    let mut rows = Vec::new();
-    for page in all_results {
-        if columns.is_empty() {
-            columns = page.columns;
-        }
-        rows.extend(page.rows);
-    }
-    let result = QueryResult { columns, rows };
+    let mut first_page = true;
+    let mut columns: Vec<ColumnInfo> = Vec::new();
 
     match opts.format {
-        DumpFormat::Csv => format_csv(&result),
-        DumpFormat::Json => format_json(&result),
+        DumpFormat::Csv => {
+            let mut buf = Vec::new();
+            {
+                let mut wtr = csv::Writer::from_writer(&mut buf);
+                loop {
+                    let paged = crate::query_builder::apply_paging(
+                        sql,
+                        Some(opts.batch_size),
+                        Some(offset),
+                        backend,
+                    )?;
+                    let page = conn.query(&paged).await?;
+
+                    if first_page {
+                        if !page.columns.is_empty() {
+                            columns = page.columns;
+                            let headers: Vec<&str> =
+                                columns.iter().map(|c| c.name.as_str()).collect();
+                            wtr.write_record(&headers)
+                                .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                        }
+                        first_page = false;
+                    }
+
+                    if page.rows.is_empty() {
+                        break;
+                    }
+
+                    for row in &page.rows {
+                        let cells: Vec<String> = row.iter().map(value_to_csv_cell).collect();
+                        wtr.write_record(&cells)
+                            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    }
+
+                    let fetched = page.rows.len();
+                    offset += fetched;
+                    if fetched < opts.batch_size {
+                        break;
+                    }
+                }
+                wtr.flush()
+                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            }
+            String::from_utf8(buf).map_err(|e| CoreError::QueryFailed(e.to_string()))
+        }
+
+        DumpFormat::Json => {
+            let mut buf = Vec::new();
+            buf.push(b'[');
+            let mut first_row = true;
+
+            loop {
+                let paged = crate::query_builder::apply_paging(
+                    sql,
+                    Some(opts.batch_size),
+                    Some(offset),
+                    backend,
+                )?;
+                let page = conn.query(&paged).await?;
+
+                if first_page {
+                    if !page.columns.is_empty() {
+                        columns = page.columns;
+                    }
+                    first_page = false;
+                }
+
+                if page.rows.is_empty() {
+                    break;
+                }
+
+                for row in &page.rows {
+                    if !first_row {
+                        buf.push(b',');
+                    }
+                    first_row = false;
+
+                    let mut obj = serde_json::Map::new();
+                    for (col, val) in columns.iter().zip(row.iter()) {
+                        obj.insert(col.name.clone(), json_value(val));
+                    }
+                    let json_str = serde_json::to_string(&serde_json::Value::Object(obj))
+                        .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    buf.extend_from_slice(json_str.as_bytes());
+                }
+
+                let fetched = page.rows.len();
+                offset += fetched;
+                if fetched < opts.batch_size {
+                    break;
+                }
+            }
+
+            buf.push(b']');
+            String::from_utf8(buf).map_err(|e| CoreError::QueryFailed(e.to_string()))
+        }
+
         DumpFormat::Sql => {
             let table = table_name.unwrap_or("dumped_table");
-            format_sql(&result, table, backend, opts.batch_size)
+            let quoted_table = quote_identifier(table);
+            let mut out = String::new();
+
+            loop {
+                let paged = crate::query_builder::apply_paging(
+                    sql,
+                    Some(opts.batch_size),
+                    Some(offset),
+                    backend,
+                )?;
+                let page = conn.query(&paged).await?;
+
+                if first_page {
+                    if !page.columns.is_empty() {
+                        columns = page.columns;
+                    }
+                    first_page = false;
+                }
+
+                if page.rows.is_empty() {
+                    break;
+                }
+
+                let col_names: Vec<String> =
+                    columns.iter().map(|c| quote_identifier(&c.name)).collect();
+                let cols = col_names.join(", ");
+
+                let values: Vec<String> = page
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let cells: Vec<String> =
+                            row.iter().map(|v| render_value(v, backend)).collect();
+                        format!("({})", cells.join(", "))
+                    })
+                    .collect();
+
+                out.push_str(&format!(
+                    "INSERT INTO {quoted_table} ({cols}) VALUES {};\n",
+                    values.join(", ")
+                ));
+
+                let fetched = page.rows.len();
+                offset += fetched;
+                if fetched < opts.batch_size {
+                    break;
+                }
+            }
+
+            Ok(out)
         }
     }
-}
-
-fn format_csv(result: &QueryResult) -> Result<String, CoreError> {
-    let mut wtr = csv::Writer::from_writer(Vec::new());
-    let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
-    wtr.write_record(&headers)
-        .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
-    for row in &result.rows {
-        let cells: Vec<String> = row.iter().map(value_to_csv_cell).collect();
-        wtr.write_record(&cells)
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
-    }
-    wtr.into_inner()
-        .map(|v| String::from_utf8_lossy(&v).into_owned())
-        .map_err(|e| CoreError::QueryFailed(e.to_string()))
 }
 
 fn value_to_csv_cell(v: &Value) -> String {
@@ -120,18 +228,6 @@ fn value_to_csv_cell(v: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
-}
-
-fn format_json(result: &QueryResult) -> Result<String, CoreError> {
-    let mut out = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
-        let mut obj = serde_json::Map::new();
-        for (col, val) in result.columns.iter().zip(row.iter()) {
-            obj.insert(col.name.clone(), json_value(val));
-        }
-        out.push(serde_json::Value::Object(obj));
-    }
-    serde_json::to_string_pretty(&out).map_err(|e| CoreError::QueryFailed(e.to_string()))
 }
 
 fn json_value(v: &Value) -> serde_json::Value {
@@ -153,43 +249,6 @@ fn json_value(v: &Value) -> serde_json::Value {
         Value::Uuid(u) => serde_json::Value::String(u.clone()),
         Value::Array(a) => serde_json::Value::Array(a.iter().map(json_value).collect()),
     }
-}
-
-fn format_sql(
-    result: &QueryResult,
-    table: &str,
-    backend: Backend,
-    batch_size: usize,
-) -> Result<String, CoreError> {
-    let mut lines = Vec::new();
-    let quoted_table = quote_identifier(table);
-    let col_names: Vec<String> = result
-        .columns
-        .iter()
-        .map(|c| quote_identifier(&c.name))
-        .collect();
-    let cols = col_names.join(", ");
-
-    let mut batch = Vec::new();
-    for row in &result.rows {
-        let values: Vec<String> = row.iter().map(|v| render_value(v, backend)).collect();
-        batch.push(format!("({})", values.join(", ")));
-        if batch.len() >= batch_size {
-            lines.push(format!(
-                "INSERT INTO {quoted_table} ({cols}) VALUES {};",
-                batch.join(", ")
-            ));
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        lines.push(format!(
-            "INSERT INTO {quoted_table} ({cols}) VALUES {};",
-            batch.join(", ")
-        ));
-    }
-
-    Ok(lines.join("\n"))
 }
 
 /// SQL-standard identifier quoting: wraps in double quotes and doubles
