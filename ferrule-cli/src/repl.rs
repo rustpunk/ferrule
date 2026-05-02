@@ -191,13 +191,14 @@ impl Repl {
         let query_start = std::time::Instant::now();
 
         let results = if self.state.explain_mode {
-            let (wrapped, _out, _is_multi) = match ferrule_core::explain_sql(&paged, self.backend, false) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Explain error: {e}");
-                    return;
-                }
-            };
+            let (wrapped, _out, _is_multi) =
+                match ferrule_core::explain_sql(&paged, self.backend, false) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("Explain error: {e}");
+                        return;
+                    }
+                };
             rt.block_on(async {
                 match self.conn.query(&wrapped).await {
                     Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
@@ -749,13 +750,14 @@ fn cmd_explain(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
             return;
         }
     };
-    let (wrapped, _out, _is_multi) = match ferrule_core::explain_sql(&substituted, repl.backend, false) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Explain error: {e}");
-            return;
-        }
-    };
+    let (wrapped, _out, _is_multi) =
+        match ferrule_core::explain_sql(&substituted, repl.backend, false) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Explain error: {e}");
+                return;
+            }
+        };
     if repl.state.verbose {
         eprintln!("[ferrule] explain SQL: {wrapped}");
     }

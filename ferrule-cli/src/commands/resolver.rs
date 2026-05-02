@@ -1,10 +1,8 @@
 use crate::error::CliError;
 use crate::ssh_keys::KeySource;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_config::registry::ConnectionRegistry;
 use ferrule_core::tunnel::SshConfig;
 use ferrule_core::url::DatabaseUrl;
-use secrecy::ExposeSecret;
 
 /// SSH inputs collected by [`resolve_connection`]: the merged SSH
 /// configuration plus the resolved [`KeySource`]. The caller hands
@@ -42,80 +40,38 @@ pub async fn resolve_connection(
     proxy_url: Option<&str>,
     global_config: &GlobalConfig,
 ) -> Result<ResolvedConnection, CliError> {
-    let url = resolve_url(connection, password, global_config).await?;
-
+    // 1. Build SSH config from CLI flags + profile.
     let ssh_config =
         crate::ssh_flags::resolve_ssh_config(connection, ssh_tunnel, ssh_key, global_config)?;
 
-    let ssh = match ssh_config {
+    let ssh = match &ssh_config {
         Some(cfg) => {
             let key_source =
                 crate::ssh_keys::resolve_key_source_default(connection, cfg.key_path.as_deref())?;
             Some(SshTunnelInputs {
-                config: cfg,
+                config: cfg.clone(),
                 key_source,
             })
         }
         None => None,
     };
 
-    let proxy = resolve_proxy_config(connection, proxy_url, global_config, &url)?;
+    // 2. Delegate URL, password, proxy resolution to ferrule-core.
+    let core_resolved = ferrule_core::resolver::resolve_connection(
+        connection,
+        password,
+        ssh_config,
+        proxy_url,
+        global_config,
+    )
+    .await
+    .map_err(CliError::connection)?;
 
-    Ok(ResolvedConnection { url, ssh, proxy })
-}
-
-/// Resolve proxy configuration from CLI flag, profile, env vars.
-fn resolve_proxy_config(
-    connection_name: &str,
-    proxy_url: Option<&str>,
-    global_config: &GlobalConfig,
-    url: &DatabaseUrl,
-) -> Result<Option<ferrule_core::ProxyConfig>, CliError> {
-    // 1. CLI flag
-    if let Some(raw) = proxy_url {
-        return ferrule_core::ProxyConfig::parse(raw)
-            .map(Some)
-            .map_err(|e| CliError::usage(format!("Invalid --proxy-url: {e}")));
-    }
-
-    // 2. Profile
-    if let Some(profile) = global_config.connection.get(connection_name) {
-        if let Some(raw) = &profile.proxy_url {
-            return ferrule_core::ProxyConfig::parse(raw)
-                .map(Some)
-                .map_err(|e| {
-                    CliError::usage(format!(
-                        "Invalid proxy_url in profile for '{connection_name}': {e}"
-                    ))
-                });
-        }
-    }
-
-    // 3. FERRULE_<NAME>_PROXY_URL env var
-    let env_name = format!(
-        "FERRULE_{}_PROXY_URL",
-        connection_name.to_ascii_uppercase().replace('-', "_")
-    );
-    if let Ok(raw) = std::env::var(&env_name) {
-        if !raw.is_empty() {
-            return ferrule_core::ProxyConfig::parse(&raw)
-                .map(Some)
-                .map_err(|e| CliError::usage(format!("{env_name} is set but invalid: {e}")));
-        }
-    }
-
-    // 4. ALL_PROXY / HTTP_PROXY / HTTPS_PROXY env vars
-    let target_scheme = url.scheme();
-    if let Some(cfg) = ferrule_core::proxy::resolve_proxy_from_env(target_scheme) {
-        if let Some(host) = url.host() {
-            if ferrule_core::proxy::is_no_proxy(host) {
-                return Ok(None);
-            }
-        }
-        return Ok(Some(cfg));
-    }
-
-    Ok(None)
+    Ok(ResolvedConnection {
+        url: core_resolved.url,
+        ssh,
+        proxy: core_resolved.proxy,
+    })
 }
 
 /// Per Wave 3 B3 §2d: reject `--daemon` together with any SSH
@@ -257,106 +213,10 @@ async fn connect_via_ssh_tunnel(
     _opts: &ferrule_core::ConnectOptions,
     _proxy: Option<&ferrule_core::ProxyConfig>,
 ) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
-    // Read the fields so they aren't flagged as dead code in
-    // ssh-feature-off builds; the struct exists in both feature
-    // modes because `ResolvedConnection.ssh` is non-gated.
     let _ = (&ssh.config, &ssh.key_source);
     Err(CliError::usage(
         "This ferrule binary was built without the `ssh` feature. \
          Rebuild with `cargo build --features ferrule-cli/ssh` (or `--features all`)."
             .to_string(),
     ))
-}
-
-/// Resolve just the URL (and credential stack) without touching SSH.
-/// Internal to `resolve_connection`; split out so the SSH branch
-/// reuses it cleanly.
-async fn resolve_url(
-    connection: &str,
-    password: Option<String>,
-    global_config: &GlobalConfig,
-) -> Result<DatabaseUrl, CliError> {
-    match DatabaseUrl::parse(connection) {
-        Ok(mut url) => {
-            if let Some(pwd) = password {
-                url.set_password(Some(&pwd));
-            }
-            Ok(url)
-        }
-        Err(_) => {
-            // 1. Try profile (from .ferrule.toml)
-            if let Some(profile) = global_config.connection.get(connection) {
-                let mut url = DatabaseUrl::parse(&profile.url).map_err(|e| {
-                    CliError::usage(format!(
-                        "Invalid URL in profile for '{}': {}",
-                        connection, e
-                    ))
-                })?;
-                let resolved = ferrule_config::credentials::resolve_password_stack(
-                    connection,
-                    password.map(|p| secrecy::SecretString::new(p.into())),
-                    profile.password_url.as_deref(),
-                )
-                .map_err(CliError::registry)?;
-                let final_pwd = if let Some(pwd) = resolved {
-                    Some(pwd)
-                } else {
-                    prompt_password_interactive(connection).await?
-                };
-                if let Some(pwd) = final_pwd {
-                    url.set_password(Some(pwd.expose_secret()));
-                }
-                return Ok(url);
-            }
-
-            // 2. Fall back to registry (connections.toml)
-            let registry = ConnectionRegistry::load_default().map_err(CliError::registry)?;
-            let entry = registry.get(connection).ok_or_else(|| {
-                CliError::usage(format!(
-                    "Connection '{}' is not a valid URL and not found in registry or profile.",
-                    connection
-                ))
-            })?;
-            let mut url = DatabaseUrl::parse(&entry.url).map_err(|e| {
-                CliError::usage(format!(
-                    "Invalid URL in registry for '{}': {}",
-                    connection, e
-                ))
-            })?;
-
-            let resolved = ferrule_config::credentials::resolve_password_stack(
-                connection,
-                password.map(|p| secrecy::SecretString::new(p.into())),
-                None,
-            )
-            .map_err(CliError::registry)?;
-            let final_pwd = if let Some(pwd) = resolved {
-                Some(pwd)
-            } else {
-                prompt_password_interactive(connection).await?
-            };
-            if let Some(pwd) = final_pwd {
-                url.set_password(Some(pwd.expose_secret()));
-            }
-            Ok(url)
-        }
-    }
-}
-
-/// Prompt for a password interactively (TTY only).
-async fn prompt_password_interactive(
-    name: &str,
-) -> Result<Option<secrecy::SecretString>, CliError> {
-    let tty = is_terminal::IsTerminal::is_terminal(&std::io::stdin());
-    if tty {
-        let prompt = format!("Password for '{}': ", name);
-        let pwd = tokio::task::spawn_blocking(move || rpassword::prompt_password(prompt))
-            .await
-            .map_err(|e| CliError::usage(format!("Password prompt failed: {e}")))?
-            .map_err(CliError::Io)?;
-        if !pwd.is_empty() {
-            return Ok(Some(secrecy::SecretString::new(pwd.into())));
-        }
-    }
-    Ok(None)
 }

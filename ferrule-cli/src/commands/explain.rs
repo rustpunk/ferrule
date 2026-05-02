@@ -91,16 +91,21 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
     let mut conn = connect_resolved(resolved, &opts).await?;
 
     let result = if is_multi {
-        let results = conn.execute_multi(&wrapped_sql).await.map_err(CliError::query)?;
+        let results = conn
+            .execute_multi(&wrapped_sql)
+            .await
+            .map_err(CliError::query)?;
         results
             .into_iter()
             .find_map(|r| match r {
                 ferrule_core::connection::StatementResult::Query(qr) => Some(qr),
                 _ => None,
             })
-            .ok_or_else(|| CliError::query(ferrule_core::CoreError::QueryFailed(
-                "EXPLAIN produced no query result".to_string()
-            )))?
+            .ok_or_else(|| {
+                CliError::query(ferrule_core::CoreError::QueryFailed(
+                    "EXPLAIN produced no query result".to_string(),
+                ))
+            })?
     } else {
         conn.query(&wrapped_sql).await.map_err(CliError::query)?
     };

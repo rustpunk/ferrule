@@ -1424,6 +1424,7 @@ dependencies = [
  "base64",
  "chrono",
  "csv",
+ "ferrule-config",
  "indexmap",
  "mysql_async",
  "oracle",

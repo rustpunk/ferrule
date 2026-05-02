@@ -9,6 +9,7 @@ pub mod formatter;
 pub mod load;
 pub mod params;
 pub mod proxy;
+pub mod resolver;
 pub mod tunnel;
 pub mod url;
 pub mod value;

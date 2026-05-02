@@ -43,4 +43,7 @@ pub enum CoreError {
 
     #[error("timeout")]
     Timeout,
+
+    #[error("registry error: {0}")]
+    RegistryError(String),
 }
