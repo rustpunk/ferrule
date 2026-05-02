@@ -79,9 +79,8 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
     .await?;
     check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
-    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
-        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
-    })?;
+    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
+        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     let opts = LoadOptions {
         format,

@@ -14,17 +14,13 @@ pub fn default_format() -> OutputFormat {
 ///
 /// Returns the filtered JSON. Errors are returned as `String` so callers can
 /// wrap them in their own error type with the right exit-code category.
-pub fn apply_filter(
-    json: serde_json::Value,
-    expr: &str,
-) -> Result<serde_json::Value, String> {
+pub fn apply_filter(json: serde_json::Value, expr: &str) -> Result<serde_json::Value, String> {
     let compiled =
         jmespath::compile(expr).map_err(|e| format!("invalid JMESPath expression: {e}"))?;
     let result = compiled
         .search(json)
         .map_err(|e| format!("JMESPath evaluation failed: {e}"))?;
-    serde_json::to_value(&*result)
-        .map_err(|e| format!("failed to serialize JMESPath result: {e}"))
+    serde_json::to_value(&*result).map_err(|e| format!("failed to serialize JMESPath result: {e}"))
 }
 
 #[cfg(test)]
@@ -49,8 +45,8 @@ mod tests {
             {"name": "Bob",   "age": 25},
             {"name": "Carol", "age": 35}
         ]);
-        let result = apply_filter(data, "[?age > `28`].name")
-            .expect("filter should compile and run");
+        let result =
+            apply_filter(data, "[?age > `28`].name").expect("filter should compile and run");
         assert_eq!(result, json!(["Alice", "Carol"]));
     }
 
@@ -61,8 +57,7 @@ mod tests {
             {"name": "Bob"},
             {"name": "Carol"}
         ]);
-        let result =
-            apply_filter(data, "length(@)").expect("filter should compile and run");
+        let result = apply_filter(data, "length(@)").expect("filter should compile and run");
         assert_eq!(result, json!(3));
     }
 

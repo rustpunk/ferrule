@@ -82,11 +82,12 @@ fn extract_columns(result: &QueryResult, backend: Backend) -> Vec<ColumnSpec> {
         .collect()
 }
 
-fn diff_tables(a: &[ColumnSpec], b: &[ColumnSpec]) -> (Vec<ColumnSpec>, Vec<ColumnSpec>, Vec<TypeChange>) {
-    let a_map: BTreeMap<&str, &ColumnSpec> =
-        a.iter().map(|c| (c.name.as_str(), c)).collect();
-    let b_map: BTreeMap<&str, &ColumnSpec> =
-        b.iter().map(|c| (c.name.as_str(), c)).collect();
+fn diff_tables(
+    a: &[ColumnSpec],
+    b: &[ColumnSpec],
+) -> (Vec<ColumnSpec>, Vec<ColumnSpec>, Vec<TypeChange>) {
+    let a_map: BTreeMap<&str, &ColumnSpec> = a.iter().map(|c| (c.name.as_str(), c)).collect();
+    let b_map: BTreeMap<&str, &ColumnSpec> = b.iter().map(|c| (c.name.as_str(), c)).collect();
 
     let only_in_a = a
         .iter()
@@ -158,8 +159,14 @@ async fn build_schema_diff(
     let mut common: Vec<&String> = a_tables.iter().filter(|t| b_set.contains_key(*t)).collect();
     common.sort();
     for t in common {
-        let a_desc = a_conn.describe_table(None, t).await.map_err(CliError::query)?;
-        let b_desc = b_conn.describe_table(None, t).await.map_err(CliError::query)?;
+        let a_desc = a_conn
+            .describe_table(None, t)
+            .await
+            .map_err(CliError::query)?;
+        let b_desc = b_conn
+            .describe_table(None, t)
+            .await
+            .map_err(CliError::query)?;
         let a_cols = extract_columns(&a_desc, a_backend);
         let b_cols = extract_columns(&b_desc, b_backend);
         let (only_in_a, only_in_b, type_changes) = diff_tables(&a_cols, &b_cols);
@@ -208,9 +215,8 @@ fn render_json(diff: &SchemaDiff) -> Result<String, CliError> {
             })
         }).collect::<Vec<_>>(),
     });
-    serde_json::to_string_pretty(&json).map_err(|e| {
-        CliError::query(ferrule_core::CoreError::QueryFailed(e.to_string()))
-    })
+    serde_json::to_string_pretty(&json)
+        .map_err(|e| CliError::query(ferrule_core::CoreError::QueryFailed(e.to_string())))
 }
 
 fn render_text(diff: &SchemaDiff) -> String {
@@ -285,16 +291,10 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
     super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved_b)?;
 
     let backend_a = Backend::from_scheme(resolved_a.url.scheme()).ok_or_else(|| {
-        CliError::usage(format!(
-            "Unsupported scheme A: {}",
-            resolved_a.url.scheme()
-        ))
+        CliError::usage(format!("Unsupported scheme A: {}", resolved_a.url.scheme()))
     })?;
     let backend_b = Backend::from_scheme(resolved_b.url.scheme()).ok_or_else(|| {
-        CliError::usage(format!(
-            "Unsupported scheme B: {}",
-            resolved_b.url.scheme()
-        ))
+        CliError::usage(format!("Unsupported scheme B: {}", resolved_b.url.scheme()))
     })?;
 
     if args.output.verbose {
@@ -354,8 +354,16 @@ mod tests {
 
     #[test]
     fn diff_columns_added_removed_changed() {
-        let a = vec![col("id", "INTEGER"), col("name", "TEXT"), col("age", "INTEGER")];
-        let b = vec![col("id", "INTEGER"), col("name", "VARCHAR"), col("email", "TEXT")];
+        let a = vec![
+            col("id", "INTEGER"),
+            col("name", "TEXT"),
+            col("age", "INTEGER"),
+        ];
+        let b = vec![
+            col("id", "INTEGER"),
+            col("name", "VARCHAR"),
+            col("email", "TEXT"),
+        ];
         let (only_a, only_b, type_changes) = diff_tables(&a, &b);
         assert_eq!(only_a, vec![col("age", "INTEGER")]);
         assert_eq!(only_b, vec![col("email", "TEXT")]);
@@ -390,12 +398,36 @@ mod tests {
         // PRAGMA table_info row: (cid, name, type, notnull, dflt_value, pk)
         let qr = QueryResult {
             columns: vec![
-                ColumnInfo { name: "cid".into(), type_hint: ferrule_core::value::TypeHint::Int64, nullable: false },
-                ColumnInfo { name: "name".into(), type_hint: ferrule_core::value::TypeHint::String, nullable: false },
-                ColumnInfo { name: "type".into(), type_hint: ferrule_core::value::TypeHint::String, nullable: false },
-                ColumnInfo { name: "notnull".into(), type_hint: ferrule_core::value::TypeHint::Int64, nullable: false },
-                ColumnInfo { name: "dflt_value".into(), type_hint: ferrule_core::value::TypeHint::String, nullable: true },
-                ColumnInfo { name: "pk".into(), type_hint: ferrule_core::value::TypeHint::Int64, nullable: false },
+                ColumnInfo {
+                    name: "cid".into(),
+                    type_hint: ferrule_core::value::TypeHint::Int64,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    type_hint: ferrule_core::value::TypeHint::String,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "type".into(),
+                    type_hint: ferrule_core::value::TypeHint::String,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "notnull".into(),
+                    type_hint: ferrule_core::value::TypeHint::Int64,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "dflt_value".into(),
+                    type_hint: ferrule_core::value::TypeHint::String,
+                    nullable: true,
+                },
+                ColumnInfo {
+                    name: "pk".into(),
+                    type_hint: ferrule_core::value::TypeHint::Int64,
+                    nullable: false,
+                },
             ],
             rows: vec![
                 vec![
@@ -428,23 +460,27 @@ mod tests {
         static N: AtomicU64 = AtomicU64::new(0);
         let pid = std::process::id();
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let path_a = std::env::temp_dir()
-            .join(format!("ferrule-diff-test-{pid}-{n}-a.db"));
+        let path_a = std::env::temp_dir().join(format!("ferrule-diff-test-{pid}-{n}-a.db"));
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let path_b = std::env::temp_dir()
-            .join(format!("ferrule-diff-test-{pid}-{n}-b.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-diff-test-{pid}-{n}-b.db"));
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut a = ferrule_core::connect(&url_a, &ConnectOptions::default(), None,
-        ).await.unwrap();
-        let mut b = ferrule_core::connect(&url_b, &ConnectOptions::default(), None,
-        ).await.unwrap();
+        let mut a = ferrule_core::connect(&url_a, &ConnectOptions::default(), None)
+            .await
+            .unwrap();
+        let mut b = ferrule_core::connect(&url_b, &ConnectOptions::default(), None)
+            .await
+            .unwrap();
 
-        a.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
-        b.execute("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").await.unwrap();
+        a.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        b.execute("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)")
+            .await
+            .unwrap();
         a.execute("CREATE TABLE only_a (id INTEGER)").await.unwrap();
         b.execute("CREATE TABLE only_b (id INTEGER)").await.unwrap();
 
@@ -458,8 +494,16 @@ mod tests {
         .await
         .expect("diff");
 
-        assert!(diff.only_in_a.contains(&"only_a".to_string()), "only_in_a: {:?}", diff.only_in_a);
-        assert!(diff.only_in_b.contains(&"only_b".to_string()), "only_in_b: {:?}", diff.only_in_b);
+        assert!(
+            diff.only_in_a.contains(&"only_a".to_string()),
+            "only_in_a: {:?}",
+            diff.only_in_a
+        );
+        assert!(
+            diff.only_in_b.contains(&"only_b".to_string()),
+            "only_in_b: {:?}",
+            diff.only_in_b
+        );
         let t_diff = diff
             .table_diffs
             .iter()

@@ -196,21 +196,14 @@ mod tests {
         let home = fresh_test_home();
         let key = home.join("my-key");
         touch(&key);
-        let resolved = resolve_key_source(
-            "x",
-            Some(key.to_str().unwrap()),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let resolved =
+            resolve_key_source("x", Some(key.to_str().unwrap()), None, None, None).unwrap();
         assert_eq!(resolved, KeySource::File(key));
     }
 
     #[test]
     fn explicit_hint_missing_file_errors() {
-        let err = resolve_key_source("x", Some("/nonexistent/key"), None, None, None)
-            .unwrap_err();
+        let err = resolve_key_source("x", Some("/nonexistent/key"), None, None, None).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -219,14 +212,8 @@ mod tests {
         let home = fresh_test_home();
         let key = home.join(".ssh").join("custom_key");
         touch(&key);
-        let resolved = resolve_key_source(
-            "x",
-            Some("~/.ssh/custom_key"),
-            Some(&home),
-            None,
-            None,
-        )
-        .unwrap();
+        let resolved =
+            resolve_key_source("x", Some("~/.ssh/custom_key"), Some(&home), None, None).unwrap();
         assert_eq!(resolved, KeySource::File(key));
     }
 
@@ -235,27 +222,15 @@ mod tests {
         let home = fresh_test_home();
         let key = home.join("env-key");
         touch(&key);
-        let resolved = resolve_key_source(
-            "x",
-            None,
-            None,
-            None,
-            Some(key.to_str().unwrap()),
-        )
-        .unwrap();
+        let resolved =
+            resolve_key_source("x", None, None, None, Some(key.to_str().unwrap())).unwrap();
         assert_eq!(resolved, KeySource::File(key));
     }
 
     #[test]
     fn env_var_missing_file_errors_with_var_name() {
-        let err = resolve_key_source(
-            "my-conn",
-            None,
-            None,
-            None,
-            Some("/nonexistent/path"),
-        )
-        .unwrap_err();
+        let err =
+            resolve_key_source("my-conn", None, None, None, Some("/nonexistent/path")).unwrap_err();
         let s = err.to_string();
         assert!(s.contains("FERRULE_MY_CONN_SSH_KEY"));
         assert!(s.contains("/nonexistent/path"));
@@ -367,14 +342,8 @@ mod tests {
         let home = fresh_test_home();
         let id_ed = home.join(".ssh").join("id_ed25519");
         touch(&id_ed);
-        let resolved = resolve_key_source(
-            "x",
-            None,
-            Some(&home),
-            Some("/some/agent.sock"),
-            None,
-        )
-        .unwrap();
+        let resolved =
+            resolve_key_source("x", None, Some(&home), Some("/some/agent.sock"), None).unwrap();
         assert_eq!(resolved, KeySource::File(id_ed));
     }
 
@@ -382,9 +351,6 @@ mod tests {
     fn env_var_name_uppercases_and_replaces_dashes() {
         assert_eq!(format_env_var_name("prod-pg"), "FERRULE_PROD_PG_SSH_KEY");
         assert_eq!(format_env_var_name("staging"), "FERRULE_STAGING_SSH_KEY");
-        assert_eq!(
-            format_env_var_name("a-b-c-d"),
-            "FERRULE_A_B_C_D_SSH_KEY"
-        );
+        assert_eq!(format_env_var_name("a-b-c-d"), "FERRULE_A_B_C_D_SSH_KEY");
     }
 }

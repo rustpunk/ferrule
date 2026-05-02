@@ -33,8 +33,8 @@ impl ProxyConfig {
     /// Parse from a URL string like `http://proxy:8080` or
     /// `http://user:pass@proxy:8080`.
     pub fn parse(url: &str) -> Result<Self, CoreError> {
-        let parsed = ::url::Url::parse(url)
-            .map_err(|e| CoreError::InvalidUrl(format!("proxy URL: {e}")))?;
+        let parsed =
+            ::url::Url::parse(url).map_err(|e| CoreError::InvalidUrl(format!("proxy URL: {e}")))?;
 
         let host = parsed
             .host_str()
@@ -97,8 +97,7 @@ pub fn is_no_proxy(target_host: &str) -> bool {
             }
         }
         // Exact match, or suffix match without leading dot.
-        else if target_host == pattern_host
-            || target_host.ends_with(&format!(".{pattern_host}"))
+        else if target_host == pattern_host || target_host.ends_with(&format!(".{pattern_host}"))
         {
             return true;
         }
@@ -175,10 +174,9 @@ pub async fn http_connect(
         .await
         .map_err(|e| CoreError::ConnectionFailed(format!("proxy read: {e}")))?;
 
-    let response = std::str::from_utf8(&buf[..n])
-        .map_err(|_| CoreError::ConnectionFailed(
-            "proxy returned non-UTF-8 response".to_string()
-        ))?;
+    let response = std::str::from_utf8(&buf[..n]).map_err(|_| {
+        CoreError::ConnectionFailed("proxy returned non-UTF-8 response".to_string())
+    })?;
 
     let status_line = response.lines().next().unwrap_or("").trim();
     if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
@@ -203,17 +201,11 @@ pub struct ProxiedConnection {
 
 #[async_trait::async_trait]
 impl crate::Connection for ProxiedConnection {
-    async fn execute(
-        &mut self,
-        sql: &str,
-    ) -> Result<crate::ExecutionSummary, crate::CoreError> {
+    async fn execute(&mut self, sql: &str) -> Result<crate::ExecutionSummary, crate::CoreError> {
         self.inner.execute(sql).await
     }
 
-    async fn query(
-        &mut self,
-        sql: &str,
-    ) -> Result<crate::QueryResult, crate::CoreError> {
+    async fn query(&mut self, sql: &str) -> Result<crate::QueryResult, crate::CoreError> {
         self.inner.query(sql).await
     }
 
@@ -228,10 +220,7 @@ impl crate::Connection for ProxiedConnection {
         self.inner.ping().await
     }
 
-    async fn list_tables(
-        &mut self,
-        schema: Option<&str>,
-    ) -> Result<Vec<String>, crate::CoreError> {
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, crate::CoreError> {
         self.inner.list_tables(schema).await
     }
 

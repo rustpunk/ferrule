@@ -94,17 +94,31 @@ pub fn explain_sql(
 
 /// Detect whether a SQL statement is modifying (DML/DDL).
 ///
-/// Checks the first keyword (case‑insensitive) against a blocklist.
+/// A statement is considered modifying if a DML/DDL keyword appears at
+/// top-level (parenthesis depth ≤ 0). This correctly handles `WITH`
+/// CTEs that are followed by `INSERT` / `UPDATE` / `DELETE` / `MERGE`
+/// — the bug that the previous first-token-only check missed.
 pub fn is_modifying(sql: &str) -> bool {
-    let first = sql
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    matches!(
-        first.as_str(),
-        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "MERGE"
-    )
+    let mut parenthesis_depth = 0i32;
+    for token in sql.split_whitespace() {
+        for ch in token.chars() {
+            if ch == '(' {
+                parenthesis_depth += 1;
+            } else if ch == ')' {
+                parenthesis_depth -= 1;
+            }
+        }
+        if parenthesis_depth <= 0 {
+            let upper = token.to_ascii_uppercase();
+            if matches!(
+                upper.as_str(),
+                "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "MERGE"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -139,6 +153,48 @@ mod tests {
     #[test]
     fn test_is_modifying_not_with() {
         assert!(!is_modifying("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+    }
+
+    #[test]
+    fn test_is_modifying_with_insert() {
+        assert!(is_modifying(
+            "WITH cte AS (SELECT 1) INSERT INTO t VALUES (1)"
+        ));
+    }
+
+    #[test]
+    fn test_is_modifying_with_update() {
+        assert!(is_modifying("WITH cte AS (SELECT 1) UPDATE t SET x = 1"));
+    }
+
+    #[test]
+    fn test_is_modifying_with_merge() {
+        assert!(is_modifying(
+            "WITH src AS (SELECT * FROM stg) MERGE INTO t USING src ON t.id = src.id"
+        ));
+    }
+
+    #[test]
+    fn test_is_modifying_with_delete() {
+        assert!(is_modifying(
+            "WITH cte AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM cte)"
+        ));
+    }
+
+    #[test]
+    fn test_is_modifying_subselect_not_flagged() {
+        // Sub-selects inside parentheses should not be flagged
+        assert!(!is_modifying(
+            "SELECT * FROM t WHERE id IN (SELECT id FROM u)"
+        ));
+    }
+
+    #[test]
+    fn test_is_modifying_cte_in_subquery_not_flagged() {
+        // WITH inside a subquery should not be flagged
+        assert!(!is_modifying(
+            "SELECT * FROM (WITH cte AS (SELECT 1) SELECT * FROM cte) AS sub"
+        ));
     }
 
     #[cfg(feature = "postgres")]

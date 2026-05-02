@@ -69,7 +69,18 @@ pub async fn run(args: BookmarkArgs, global_config: &GlobalConfig) -> Result<(),
             edit,
             output,
             conn_flags,
-        } => cmd_run(name, params, connection, edit, output, conn_flags, global_config).await,
+        } => {
+            cmd_run(
+                name,
+                params,
+                connection,
+                edit,
+                output,
+                conn_flags,
+                global_config,
+            )
+            .await
+        }
         BookmarkCommand::Delete { name } => cmd_delete(name).await,
     }
 }
@@ -179,9 +190,8 @@ async fn cmd_run(
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let backend = Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
-        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
-    })?;
+    let backend = Backend::from_scheme(resolved.url.scheme())
+        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     let mut conn = connect_resolved(resolved, &opts).await?;
 
@@ -282,16 +292,18 @@ fn edit_in_editor(initial: &str) -> Result<String, CliError> {
     let status = std::process::Command::new(&editor)
         .arg(&path)
         .status()
-        .map_err(|e| CliError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to launch editor '{}': {}", editor, e),
-        )))?;
+        .map_err(|e| {
+            CliError::Io(std::io::Error::other(format!(
+                "Failed to launch editor '{}': {}",
+                editor, e
+            )))
+        })?;
 
     if !status.success() {
-        return Err(CliError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Editor '{}' exited with status: {}", editor, status),
-        )));
+        return Err(CliError::Io(std::io::Error::other(format!(
+            "Editor '{}' exited with status: {}",
+            editor, status
+        ))));
     }
 
     let edited = std::fs::read_to_string(&path).map_err(CliError::Io)?;

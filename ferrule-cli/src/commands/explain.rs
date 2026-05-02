@@ -1,4 +1,6 @@
-use super::{check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags, OutputFlags};
+use super::{
+    check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags, OutputFlags,
+};
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
@@ -47,9 +49,8 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
         eprintln!("[ferrule] Resolved URL: {}", resolved.url.redacted());
     }
 
-    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
-        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
-    })?;
+    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
+        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     let (wrapped_sql, explain_out) =
         explain_sql(&args.sql, backend, args.analyze).map_err(CliError::query)?;

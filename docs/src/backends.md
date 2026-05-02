@@ -149,7 +149,7 @@ query parameter is preferred where it applies.
 | MSSQL | ✅ | Via TDS row-set framing |
 | MySQL | ❌ | Driver supports it; ferrule does not surface it. Issue separate calls |
 | SQLite | ❌ | Use a script via `--file` if needed; one statement per `query` call |
-| Oracle | ❌ | Use anonymous PL/SQL blocks for multi-statement work |
+| Oracle | ✅ | Semicolon-split with PL/SQL block awareness; `BEGIN … END`, `IF … END IF`, `LOOP … END LOOP`, and `CASE … END CASE` are kept intact |
 
 When using batches, remember `--limit` and `--offset` are not
 allowed — see [Querying](querying.md#paging) for the workaround.

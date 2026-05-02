@@ -121,9 +121,11 @@ A few rules:
   `--limit 0` to disable paging for batches.
 - **Each result is reported separately.** Result sets print to stdout;
   DML row counts ("`N rows affected`") print to stderr.
-- **Backends that don't support batches** (MySQL, SQLite, Oracle in
+- **Backends that don't support batches** (MySQL, SQLite in
   the current driver layer) reject the SQL — split it into separate
   `ferrule query` calls or wrap it in a stored procedure.
+- **Oracle** now supports multi-statement batches with PL/SQL block
+  awareness; see [Querying](querying.md#multi-statement-batches).
 
 ## Where to next
 

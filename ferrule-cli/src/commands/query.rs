@@ -21,12 +21,10 @@ fn maybe_apply_filter(rendered: String, filter: Option<&str>) -> Result<String, 
             "filter expects JSON output but rendered output is not valid JSON: {e}"
         )))
     })?;
-    let filtered = crate::output::apply_filter(parsed, expr).map_err(|e| {
-        CliError::query(ferrule_core::CoreError::QueryFailed(e))
-    })?;
-    serde_json::to_string_pretty(&filtered).map_err(|e| {
-        CliError::query(ferrule_core::CoreError::QueryFailed(e.to_string()))
-    })
+    let filtered = crate::output::apply_filter(parsed, expr)
+        .map_err(|e| CliError::query(ferrule_core::CoreError::QueryFailed(e)))?;
+    serde_json::to_string_pretty(&filtered)
+        .map_err(|e| CliError::query(ferrule_core::CoreError::QueryFailed(e.to_string())))
 }
 
 fn render_query_result(
@@ -205,9 +203,8 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         eprintln!("[ferrule] Resolved URL: {}", resolved.url.redacted());
     }
 
-    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
-        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
-    })?;
+    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
+        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     // Substitute parameters into SQL before paging
     let sql = substitute(&sql, &param_set, backend).map_err(CliError::query)?;

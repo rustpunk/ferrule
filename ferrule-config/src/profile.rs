@@ -248,7 +248,10 @@ ssh_key  = "/home/me/.ssh/id_ed25519"
         assert_eq!(tunneled.ssh_host.as_deref(), Some("bastion.example.com"));
         assert_eq!(tunneled.ssh_user.as_deref(), Some("ec2-user"));
         assert_eq!(tunneled.ssh_port, Some(2222));
-        assert_eq!(tunneled.ssh_key.as_deref(), Some("/home/me/.ssh/id_ed25519"));
+        assert_eq!(
+            tunneled.ssh_key.as_deref(),
+            Some("/home/me/.ssh/id_ed25519")
+        );
     }
 
     #[test]

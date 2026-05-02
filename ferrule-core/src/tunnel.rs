@@ -85,7 +85,11 @@ mod ssh_impl {
     pub enum TunnelError {
         /// Host key on file matches the server's advertised key.
         #[error("The server key has changed at line {line}")]
-        HostKeyMismatch { host: String, port: u16, line: usize },
+        HostKeyMismatch {
+            host: String,
+            port: u16,
+            line: usize,
+        },
         /// Host not present in known_hosts — TOFU prompt required.
         #[error(
             "The authenticity of host '{host}:{port}' can't be established.\n\
@@ -192,9 +196,7 @@ mod ssh_impl {
     /// it — standard Rust ownership instead of an explicit close
     /// protocol.
     pub struct SshSession {
-        pub handle: std::sync::Arc<
-            tokio::sync::Mutex<russh::client::Handle<ClientHandler>>,
-        >,
+        pub handle: std::sync::Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
     }
 
     /// Outcome of [`setup_tunnel`]. The session is held alongside
@@ -263,10 +265,7 @@ mod ssh_impl {
             self.inner.execute(sql).await
         }
 
-        async fn query(
-            &mut self,
-            sql: &str,
-        ) -> Result<crate::QueryResult, crate::CoreError> {
+        async fn query(&mut self, sql: &str) -> Result<crate::QueryResult, crate::CoreError> {
             self.inner.query(sql).await
         }
 
@@ -316,18 +315,13 @@ mod ssh_impl {
             &mut self,
             server_public_key: &russh::keys::ssh_key::PublicKey,
         ) -> Result<bool, Self::Error> {
-            match check_host_key(&self.host,
-                         self.port,
-                         server_public_key,
-            )? {
+            match check_host_key(&self.host, self.port, server_public_key)? {
                 HostKeyStatus::Match => Ok(true),
-                HostKeyStatus::Mismatch { line } => {
-                    Err(TunnelError::HostKeyMismatch {
-                        host: self.host.clone(),
-                        port: self.port,
-                        line,
-                    })
-                }
+                HostKeyStatus::Mismatch { line } => Err(TunnelError::HostKeyMismatch {
+                    host: self.host.clone(),
+                    port: self.port,
+                    line,
+                }),
                 HostKeyStatus::Unknown => {
                     let fingerprint = server_public_key
                         .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
@@ -416,13 +410,10 @@ mod ssh_impl {
 
         match key_source {
             KeySource::File(path, passphrase) => {
-                let key = load_secret_key(path, passphrase.as_ref().map(|s| s.expose_secret())).map_err(|e| {
-                    TunnelError::Key(format!(
-                        "load SSH key from {}: {}",
-                        path.display(),
-                        e
-                    ))
-                })?;
+                let key = load_secret_key(path, passphrase.as_ref().map(|s| s.expose_secret()))
+                    .map_err(|e| {
+                        TunnelError::Key(format!("load SSH key from {}: {}", path.display(), e))
+                    })?;
                 let auth = handle
                     .authenticate_publickey(
                         &config.user,
@@ -438,17 +429,17 @@ mod ssh_impl {
                 }
             }
             KeySource::Agent(sock_path) => {
-                let mut agent =
-                    AgentClient::connect_uds(sock_path).await.map_err(|e| {
-                        TunnelError::Auth(format!(
-                            "connect to SSH agent at {}: {}",
-                            sock_path.display(),
-                            e
-                        ))
-                    })?;
-                let identities = agent.request_identities().await.map_err(|e| {
-                    TunnelError::Auth(format!("agent request_identities: {}", e))
+                let mut agent = AgentClient::connect_uds(sock_path).await.map_err(|e| {
+                    TunnelError::Auth(format!(
+                        "connect to SSH agent at {}: {}",
+                        sock_path.display(),
+                        e
+                    ))
                 })?;
+                let identities = agent
+                    .request_identities()
+                    .await
+                    .map_err(|e| TunnelError::Auth(format!("agent request_identities: {}", e)))?;
                 if identities.is_empty() {
                     return Err(TunnelError::Auth(format!(
                         "SSH agent at {} has no identities loaded",
@@ -466,12 +457,7 @@ mod ssh_impl {
                         AgentIdentity::Certificate { .. } => continue,
                     };
                     match handle
-                        .authenticate_publickey_with(
-                            &config.user,
-                            pk,
-                            rsa_hash,
-                            &mut agent,
-                        )
+                        .authenticate_publickey_with(&config.user, pk, rsa_hash, &mut agent)
                         .await
                     {
                         Ok(AuthResult::Success) => {
@@ -513,12 +499,7 @@ mod ssh_impl {
                 let channel = handle
                     .lock()
                     .await
-                    .channel_open_direct_tcpip(
-                        target_host,
-                        u32::from(target_port),
-                        "127.0.0.1",
-                        0,
-                    )
+                    .channel_open_direct_tcpip(target_host, u32::from(target_port), "127.0.0.1", 0)
                     .await
                     .map_err(|e| {
                         TunnelError::Channel(format!(
@@ -545,10 +526,7 @@ mod ssh_impl {
                         let (mut tcp, _addr) = match listener.accept().await {
                             Ok(pair) => pair,
                             Err(e) => {
-                                eprintln!(
-                                    "[ferrule] SSH tunnel listener accept failed: {}",
-                                    e
-                                );
+                                eprintln!("[ferrule] SSH tunnel listener accept failed: {}", e);
                                 return;
                             }
                         };
@@ -556,27 +534,24 @@ mod ssh_impl {
                         let target_host = target_host.clone();
                         tokio::spawn(async move {
                             let guard = handle.lock().await;
-                            let channel = match guard.channel_open_direct_tcpip(
-                                &target_host,
-                                u32::from(target_port),
-                                "127.0.0.1",
-                                0,
-                            )
-                            .await
+                            let channel = match guard
+                                .channel_open_direct_tcpip(
+                                    &target_host,
+                                    u32::from(target_port),
+                                    "127.0.0.1",
+                                    0,
+                                )
+                                .await
                             {
                                 Ok(ch) => ch,
                                 Err(e) => {
-                                    eprintln!(
-                                        "[ferrule] SSH tunnel direct-tcpip failed: {}",
-                                        e
-                                    );
+                                    eprintln!("[ferrule] SSH tunnel direct-tcpip failed: {}", e);
                                     return;
                                 }
                             };
                             drop(guard);
                             let mut ssh = channel.into_stream();
-                            if let Err(e) =
-                                tokio::io::copy_bidirectional(&mut tcp, &mut ssh).await
+                            if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut ssh).await
                             {
                                 // Normal close is expected; don't spam stderr.
                                 let _ = e;
@@ -597,7 +572,9 @@ mod ssh_impl {
     /// Returns `Ok(true)` if the key is encrypted, `Ok(false)` if it
     /// loads without a passphrase, and `Err(TunnelError::Key(...))`
     /// for I/O or parse errors.
-    pub fn ssh_key_needs_passphrase(path: impl AsRef<std::path::Path>) -> Result<bool, TunnelError> {
+    pub fn ssh_key_needs_passphrase(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<bool, TunnelError> {
         match russh::keys::load_secret_key(path.as_ref(), None) {
             Ok(_) => Ok(false),
             Err(russh::keys::Error::KeyIsEncrypted) => Ok(true),

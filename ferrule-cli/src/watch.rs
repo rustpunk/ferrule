@@ -1,16 +1,18 @@
-use crate::commands::{check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags};
+use crate::commands::{
+    check_daemon_ssh_compat, connect_resolved, resolve_connection, ConnectionFlags,
+};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
+use ferrule_core::connection::{ConnectOptions, StatementResult};
+use ferrule_core::formatter::{format_result, OutputFormat};
 use is_terminal::IsTerminal;
 use notify::{EventKind, RecursiveMode, Watcher};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::io::Write;
 use tokio::time::Duration;
 use tokio::time::Instant;
-use ferrule_core::connection::{ConnectOptions, StatementResult};
-use ferrule_core::formatter::{format_result, OutputFormat};
 
 /// Options that drive a single watch loop.
 pub struct WatchOptions {
@@ -43,8 +45,8 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
     let _watcher = if let Some(ref path) = opts.file_path {
         let path = path.clone();
         let tx = watch_tx.clone();
-        let mut watcher = notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = res {
                     if matches!(
                         event.kind,
@@ -53,13 +55,12 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                         let _ = tx.try_send(());
                     }
                 }
-            },
-        )
-        .map_err(|e| CliError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            })
+            .map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))?;
 
         watcher
             .watch(&path, RecursiveMode::NonRecursive)
-            .map_err(|e| CliError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))?;
         Some(watcher)
     } else {
         None

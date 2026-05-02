@@ -266,14 +266,11 @@ pub async fn connect_with_tunnel(
         .host()
         .ok_or_else(|| {
             CoreError::ConnectionFailed(
-                "URL has no host — SSH tunneling requires a network-based backend"
-                    .to_string(),
+                "URL has no host — SSH tunneling requires a network-based backend".to_string(),
             )
         })?
         .to_string();
-    let target_port = url
-        .port()
-        .unwrap_or_else(|| default_port_for(backend));
+    let target_port = url.port().unwrap_or_else(|| default_port_for(backend));
 
     let transport = match backend {
         #[cfg(feature = "postgres")]
@@ -294,9 +291,20 @@ pub async fn connect_with_tunnel(
         TunnelError::HostKeyMismatch { host, port, .. } => {
             CoreError::SshHostKeyMismatch { host, port }
         }
-        TunnelError::UnknownHost { host, port, algorithm, fingerprint, key, .. } => {
-            CoreError::SshUnknownHost { host, port, algorithm, fingerprint, key }
-        }
+        TunnelError::UnknownHost {
+            host,
+            port,
+            algorithm,
+            fingerprint,
+            key,
+            ..
+        } => CoreError::SshUnknownHost {
+            host,
+            port,
+            algorithm,
+            fingerprint,
+            key,
+        },
         other => CoreError::ConnectionFailed(format!("SSH tunnel setup: {other}")),
     })?;
 
@@ -330,7 +338,12 @@ pub async fn connect_with_tunnel(
     }
 }
 
-#[cfg(any(feature = "ssh", feature = "mysql", feature = "mssql", feature = "oracle"))]
+#[cfg(any(
+    feature = "ssh",
+    feature = "mysql",
+    feature = "mssql",
+    feature = "oracle"
+))]
 fn default_port_for(backend: Backend) -> u16 {
     match backend {
         #[cfg(feature = "postgres")]
@@ -346,7 +359,12 @@ fn default_port_for(backend: Backend) -> u16 {
     }
 }
 
-#[cfg(any(feature = "ssh", feature = "mysql", feature = "mssql", feature = "oracle"))]
+#[cfg(any(
+    feature = "ssh",
+    feature = "mysql",
+    feature = "mssql",
+    feature = "oracle"
+))]
 fn rewrite_url_to_local(url: &DatabaseUrl, port: u16) -> Result<DatabaseUrl, CoreError> {
     let mut parsed = ::url::Url::parse(url.raw())
         .map_err(|e| CoreError::InvalidUrl(format!("re-parse for tunnel rewrite: {e}")))?;

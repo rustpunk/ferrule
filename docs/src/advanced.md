@@ -42,8 +42,11 @@ get the estimated plan, not an actual delete.
 
 A statement is "modifying" if it starts (case-insensitively) with
 `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ALTER`, `TRUNCATE`,
-or `MERGE`. `WITH cte AS (UPDATE ...) ...` (Postgres data-modifying
-CTEs) is *not* detected — be careful.
+or `MERGE`, or if it contains a data-modifying CTE such as
+`WITH cte AS (UPDATE ...) ...`. Ferrule tracks parenthesis depth
+while scanning; keywords inside subqueries or CTE bodies are still
+caught, so `WITH t AS (INSERT INTO ...) SELECT * FROM t` is correctly
+flagged as modifying.
 
 ### Per-backend output formats
 

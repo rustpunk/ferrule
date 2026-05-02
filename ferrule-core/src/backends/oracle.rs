@@ -1,4 +1,6 @@
-use crate::connection::{ConnectOptions, Connection, ExecutionSummary, QueryResult};
+use crate::connection::{
+    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+};
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, TypeHint, Value};
@@ -71,6 +73,27 @@ impl Connection for OracleConnection {
         })
         .await
         .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+    }
+
+    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, CoreError> {
+        let statements =
+            split_oracle_statements(sql).map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+        let mut results = Vec::with_capacity(statements.len());
+        for stmt in statements {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            match self.query(stmt).await {
+                Ok(result) => results.push(StatementResult::Query(result)),
+                Err(CoreError::QueryFailed(_)) => {
+                    let summary = self.execute(stmt).await?;
+                    results.push(StatementResult::Summary(summary));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(results)
     }
 
     async fn ping(&mut self) -> Result<(), CoreError> {
@@ -159,6 +182,174 @@ pub async fn connect(
     })
     .await
     .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?
+}
+
+/// Split a SQL string into individual statements by `;`.
+/// Ignores semicolons inside:
+///   - single-quoted strings (`''` escape)
+///   - `--` line comments and `/* */` block comments
+///   - PL/SQL blocks (`BEGIN … END`, `DECLARE … BEGIN … END`) and
+///     nested control structures (`IF … END IF`, `LOOP … END LOOP`,
+///     `CASE … END CASE` or `CASE … END`).
+fn split_oracle_statements(sql: &str) -> Result<Vec<&str>, String> {
+    let mut statements = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let bytes = sql.as_bytes();
+    let mut block_depth = 0usize;
+    let mut case_depth = 0usize;
+    let mut loop_depth = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b';' if block_depth == 0 && case_depth == 0 && loop_depth == 0 => {
+                let candidate = &sql[start..=i];
+                let trimmed = candidate.trim();
+                if !trimmed.is_empty() && trimmed != ";" {
+                    statements.push(trimmed);
+                }
+                i += 1;
+                start = i;
+            }
+            _ => {
+                if matches_keyword(bytes, i, "begin") || matches_keyword(bytes, i, "declare") {
+                    block_depth += 1;
+                    i += if matches_keyword(bytes, i, "begin") {
+                        5
+                    } else {
+                        7
+                    };
+                } else if matches_keyword(bytes, i, "case") {
+                    case_depth += 1;
+                    i += 4;
+                } else if matches_keyword(bytes, i, "loop") {
+                    loop_depth += 1;
+                    i += 4;
+                } else if matches_keyword(bytes, i, "end") {
+                    match end_suffix(bytes, i) {
+                        Some("case") => {
+                            case_depth = case_depth.saturating_sub(1);
+                            i += 3; // skip "END"
+                            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                                i += 1;
+                            }
+                            i += keyword_len(bytes, i); // skip "CASE"
+                        }
+                        Some("if") | Some("loop") => {
+                            // END IF / END LOOP do not affect tracked depths
+                            i += 3; // skip "END"
+                            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                                i += 1;
+                            }
+                            i += keyword_len(bytes, i); // skip suffix
+                        }
+                        _ => {
+                            if case_depth > 0 {
+                                case_depth -= 1;
+                            } else if loop_depth > 0 {
+                                loop_depth -= 1;
+                            } else {
+                                block_depth = block_depth.saturating_sub(1);
+                            }
+                            i += 3;
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    if start < sql.len() {
+        let tail = &sql[start..];
+        if !tail.trim().is_empty() {
+            statements.push(tail.trim_end());
+        }
+    }
+
+    Ok(statements)
+}
+
+/// Case-insensitive keyword match with word-boundary guards.
+fn matches_keyword(bytes: &[u8], at: usize, keyword: &str) -> bool {
+    let klen = keyword.len();
+    if at + klen > bytes.len() {
+        return false;
+    }
+    for (i, b) in keyword.bytes().enumerate() {
+        if bytes[at + i].to_ascii_lowercase() != b {
+            return false;
+        }
+    }
+    // Preceding boundary
+    if at > 0 {
+        let prev = bytes[at - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return false;
+        }
+    }
+    // Following boundary
+    if at + klen < bytes.len() {
+        let next = bytes[at + klen];
+        if next.is_ascii_alphanumeric() || next == b'_' {
+            return false;
+        }
+    }
+    true
+}
+
+/// Length of the word starting at `at`.
+fn keyword_len(bytes: &[u8], at: usize) -> usize {
+    let mut j = at;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        j += 1;
+    }
+    j - at
+}
+
+/// After a bare `END`, peek the next non-whitespace token.
+fn end_suffix(bytes: &[u8], end_pos: usize) -> Option<&'static str> {
+    let mut j = end_pos + 3;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    for kw in ["if", "loop", "case"] {
+        if matches_keyword(bytes, j, kw) {
+            return Some(kw);
+        }
+    }
+    None
 }
 
 fn map_oracle_error(e: oracle::Error) -> CoreError {
@@ -447,5 +638,119 @@ mod tests {
                 || err.contains("connection failed"),
             "error should mention missing client or connection failure: {err}"
         );
+    }
+
+    // ── split_oracle_statements unit tests (no DB required) ─────────────────────
+
+    #[test]
+    fn test_split_begin_end() {
+        let stmts = split_oracle_statements("BEGIN NULL; END;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "BEGIN NULL; END;");
+    }
+
+    #[test]
+    fn test_split_declare_begin_end() {
+        let stmts = split_oracle_statements("DECLARE x INT; BEGIN NULL; END;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "DECLARE x INT; BEGIN NULL; END;");
+    }
+
+    #[test]
+    fn test_split_nested_begin() {
+        let stmts = split_oracle_statements("BEGIN BEGIN NULL; END; END;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "BEGIN BEGIN NULL; END; END;");
+    }
+
+    #[test]
+    fn test_split_end_if_not_block_end() {
+        let stmts = split_oracle_statements("BEGIN IF TRUE THEN NULL; END IF; END;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "BEGIN IF TRUE THEN NULL; END IF; END;");
+    }
+
+    #[test]
+    fn test_split_end_loop_not_block_end() {
+        let stmts = split_oracle_statements("BEGIN LOOP NULL; END LOOP; END;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "BEGIN LOOP NULL; END LOOP; END;");
+    }
+
+    #[test]
+    fn test_split_end_case_not_block_end() {
+        let stmts =
+            split_oracle_statements("BEGIN CASE WHEN 1=1 THEN NULL; END CASE; END;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "BEGIN CASE WHEN 1=1 THEN NULL; END CASE; END;");
+    }
+
+    #[test]
+    fn test_split_case_expr_bare_end() {
+        let stmts = split_oracle_statements("BEGIN x := CASE WHEN 1=1 THEN 1 END; END;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "BEGIN x := CASE WHEN 1=1 THEN 1 END; END;");
+    }
+
+    #[test]
+    fn test_split_case_insensitive() {
+        let stmts = split_oracle_statements("begin null; end;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "begin null; end;");
+    }
+
+    #[test]
+    fn test_split_string_ignores_keywords() {
+        let stmts = split_oracle_statements("SELECT 'BEGIN END CASE LOOP' FROM DUAL;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "SELECT 'BEGIN END CASE LOOP' FROM DUAL;");
+    }
+
+    #[test]
+    fn test_split_comment_ignores_keywords() {
+        let stmts = split_oracle_statements("/* BEGIN END CASE */ SELECT 1;").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "/* BEGIN END CASE */ SELECT 1;");
+    }
+
+    #[test]
+    fn test_split_multiple_statements() {
+        let stmts = split_oracle_statements("BEGIN NULL; END; SELECT 1;").unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "BEGIN NULL; END;");
+        assert_eq!(stmts[1], "SELECT 1;");
+    }
+
+    #[test]
+    fn test_split_trailing_no_semicolon() {
+        // A semicolon is required between statements; without one the tail is
+        // treated as a continuation of the current statement.
+        let stmts = split_oracle_statements("BEGIN NULL; END\n SELECT 1").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "BEGIN NULL; END\n SELECT 1");
+    }
+
+    #[test]
+    fn test_split_empty_and_whitespace() {
+        let stmts = split_oracle_statements("  ;  ;  BEGIN NULL; END;  ;  ").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "BEGIN NULL; END;");
+    }
+
+    #[test]
+    fn test_split_deeply_nested_case() {
+        let sql = "BEGIN CASE WHEN 1=1 THEN CASE WHEN 2=2 THEN 2 END; END CASE; END;";
+        let stmts = split_oracle_statements(sql).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], sql);
+    }
+
+    #[test]
+    fn test_split_mixed_block_and_dml() {
+        let stmts =
+            split_oracle_statements("BEGIN INSERT INTO t VALUES (1); END; COMMIT;").unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "BEGIN INSERT INTO t VALUES (1); END;");
+        assert_eq!(stmts[1], "COMMIT;");
     }
 }

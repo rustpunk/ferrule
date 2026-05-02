@@ -92,10 +92,14 @@ Behavior:
   a `-- Result set N` separator.
 - **DML row counts** print to stderr as `-- Statement N: K rows
   affected`.
-- **MySQL, SQLite, and Oracle** at the current driver layer don't
+- **MySQL and SQLite** at the current driver layer don't
   multiplex multiple statements per query — split into separate
   `ferrule query` calls or use a stored procedure / script
   invocation specific to that backend.
+- **Oracle** now supports semicolon-separated batches including
+  anonymous PL/SQL blocks (`BEGIN … END`), control structures
+  (`IF … END IF`, `LOOP … END LOOP`, `CASE … END CASE`), and
+  mixed DML/DDL. See [Backends](backends.md#multi-statement-support).
 
 ## Parameterized queries
 

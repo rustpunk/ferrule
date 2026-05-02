@@ -65,9 +65,7 @@ pub fn parse_ssh_tunnel(raw: &str) -> Result<ParsedSshTunnel, CliError> {
     let (host, port) = match host_port.rsplit_once(':') {
         Some((h, p)) if !h.is_empty() => {
             let port = p.parse::<u16>().map_err(|e| {
-                CliError::usage(format!(
-                    "--ssh-tunnel: invalid port '{p}' in '{raw}': {e}"
-                ))
+                CliError::usage(format!("--ssh-tunnel: invalid port '{p}' in '{raw}': {e}"))
             })?;
             (h.to_string(), Some(port))
         }

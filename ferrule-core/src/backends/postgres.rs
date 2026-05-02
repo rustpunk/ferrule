@@ -643,7 +643,10 @@ mod tests {
             "score (NUMERIC) should be Decimal or Float64"
         );
         assert!(matches!(row[3], Value::Bool(_)), "active should be Bool");
-        assert!(matches!(row[4], Value::Json(_)), "meta (JSONB) should be Json");
+        assert!(
+            matches!(row[4], Value::Json(_)),
+            "meta (JSONB) should be Json"
+        );
         assert!(matches!(row[5], Value::Uuid(_)), "uid should be Uuid");
     }
 

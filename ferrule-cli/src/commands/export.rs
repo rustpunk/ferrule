@@ -79,9 +79,8 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
     .await?;
     check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
-    let backend = Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
-        CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
-    })?;
+    let backend = Backend::from_scheme(resolved.url.scheme())
+        .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     let mut conn = connect_resolved(
         resolved,
@@ -134,8 +133,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
                 if !csv_header_done {
                     let headers: Vec<&str> =
                         result.columns.iter().map(|c| c.name.as_str()).collect();
-                    let line = csv_line(&headers.iter().map(|h| *h).collect::<Vec<&str>>())
-                        + "\n";
+                    let line = csv_line(&headers.to_vec()) + "\n";
                     writer.write_all(line.as_bytes()).map_err(CliError::Io)?;
                     csv_header_done = true;
                 }
@@ -156,7 +154,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
                     }
                     let obj = row_to_json_object(&result.columns, row);
                     let line = serde_json::to_string(&obj)
-                        .map_err(|e| CliError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                        .map_err(|e| CliError::Io(std::io::Error::other(e)))?;
                     writer.write_all(line.as_bytes()).map_err(CliError::Io)?;
                 }
             }
@@ -164,7 +162,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
                 for row in &result.rows {
                     let obj = row_to_json_object(&result.columns, row);
                     let mut line = serde_json::to_string(&obj)
-                        .map_err(|e| CliError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                        .map_err(|e| CliError::Io(std::io::Error::other(e)))?;
                     line.push('\n');
                     writer.write_all(line.as_bytes()).map_err(CliError::Io)?;
                 }
@@ -231,7 +229,8 @@ fn csv_line(fields: &[impl AsRef<str>]) -> String {
             line.push(',');
         }
         let text = field.as_ref();
-        let needs_quote = text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r');
+        let needs_quote =
+            text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r');
         if needs_quote {
             line.push('"');
             line.push_str(&text.replace('"', "\"\""));
