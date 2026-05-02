@@ -214,7 +214,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     }
 
     if args.explain {
-        let (wrapped, out) = explain_sql(&sql, backend, false).map_err(CliError::query)?;
+        let (wrapped, out, _is_multi) = explain_sql(&sql, backend, false).map_err(CliError::query)?;
         if is_modifying(&sql) {
             eprintln!(
                 "Warning: EXPLAIN on modifying statement uses estimated plan (ANALYZE disabled)."

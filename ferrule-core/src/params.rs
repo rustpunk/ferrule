@@ -67,13 +67,14 @@ pub fn render_value(value: &Value, backend: Backend) -> String {
                     "0".to_string()
                 }
             }
-            _ => {
-                if *b {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
-                }
-            }
+            #[cfg(feature = "postgres")]
+            Backend::Postgres => bool_literal(*b),
+            #[cfg(feature = "mysql")]
+            Backend::MySql => bool_literal(*b),
+            #[cfg(feature = "mssql")]
+            Backend::MsSql => bool_literal(*b),
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite => bool_literal(*b),
         },
         Value::Int64(i) => i.to_string(),
         Value::Float64(f) => f.to_string(),
@@ -86,6 +87,15 @@ pub fn render_value(value: &Value, backend: Backend) -> String {
             format!("X'{}'", hex)
         }
         other => quote_string(&other.to_string()),
+    }
+}
+
+/// Render a boolean as a SQL literal (`TRUE` / `FALSE`).
+fn bool_literal(b: bool) -> String {
+    if b {
+        "TRUE".to_string()
+    } else {
+        "FALSE".to_string()
     }
 }
 

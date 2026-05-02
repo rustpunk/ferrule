@@ -9,7 +9,8 @@ pub enum ExplainOutput {
     Xml,
 }
 
-/// Return the EXPLAIN-wrapped SQL and the expected output format.
+/// Return the EXPLAIN-wrapped SQL, the expected output format, and whether the
+/// wrapped SQL contains multiple statements (which requires `execute_multi`).
 ///
 /// When `analyze` is `true` and the statement is non-modifying, the
 /// backend-specific "actual execution" variant is used. For modifying
@@ -18,7 +19,7 @@ pub fn explain_sql(
     sql: &str,
     backend: Backend,
     analyze: bool,
-) -> Result<(String, ExplainOutput), CoreError> {
+) -> Result<(String, ExplainOutput, bool), CoreError> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
         return Err(CoreError::QueryFailed("Empty SQL for EXPLAIN".into()));
@@ -34,6 +35,7 @@ pub fn explain_sql(
                 Ok((
                     format!("EXPLAIN (FORMAT JSON, COSTS) {}", trimmed),
                     ExplainOutput::Json,
+                    false,
                 ))
             } else {
                 Ok((
@@ -42,6 +44,7 @@ pub fn explain_sql(
                         trimmed
                     ),
                     ExplainOutput::Json,
+                    false,
                 ))
             }
         }
@@ -51,12 +54,14 @@ pub fn explain_sql(
             Ok((
                 format!("EXPLAIN FORMAT=JSON {}", trimmed),
                 ExplainOutput::Json,
+                false,
             ))
         }
         #[cfg(feature = "sqlite")]
         Backend::Sqlite => Ok((
             format!("EXPLAIN QUERY PLAN {}", trimmed),
             ExplainOutput::Text,
+            false,
         )),
         #[cfg(feature = "mssql")]
         Backend::MsSql => {
@@ -64,6 +69,7 @@ pub fn explain_sql(
                 Ok((
                     format!("SET SHOWPLAN_XML ON; {}; SET SHOWPLAN_XML OFF;", trimmed),
                     ExplainOutput::Xml,
+                    true,
                 ))
             } else {
                 Ok((
@@ -72,6 +78,7 @@ pub fn explain_sql(
                         trimmed
                     ),
                     ExplainOutput::Xml,
+                    true,
                 ))
             }
         }
@@ -82,12 +89,12 @@ pub fn explain_sql(
                 "EXPLAIN PLAN FOR {}; SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY('','',{}));",
                 trimmed, display_opts
             );
-            Ok((wrapped, ExplainOutput::Text))
+            Ok((wrapped, ExplainOutput::Text, true))
         }
         #[allow(unreachable_patterns)]
         _ => {
             // Fallback for any backend that gets here without a specific impl.
-            Ok((format!("EXPLAIN {}", trimmed), ExplainOutput::Text))
+            Ok((format!("EXPLAIN {}", trimmed), ExplainOutput::Text, false))
         }
     }
 }
@@ -200,32 +207,37 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[test]
     fn test_postgres_explain_wrap() {
-        let (sql, out) = explain_sql("SELECT 1", Backend::Postgres, false).unwrap();
+        let (sql, out, is_multi) = explain_sql("SELECT 1", Backend::Postgres, false).unwrap();
         assert!(sql.contains("EXPLAIN (FORMAT JSON, COSTS)"));
         assert_eq!(out, ExplainOutput::Json);
+        assert!(!is_multi);
     }
 
     #[cfg(feature = "postgres")]
     #[test]
     fn test_postgres_explain_analyze() {
-        let (sql, out) = explain_sql("SELECT 1", Backend::Postgres, true).unwrap();
+        let (sql, out, is_multi) = explain_sql("SELECT 1", Backend::Postgres, true).unwrap();
         assert!(sql.contains("ANALYZE"));
         assert_eq!(out, ExplainOutput::Json);
+        assert!(!is_multi);
     }
 
     #[cfg(feature = "postgres")]
     #[test]
     fn test_safe_explain_for_modifying() {
-        let (sql, _out) = explain_sql("INSERT INTO t VALUES (1)", Backend::Postgres, true).unwrap();
+        let (sql, _out, is_multi) =
+            explain_sql("INSERT INTO t VALUES (1)", Backend::Postgres, true).unwrap();
         assert!(!sql.contains("ANALYZE"));
         assert!(sql.contains("EXPLAIN (FORMAT JSON, COSTS)"));
+        assert!(!is_multi);
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn test_sqlite_explain_wrap() {
-        let (sql, out) = explain_sql("SELECT 1", Backend::Sqlite, false).unwrap();
+        let (sql, out, is_multi) = explain_sql("SELECT 1", Backend::Sqlite, false).unwrap();
         assert!(sql.contains("EXPLAIN QUERY PLAN"));
         assert_eq!(out, ExplainOutput::Text);
+        assert!(!is_multi);
     }
 }

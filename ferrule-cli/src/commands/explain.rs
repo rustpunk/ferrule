@@ -52,7 +52,7 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
     let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
         .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
-    let (wrapped_sql, explain_out) =
+    let (wrapped_sql, explain_out, is_multi) =
         explain_sql(&args.sql, backend, args.analyze).map_err(CliError::query)?;
 
     if is_modifying(&args.sql) {
@@ -90,7 +90,20 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
 
     let mut conn = connect_resolved(resolved, &opts).await?;
 
-    let result = conn.query(&wrapped_sql).await.map_err(CliError::query)?;
+    let result = if is_multi {
+        let results = conn.execute_multi(&wrapped_sql).await.map_err(CliError::query)?;
+        results
+            .into_iter()
+            .find_map(|r| match r {
+                ferrule_core::connection::StatementResult::Query(qr) => Some(qr),
+                _ => None,
+            })
+            .ok_or_else(|| CliError::query(ferrule_core::CoreError::QueryFailed(
+                "EXPLAIN produced no query result".to_string()
+            )))?
+    } else {
+        conn.query(&wrapped_sql).await.map_err(CliError::query)?
+    };
 
     let rendered = format_result(&result, format).map_err(CliError::query)?;
     print_payload(&rendered, explain_out);
