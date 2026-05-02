@@ -4,6 +4,9 @@
 # Pi orchestration state
 .pi/
 
+# Hermes agent working directory
+.hermes/
+
 docs/internal/
 
 docs/book/
