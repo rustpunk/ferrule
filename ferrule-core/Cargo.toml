@@ -29,6 +29,8 @@ serde-saphyr = "0.0.24"
 secrecy = { workspace = true }
 async-trait = "0.1"
 base64 = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
 
 # Config (needed by resolver)
 ferrule-config = { path = "../ferrule-config" }

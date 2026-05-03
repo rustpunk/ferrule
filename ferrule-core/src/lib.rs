@@ -7,6 +7,7 @@ pub mod error;
 pub mod explain;
 pub mod formatter;
 pub mod load;
+pub mod migrate;
 pub mod params;
 pub mod proxy;
 pub mod resolver;

@@ -11,7 +11,7 @@ mod watch;
 
 use commands::{
     BookmarkArgs, ConnArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, ExportArgs, LoadArgs,
-    QueryArgs, ReplArgs, TablesArgs, WatchArgs,
+    MigrateArgs, QueryArgs, ReplArgs, TablesArgs, WatchArgs,
 };
 use error::CliError;
 
@@ -66,6 +66,9 @@ enum Commands {
 
     /// Export query results to CSV/JSON/SQL
     Export(ExportArgs),
+
+    /// Schema migrations
+    Migrate(MigrateArgs),
 
     /// Watch a query and re-execute periodically
     Watch(WatchArgs),
@@ -124,6 +127,7 @@ fn main() {
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,
             Commands::Describe(args) => commands::describe::run(args, &global_config).await,
             Commands::Diff(args) => commands::diff::run(args, &global_config).await,
+            Commands::Migrate(args) => commands::migrate::run(args, &global_config).await,
         }
     });
 
