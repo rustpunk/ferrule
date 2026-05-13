@@ -27,6 +27,7 @@
 - [Connection Pooling Daemon](daemon.md)
 - [Filtering Results with JMESPath](result-filtering.md)
 - [Schema Diff](schema-diff.md)
+- [Cross-DB Copy](copy.md)
 - [SSH Tunnels](ssh-tunnels.md)
 - [HTTP CONNECT Proxy](proxy.md)
 
