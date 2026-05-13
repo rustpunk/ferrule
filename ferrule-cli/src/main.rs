@@ -10,8 +10,8 @@ mod ssh_keys;
 mod watch;
 
 use commands::{
-    BookmarkArgs, ConnArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, ExportArgs, LoadArgs,
-    MigrateArgs, QueryArgs, ReplArgs, TablesArgs, WatchArgs,
+    BookmarkArgs, ConnArgs, CopyArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, ExportArgs,
+    LoadArgs, MigrateArgs, QueryArgs, ReplArgs, TablesArgs, WatchArgs,
 };
 use error::CliError;
 
@@ -63,6 +63,9 @@ enum Commands {
 
     /// Diff schemas between two connections
     Diff(DiffArgs),
+
+    /// Copy rows between two connections (cross-DB)
+    Copy(CopyArgs),
 
     /// Export query results to CSV/JSON/SQL
     Export(ExportArgs),
@@ -127,6 +130,7 @@ fn main() {
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,
             Commands::Describe(args) => commands::describe::run(args, &global_config).await,
             Commands::Diff(args) => commands::diff::run(args, &global_config).await,
+            Commands::Copy(args) => commands::copy::run(args, &global_config).await,
             Commands::Migrate(args) => commands::migrate::run(args, &global_config).await,
         }
     });

@@ -1,5 +1,6 @@
 pub mod bookmark;
 pub mod conn;
+pub mod copy;
 pub mod describe;
 pub mod diff;
 pub mod dump;
@@ -234,6 +235,71 @@ pub struct DescribeArgs {
     #[command(flatten)]
     pub output: OutputFlags,
 
+    #[command(flatten)]
+    pub conn_flags: ConnectionFlags,
+}
+
+/// Copy command arguments — stream rows from a source DB into a target DB.
+#[derive(Args, Clone, Debug)]
+pub struct CopyArgs {
+    /// Source connection: registry name or raw URL.
+    pub source: String,
+
+    /// Destination connection: registry name or raw URL.
+    pub dest: String,
+
+    /// Whole-table mode: copy `<table>` from source to dest. Mutually
+    /// exclusive with `--query`.
+    #[arg(long, value_name = "NAME", conflicts_with = "query")]
+    pub table: Option<String>,
+
+    /// Query mode: run this SELECT against the source. Requires
+    /// `--into NAME` for the target table.
+    #[arg(long, value_name = "SQL", requires = "into")]
+    pub query: Option<String>,
+
+    /// Target table name when using `--query`.
+    #[arg(long, value_name = "NAME")]
+    pub into: Option<String>,
+
+    /// Translate source column metadata into a CREATE TABLE on the
+    /// target if it does not yet exist.
+    #[arg(long)]
+    pub create_table: bool,
+
+    /// What to do if the target table already contains rows.
+    /// `error` (default, non-destructive), `append`, `truncate`.
+    #[arg(long, value_name = "STRATEGY", default_value = "error")]
+    pub if_exists: String,
+
+    /// Required confirmation for destructive `--if-exists truncate`
+    /// when stdin is a TTY.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Wrap the entire copy in a single target-side transaction.
+    /// Recommended for snapshots; avoid for million-row migrations.
+    #[arg(long)]
+    pub atomic: bool,
+
+    /// Source page / target INSERT batch size.
+    #[arg(long, value_name = "N", default_value_t = 1000)]
+    pub batch: usize,
+
+    /// Password for the source connection (overrides credential stack).
+    #[arg(long = "password-src")]
+    pub password_src: Option<String>,
+
+    /// Password for the destination connection (overrides credential stack).
+    #[arg(long = "password-dst")]
+    pub password_dst: Option<String>,
+
+    #[command(flatten)]
+    pub output: OutputFlags,
+
+    /// Connection flags. Note: in Phase 1 these apply to *both* source
+    /// and destination — independent `--src-*` / `--dst-*` SSH/proxy
+    /// flags are tracked as a backlog enhancement.
     #[command(flatten)]
     pub conn_flags: ConnectionFlags,
 }

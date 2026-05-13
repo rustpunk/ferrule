@@ -49,6 +49,23 @@ cargo clippy --workspace
 cargo doc --workspace --no-deps
 ```
 
+### Prerequisite: clone the sibling `hasp` repo
+
+`ferrule-config` depends on `hasp` via a path dependency
+(`hasp = { path = "../../hasp/crates/hasp", ... }`). Before the
+workspace will resolve, clone `rustpunk/hasp` as a sibling of
+`rustpunk/ferrule`:
+
+```bash
+git clone https://github.com/rustpunk/hasp.git ../hasp
+sudo apt-get install -y libdbus-1-dev pkg-config   # for hasp's keyring backend on Linux
+```
+
+The crates.io `hasp` (`0.1.0-alpha`) is a name-reservation placeholder
+and does not satisfy ferrule's feature requirements. Use the GitHub
+source. If you build without `hasp/` present, cargo fails with
+`failed to read /home/.../hasp/crates/hasp/Cargo.toml`.
+
 ## How to Test
 
 ### SQLite — no setup required
@@ -454,6 +471,65 @@ Notes:
 - For other backends (MySQL / MSSQL), swap the URL scheme. Ferrule
   picks the `LocalListener` transport automatically; the database
   driver sees `127.0.0.1:<random>` instead of the original host.
+
+### Cross-DB copy — smoke against the seeded containers
+
+`ferrule copy <SRC> <DST>` streams rows between any pair of backends.
+Phase 1 uses a generic batched-INSERT path on the destination;
+backend-native bulk loaders (PG `COPY FROM STDIN`, MySQL `LOAD DATA`,
+MSSQL `BULK INSERT`, Oracle direct-path) are tracked separately.
+
+Default conflict policy is non-destructive: ferrule refuses to copy
+into a non-empty existing target unless `--if-exists append` or
+`--if-exists truncate` is set. Truncate also requires `--yes` from a
+TTY.
+
+Type translation lives in `ferrule_core::copy::translate_type`. See
+`docs/src/copy.md` for the full mapping table.
+
+Smoke against the existing Postgres + SQLite setup (no new container
+needed — uses the `test_users` table seeded in the Postgres section
+above):
+
+```bash
+# Snapshot Postgres → SQLite, creating the target table from source DDL.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-smoke.db" \
+  --table test_users --create-table
+
+# Verify the round-trip.
+ferrule query "sqlite:///tmp/ferrule-copy-smoke.db" \
+  "SELECT count(*) FROM test_users" --format json
+
+# Try the default-conflict guardrail (should fail with a hint).
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-smoke.db" \
+  --table test_users
+# → "Target table 'test_users' already contains rows. Pass --if-exists ..."
+
+# Refresh: clear and reload.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-smoke.db" \
+  --table test_users --if-exists truncate --yes
+
+# --query form: project a subset and copy into a new target table.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-smoke.db" \
+  --query "SELECT id, name FROM test_users WHERE active = true" \
+  --into active_users --create-table
+
+rm /tmp/ferrule-copy-smoke.db
+```
+
+Inline tests at `ferrule-core/src/copy.rs` cover the SQLite → SQLite
+round trip, the default-conflict refusal, the truncate-replaces-rows
+path, and the query+into mode. Cross-backend integration tests are
+deferred — the existing per-backend test fixtures already cover both
+sides of the type translation in isolation.
 
 ### Backend test status
 
