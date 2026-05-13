@@ -49,6 +49,23 @@ cargo clippy --workspace
 cargo doc --workspace --no-deps
 ```
 
+### Prerequisite: clone the sibling `hasp` repo
+
+`ferrule-config` depends on `hasp` via a path dependency
+(`hasp = { path = "../../hasp/crates/hasp", ... }`). Before the
+workspace will resolve, clone `rustpunk/hasp` as a sibling of
+`rustpunk/ferrule`:
+
+```bash
+git clone https://github.com/rustpunk/hasp.git ../hasp
+sudo apt-get install -y libdbus-1-dev pkg-config   # for hasp's keyring backend on Linux
+```
+
+The crates.io `hasp` (`0.1.0-alpha`) is a name-reservation placeholder
+and does not satisfy ferrule's feature requirements. Use the GitHub
+source. If you build without `hasp/` present, cargo fails with
+`failed to read /home/.../hasp/crates/hasp/Cargo.toml`.
+
 ## How to Test
 
 ### SQLite — no setup required
