@@ -224,41 +224,34 @@ impl Connection for OracleConnection {
     }
 }
 
-/// Classify an `oracle::Error` raised by the `Batch` path. Returns
-/// [`CoreError::BulkUnavailable`] for conditions where the Auto
-/// dispatcher can safely fall back to the generic
-/// `INSERT ALL ... SELECT 1 FROM DUAL` path:
+/// Classify an `oracle::Error` raised by the `Batch` path.
 ///
-/// - ORA-01031 (insufficient privileges): user lacks INSERT on the
-///   target. The generic INSERT path would fail too, but flagging
-///   BulkUnavailable surfaces a clearer "--bulk-native off" hint.
-/// - ORA-00942 (table or view does not exist): same rationale.
-/// - DPI-1010 / Instant Client missing: degraded host install.
+/// `BulkUnavailable` is only used when the generic
+/// `INSERT ALL ... SELECT 1 FROM DUAL` path could *actually* succeed
+/// where bulk failed — i.e., when the failure is specific to the
+/// array-DML protocol shape and not to schema/privilege concerns the
+/// generic path would also hit. Today no such Oracle-specific
+/// recoverable error class is known, so every failure surfaces as
+/// `QueryFailed` immediately. (Notably, ORA-01031 "insufficient
+/// privilege" and ORA-00942 "table or view does not exist" were
+/// previously flagged as `BulkUnavailable`, but the generic path
+/// fails identically on both — the suggested fallback was misleading.)
 ///
-/// Anything else stays `QueryFailed`. Notably, ORA-26026 ("unique
-/// index initially in invalid state") from direct-path inserts is
-/// reserved for the future `--oracle-direct-path` opt-in (#37).
+/// ORA-26026 / ORA-12838 from direct-path inserts are reserved for
+/// the future `--oracle-direct-path` opt-in (#37), where falling
+/// back to safe array-DML is the right behaviour.
 fn map_oracle_bulk_error(e: oracle::Error) -> CoreError {
     let msg = e.to_string();
-    // dpi_code is typed `Option<i32>`. Oracle error codes (ORA-XXXXX)
-    // surface via the error display string; ODPI-C structural codes
-    // (DPI-XXXX) surface via dpi_code.
+    // dpi_code is typed `Option<i32>`. ODPI-C 1047 is the
+    // Instant-Client-not-loaded structural error (see the connect
+    // path at `map_oracle_error`). In practice this can't fire here
+    // because we'd have failed at connect time, but defend in depth.
     if let Some(code) = e.dpi_code() {
         if code == 1047 || msg.contains("libclntsh") {
-            return CoreError::BulkUnavailable(format!(
+            return CoreError::ConnectionFailed(format!(
                 "Oracle Instant Client not loaded: {msg}"
             ));
         }
-    }
-    if msg.contains("ORA-01031") {
-        return CoreError::BulkUnavailable(format!(
-            "Oracle insufficient privileges for bulk insert: {msg}"
-        ));
-    }
-    if msg.contains("ORA-00942") {
-        return CoreError::BulkUnavailable(format!(
-            "Oracle table or view does not exist: {msg}"
-        ));
     }
     CoreError::QueryFailed(format!("Oracle bulk: {msg}"))
 }
@@ -273,8 +266,12 @@ enum OwnedBind {
     /// Oracle DDL maps Bool → `NUMBER(1)`, so 0/1 round-trips
     /// cleanly through an `i64` bind).
     I64(Option<i64>),
-    /// `f64` — used for `Value::Float64`. NaN/Inf are substituted
-    /// with `None` (Oracle has no NaN/Inf literal for `BINARY_DOUBLE`).
+    /// `f64` — used for `Value::Float64`. NaN/Inf pass through
+    /// because ferrule's Oracle DDL maps `Float64 → BINARY_DOUBLE`,
+    /// which natively accepts both values via the IEEE-754 bit
+    /// pattern. (Note: this diverges from the MySQL bulk path, which
+    /// substitutes NULL because MySQL `DOUBLE` literals have no
+    /// NaN/Inf representation in LOAD DATA.)
     F64(Option<f64>),
     /// Text — used for `Value::String`, `Value::Decimal` (Oracle
     /// auto-coerces string → NUMBER), `Value::Json`, `Value::Array`,
@@ -391,14 +388,35 @@ fn null_bind_for_hint(hint: TypeHint) -> OwnedBind {
     }
 }
 
-/// Parse a canonical UUID hex string (with or without dashes) into
-/// 16 raw bytes. Used for binding `Value::Uuid` into an Oracle
-/// `RAW(16)` column.
+/// Parse a UUID hex string into 16 raw bytes for binding into an
+/// Oracle `RAW(16)` column. Accepts the canonical 8-4-4-4-12 dashed
+/// form, the 32-character undashed form, an optional `urn:uuid:`
+/// prefix (RFC 4122 §3), and Microsoft / .NET curly-brace form
+/// `{...}`. Case-insensitive (`u8::from_str_radix` accepts a-f and
+/// A-F). Surrounding whitespace is tolerated.
 fn parse_uuid_hex(s: &str) -> Result<Vec<u8>, String> {
-    let stripped: String = s.chars().filter(|c| *c != '-').collect();
+    let trimmed = s.trim();
+    // RFC 4122 §3 URN prefix: `urn:uuid:550e8400-...`. Case-insensitive
+    // per the RFC, but in practice always lowercase from real sources.
+    let stripped_urn = trimmed
+        .strip_prefix("urn:uuid:")
+        .or_else(|| trimmed.strip_prefix("URN:UUID:"))
+        .unwrap_or(trimmed);
+    // .NET / Microsoft curly-brace form: `{550e8400-...}`. Both braces
+    // must be present; one without the other is a malformed input.
+    let stripped_braces = if let Some(inner) = stripped_urn.strip_prefix('{') {
+        inner
+            .strip_suffix('}')
+            .ok_or_else(|| "leading `{` without matching `}`".to_string())?
+    } else if stripped_urn.starts_with('}') || stripped_urn.ends_with('}') {
+        return Err("unmatched `}` in UUID".to_string());
+    } else {
+        stripped_urn
+    };
+    let stripped: String = stripped_braces.chars().filter(|c| *c != '-').collect();
     if stripped.len() != 32 {
         return Err(format!(
-            "expected 32 hex characters (32 with dashes stripped), got {}",
+            "expected 32 hex characters (after stripping dashes / prefix / braces), got {}",
             stripped.len()
         ));
     }
@@ -1037,6 +1055,53 @@ mod tests {
     fn parse_uuid_rejects_short_or_invalid() {
         assert!(parse_uuid_hex("550e8400").is_err());
         assert!(parse_uuid_hex("ZZZe8400-e29b-41d4-a716-446655440000").is_err());
+    }
+
+    // -------- L2: parse_uuid_hex accepts more real-world forms --------
+
+    #[test]
+    fn parse_uuid_accepts_urn_prefix() {
+        // RFC 4122 §3 — UUIDs from URN-aware sources arrive prefixed.
+        let bytes =
+            parse_uuid_hex("urn:uuid:550e8400-e29b-41d4-a716-446655440000").expect("parse");
+        assert_eq!(bytes.len(), 16);
+        // Uppercase URN prefix per RFC 4122 §3 (case-insensitive).
+        let bytes2 =
+            parse_uuid_hex("URN:UUID:550e8400-e29b-41d4-a716-446655440000").expect("parse");
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn parse_uuid_accepts_curly_brace_form() {
+        // Microsoft / .NET registry form: `{550e8400-...}`.
+        let bytes =
+            parse_uuid_hex("{550e8400-e29b-41d4-a716-446655440000}").expect("parse");
+        assert_eq!(bytes.len(), 16);
+        // Also accepts braces around the no-dash form.
+        let bytes2 = parse_uuid_hex("{550e8400e29b41d4a716446655440000}").expect("parse");
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn parse_uuid_accepts_uppercase_hex() {
+        let bytes =
+            parse_uuid_hex("550E8400-E29B-41D4-A716-446655440000").expect("parse");
+        let lower =
+            parse_uuid_hex("550e8400-e29b-41d4-a716-446655440000").expect("parse");
+        assert_eq!(bytes, lower);
+    }
+
+    #[test]
+    fn parse_uuid_trims_surrounding_whitespace() {
+        let bytes =
+            parse_uuid_hex("  550e8400-e29b-41d4-a716-446655440000\t\n").expect("parse");
+        assert_eq!(bytes.len(), 16);
+    }
+
+    #[test]
+    fn parse_uuid_rejects_unmatched_braces() {
+        assert!(parse_uuid_hex("{550e8400-e29b-41d4-a716-446655440000").is_err());
+        assert!(parse_uuid_hex("550e8400-e29b-41d4-a716-446655440000}").is_err());
     }
 
     #[test]

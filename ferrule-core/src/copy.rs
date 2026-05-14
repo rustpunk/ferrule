@@ -268,9 +268,35 @@ pub async fn copy_rows(
                 let _ = rollback_transaction(dst, dst_backend).await;
             }
         }
+    } else if result.is_ok() && backend_needs_explicit_commit(dst_backend) {
+        // L1: Oracle has no client-side autocommit (the oracle crate
+        // requires an explicit `COMMIT`). The other backends auto-
+        // commit each `execute()` by default. Without an explicit
+        // commit here, rows inserted by run_copy() would silently
+        // roll back at session close — making the function appear
+        // successful but losing the data. Issue the commit when no
+        // outer transaction was opened (the --atomic branch above
+        // already handles its own commit).
+        commit_transaction(dst, dst_backend).await?;
     }
 
     result
+}
+
+/// Backends whose client driver does *not* auto-commit each
+/// `execute()` call, so `copy_rows` must issue an explicit `COMMIT`
+/// at the end of a successful copy (when no outer transaction is in
+/// play). Currently only Oracle behaves this way; every other
+/// supported backend defaults to autocommit.
+fn backend_needs_explicit_commit(backend: Backend) -> bool {
+    #[cfg(feature = "oracle")]
+    {
+        if matches!(backend, Backend::Oracle) {
+            return true;
+        }
+    }
+    let _ = backend;
+    false
 }
 
 #[allow(clippy::too_many_arguments)]

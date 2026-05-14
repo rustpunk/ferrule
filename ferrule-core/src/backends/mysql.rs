@@ -263,10 +263,29 @@ impl Connection for MySqlConnection {
 
         // query_drop discards the result set but stores
         // affected_rows on the connection.
-        self.conn
-            .query_drop(load_sql)
-            .await
-            .map_err(my_load_data::classify_load_error)?;
+        let load_result = self.conn.query_drop(load_sql).await;
+
+        if let Err(e) = load_result {
+            // C2: ensure no infile handler lingers on the connection
+            // after a failed LOAD DATA. mysql_async only consumes the
+            // local handler when the *server* asks for the file (see
+            // `helpers.rs::handle_local_infile`); on a parse error,
+            // missing-table error, or any failure *before* that
+            // server prompt, the handler stays in
+            // `Conn::inner.infile_handler` ready to be honored by the
+            // *next* query on this connection — including a hostile
+            // user-issued `LOAD DATA LOCAL INFILE '/etc/passwd'`.
+            //
+            // `Conn::reset()` issues `COM_RESET_CONNECTION` and
+            // explicitly clears `infile_handler = None` (mysql_async
+            // src/conn/mod.rs:1146). Best-effort: if reset itself
+            // fails, surface the original LOAD DATA error rather than
+            // the reset failure — the caller's next query will fail
+            // at a more obvious place and they'll reconnect.
+            let _ = self.conn.reset().await;
+            return Err(my_load_data::classify_load_error(e));
+        }
+
         Ok(self.conn.affected_rows() as usize)
     }
 }
@@ -477,6 +496,7 @@ fn escape_mysql_string(s: &str) -> String {
 /// - `\\` → literal backslash
 /// - `\t` → literal tab
 /// - `\n` → literal newline
+/// - `\r` → literal carriage return
 /// - `\0` → literal NUL byte
 /// - `\N` → SQL NULL
 ///
@@ -568,6 +588,13 @@ mod my_load_data {
                 b'\\' => out.extend_from_slice(b"\\\\"),
                 b'\t' => out.extend_from_slice(b"\\t"),
                 b'\n' => out.extend_from_slice(b"\\n"),
+                // `\r` matters because (a) some MySQL clients
+                // interpret a bare `\r` immediately before `\n` as
+                // part of a CRLF row terminator under certain
+                // `LINES TERMINATED BY` settings, and (b) even when
+                // the server doesn't, a bare `\r` survives as a data
+                // byte and corrupts `VARCHAR` round-trips.
+                b'\r' => out.extend_from_slice(b"\\r"),
                 b'\0' => out.extend_from_slice(b"\\0"),
                 other => out.push(other),
             }
@@ -672,6 +699,18 @@ mod my_load_data {
             assert_eq!(
                 enc1_str(Value::String("a\nb".into()), TypeHint::String),
                 "a\\nb"
+            );
+            // H1 regression guard: \r MUST be escaped as `\r` too,
+            // otherwise CRLF source data corrupts VARCHAR round-trips
+            // and may interact badly with LINES TERMINATED BY on some
+            // server configurations.
+            assert_eq!(
+                enc1_str(Value::String("a\rb".into()), TypeHint::String),
+                "a\\rb"
+            );
+            assert_eq!(
+                enc1_str(Value::String("a\r\nb".into()), TypeHint::String),
+                "a\\r\\nb"
             );
         }
 

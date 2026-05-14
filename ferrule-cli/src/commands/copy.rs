@@ -4,6 +4,11 @@ use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::Backend;
 use ferrule_core::connection::ConnectOptions;
 use ferrule_core::copy::{copy_rows, BulkMode, CopyOptions, CopySource, IfExists};
+
+// `BulkMode` itself comes from ferrule_core; the CLI wraps it in
+// `BulkNativeMode` so clap can enumerate values in --help and reject
+// bad inputs with a real usage error instead of routing them through
+// the runtime parser.
 use is_terminal::IsTerminal;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -38,12 +43,10 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
         ))
     })?;
 
-    let bulk_mode = BulkMode::parse(&args.bulk_native).ok_or_else(|| {
-        CliError::usage(format!(
-            "Unknown --bulk-native mode '{}'. Use: off, auto, on.",
-            args.bulk_native
-        ))
-    })?;
+    // clap's ValueEnum derive on `BulkNativeMode` already rejects
+    // invalid input with a usage error before we get here, so this
+    // conversion is infallible.
+    let bulk_mode: BulkMode = args.bulk_native.into();
 
     if if_exists == IfExists::Truncate && !args.yes && std::io::stdin().is_terminal() {
         return Err(CliError::usage(

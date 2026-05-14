@@ -186,10 +186,24 @@ impl Connection for MssqlConnection {
         // tiberius's `client.bulk_insert(table)` issues
         // `SELECT TOP 0 * FROM <table>` to introspect the column
         // metadata, then opens a TDS bulk-load stream against the
-        // `Updateable` columns. Both interpolations happen verbatim,
-        // so we pre-quote with the backend's ANSI-quoting helper.
+        // `Updateable` columns *in physical order*. Both interpolations
+        // happen verbatim, so we pre-quote with the backend's
+        // ANSI-quoting helper.
         let qtable =
             crate::copy::quote_identifier(target.table, crate::backend::Backend::MsSql);
+
+        // C1 pre-flight: the destination's physical column order
+        // (minus IDENTITY columns) MUST match `target.columns` exactly
+        // — otherwise we'd push positional `TokenRow`s into the wrong
+        // columns silently, or push N values into N-1 slots (IDENTITY
+        // mismatch). The generic INSERT path uses named column lists
+        // so it doesn't have this hazard; return `BulkUnavailable` on
+        // mismatch so `--bulk-native=auto` degrades cleanly.
+        let dest_cols = self
+            .fetch_bulk_updatable_columns(target.table)
+            .await?;
+        verify_bulk_column_alignment(&dest_cols, target.columns)?;
+
         let mut req = self
             .client
             .bulk_insert(qtable.as_str())
@@ -216,24 +230,108 @@ impl Connection for MssqlConnection {
     }
 }
 
+impl MssqlConnection {
+    /// Fetch destination column names in physical order, filtered to
+    /// *non-IDENTITY* columns (the same set `tiberius::Client::bulk_insert`
+    /// will accept).
+    async fn fetch_bulk_updatable_columns(
+        &mut self,
+        table: &str,
+    ) -> Result<Vec<String>, CoreError> {
+        // `OBJECT_ID(QUOTENAME(...))` resolves the table without
+        // requiring a schema prefix in `table` (matches the existing
+        // describe_table behaviour). `COLUMNPROPERTY(..., 'IsIdentity')`
+        // returns 1 for IDENTITY columns, 0 otherwise.
+        let sql = format!(
+            "SELECT c.COLUMN_NAME, \
+                    COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS is_identity \
+             FROM INFORMATION_SCHEMA.COLUMNS c \
+             WHERE c.TABLE_NAME = '{}' \
+             ORDER BY c.ORDINAL_POSITION",
+            escape_mssql_string(table)
+        );
+        let result = self.query(&sql).await.map_err(|e| {
+            CoreError::BulkUnavailable(format!(
+                "MSSQL bulk pre-flight: could not introspect destination columns: {e}"
+            ))
+        })?;
+        let mut cols = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            // Skip IDENTITY columns — tiberius excludes them.
+            let is_identity = match &row[1] {
+                Value::Bool(b) => *b,
+                Value::Int64(n) => *n != 0,
+                _ => false,
+            };
+            if is_identity {
+                continue;
+            }
+            if let Value::String(name) = &row[0] {
+                cols.push(name.clone());
+            }
+        }
+        Ok(cols)
+    }
+}
+
+/// Compare destination physical column order (already filtered to
+/// non-IDENTITY) against `target.columns`. Names must match exactly,
+/// case-insensitive (MSSQL identifiers default to case-insensitive
+/// collation; the destination metadata may return original case but
+/// the source may have produced any case). Returns
+/// [`CoreError::BulkUnavailable`] on mismatch so the dispatcher
+/// degrades to the generic INSERT path (which uses named column
+/// lists and works regardless of physical order).
+fn verify_bulk_column_alignment(
+    dest_cols: &[String],
+    target_cols: &[ColumnInfo],
+) -> Result<(), CoreError> {
+    if dest_cols.len() != target_cols.len() {
+        return Err(CoreError::BulkUnavailable(format!(
+            "MSSQL bulk path requires destination to have exactly the same \
+             non-IDENTITY columns as the source ({} dest cols vs {} source cols). \
+             The destination may have IDENTITY columns the source doesn't, or \
+             columns the source doesn't write to — generic INSERT can handle \
+             this with a named column list",
+            dest_cols.len(),
+            target_cols.len()
+        )));
+    }
+    for (idx, (dest, src)) in dest_cols.iter().zip(target_cols).enumerate() {
+        if !dest.eq_ignore_ascii_case(&src.name) {
+            return Err(CoreError::BulkUnavailable(format!(
+                "MSSQL bulk path requires destination column order to match source. \
+                 Position {idx}: dest = {dest:?}, source = {src_name:?}. \
+                 Generic INSERT uses a named column list and works regardless of order",
+                src_name = src.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Classify a `tiberius::error::Error` raised by `client.bulk_insert`
 /// setup. Returns [`CoreError::BulkUnavailable`] only for conditions
-/// where falling back to a generic INSERT is safe — anything that
-/// could imply a partial insert (post-prologue protocol errors) stays
-/// as `QueryFailed`.
+/// where falling back to a generic INSERT could *actually succeed* —
+/// not for errors that would hit the generic path too (permission
+/// denied, missing table). The `Auto` dispatcher's "fall back to
+/// generic" only helps when the generic path is strictly more capable.
+///
+/// Currently bulk-recoverable on MSSQL:
+/// - "Cannot bulk load" — target is a view or otherwise non-bulk-eligible.
+///   Generic INSERT can still target views if INSTEAD OF triggers exist.
+/// - Missing column metadata — the bulk handshake's
+///   `SELECT TOP 0 *` returned no usable columns. Generic INSERT can
+///   still hit a synonym or other indirection that bulk can't.
 fn classify_bulk_setup_error(e: &tiberius::error::Error) -> CoreError {
     let msg = e.to_string();
-    // "Invalid object name '...'" — target is not a base table or
-    // doesn't exist at all. The Auto dispatcher cannot recover by
-    // falling back (the INSERT would fail too), but flag it as
-    // BulkUnavailable so the error message is more informative.
-    // (`On` mode then surfaces it via the dispatcher's hint.)
-    if msg.contains("Invalid object name")
-        || msg.contains("Cannot bulk load")
-        || msg.contains("expecting column metadata")
-    {
+    if msg.contains("Cannot bulk load") || msg.contains("expecting column metadata") {
         return CoreError::BulkUnavailable(format!("MSSQL rejected bulk_insert setup: {msg}"));
     }
+    // "Invalid object name" / permission errors / network errors: the
+    // generic INSERT path would fail with the same root cause, so
+    // surface the error immediately rather than confusing the user
+    // with a "fall back to --bulk-native=auto" hint.
     CoreError::QueryFailed(format!("MSSQL bulk_insert setup: {msg}"))
 }
 
@@ -677,6 +775,72 @@ mod tests {
         let n = parse_decimal_to_numeric("42").unwrap();
         assert_eq!(n.value(), 42);
         assert_eq!(n.scale(), 0);
+    }
+
+    // -------- C1: verify_bulk_column_alignment --------
+
+    fn col(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            type_hint: TypeHint::String,
+            nullable: true,
+        }
+    }
+
+    #[test]
+    fn verify_alignment_accepts_exact_match() {
+        let dest = vec!["id".to_string(), "name".to_string(), "age".to_string()];
+        let target = vec![col("id"), col("name"), col("age")];
+        verify_bulk_column_alignment(&dest, &target).expect("matched columns should pass");
+    }
+
+    #[test]
+    fn verify_alignment_is_case_insensitive() {
+        // MSSQL identifiers default to case-insensitive collation —
+        // the dest might come back as `ID` while the source rendered
+        // `id`. Should not block.
+        let dest = vec!["ID".to_string(), "Name".to_string()];
+        let target = vec![col("id"), col("name")];
+        verify_bulk_column_alignment(&dest, &target).expect("case-insensitive should pass");
+    }
+
+    #[test]
+    fn verify_alignment_rejects_count_mismatch() {
+        let dest = vec!["a".to_string(), "b".to_string()];
+        let target = vec![col("a"), col("b"), col("c")];
+        let err = verify_bulk_column_alignment(&dest, &target).expect_err("count mismatch");
+        assert!(matches!(err, CoreError::BulkUnavailable(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2 dest cols") && msg.contains("3 source cols"),
+            "useful diagnostic: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_alignment_rejects_order_mismatch() {
+        // The silent-corruption hazard: same names, wrong order. The
+        // bulk path would write `a`'s values into `b`'s column.
+        let dest = vec!["b".to_string(), "a".to_string()];
+        let target = vec![col("a"), col("b")];
+        let err = verify_bulk_column_alignment(&dest, &target).expect_err("order mismatch");
+        assert!(matches!(err, CoreError::BulkUnavailable(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Position 0") && msg.contains("\"b\"") && msg.contains("\"a\""),
+            "useful diagnostic: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_alignment_rejects_extra_destination_columns() {
+        // IDENTITY mismatch in the wild: dest has columns the source
+        // doesn't write to. fetch_bulk_updatable_columns filters out
+        // IDENTITY, but a regular extra column should still be caught.
+        let dest = vec!["a".to_string(), "b".to_string(), "extra".to_string()];
+        let target = vec![col("a"), col("b")];
+        let err = verify_bulk_column_alignment(&dest, &target).expect_err("extra dest cols");
+        assert!(matches!(err, CoreError::BulkUnavailable(_)));
     }
 
     #[test]

@@ -47,9 +47,13 @@ uuid = { workspace = true, optional = true }
 # `LOAD DATA LOCAL INFILE` bulk paths: `bytes::Bytes` is the payload
 # accepted by `tokio_postgres::CopyInSink` and by
 # `mysql_async::InfileData`. `futures-util` provides `SinkExt::send`
-# for PG and `stream::iter` for the MySQL infile-data stream.
+# for PG and `stream::iter` + `StreamExt::boxed` for the MySQL
+# infile-data stream — `boxed()` allocates via `Pin<Box<…>>` and
+# requires the `alloc` feature explicitly. (Today it works
+# transitively through mysql_async's default features, but pinning
+# it here keeps a clean rebuild robust to upstream dep changes.)
 bytes = { version = "1", optional = true }
-futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "alloc"] }
 
 # MySQL
 mysql_async = { version = "0.35", optional = true }

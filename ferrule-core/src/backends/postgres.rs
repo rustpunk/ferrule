@@ -421,17 +421,26 @@ mod pg_text_copy {
     /// Classify a `tokio_postgres::Error` raised by `copy_in`.
     /// Returns [`CoreError::BulkUnavailable`] only when the error
     /// names a *recoverable* condition (target is a non-table
-    /// relation), so the Auto dispatcher can fall back. Everything
-    /// else surfaces as `QueryFailed` because a fallback would
+    /// relation that COPY refuses but a generic INSERT with rules
+    /// or INSTEAD OF triggers can target), so the Auto dispatcher
+    /// can fall back. Everything else surfaces as `QueryFailed`
+    /// because a fallback after a partial bulk send would
     /// double-insert.
+    ///
+    /// SQLSTATE-based rather than substring-based: PG raises
+    /// `wrong_object_type` (42809) when COPY is issued against a
+    /// view / mat view / foreign table / sequence. Substring
+    /// matching on the English error message (`"cannot copy
+    /// to/from"`) was previously used but is fragile across server
+    /// locales and minor version wording changes.
     pub fn classify_copy_error(e: &tokio_postgres::Error) -> CoreError {
-        let msg = e.to_string();
-        // PG "cannot copy to/from foreign table" / "view"
-        // / "materialized view": fall back.
-        if msg.contains("cannot copy to") || msg.contains("cannot copy from") {
-            return CoreError::BulkUnavailable(format!("PG rejected COPY: {msg}"));
+        use tokio_postgres::error::SqlState;
+        if let Some(code) = e.code() {
+            if *code == SqlState::WRONG_OBJECT_TYPE {
+                return CoreError::BulkUnavailable(format!("PG rejected COPY: {e}"));
+            }
         }
-        CoreError::QueryFailed(format!("COPY setup: {msg}"))
+        CoreError::QueryFailed(format!("COPY setup: {e}"))
     }
 
     #[cfg(test)]
