@@ -28,7 +28,8 @@ pub use connection::{
     StatementResult,
 };
 pub use copy::{
-    copy_rows, translate_ddl, translate_type, BulkMode, CopyOptions, CopySource, IfExists,
+    copy_all_tables, copy_rows, discover_tables, topo_sort, translate_ddl, translate_type,
+    AllTablesOptions, BulkMode, CopyOptions, CopySource, CycleError, IfExists,
 };
 pub use dump::{dump_query, dump_table, DumpFormat, DumpOptions};
 pub use error::CoreError;

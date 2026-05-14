@@ -1412,4 +1412,87 @@ mod tests {
         let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
         let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
     }
+
+    /// PG → SQLite `--all-tables` round-trip. Two related PG tables
+    /// (parent + child via FK) are copied into a fresh SQLite file in
+    /// FK-respecting order; we verify both tables exist on the
+    /// destination with the expected row counts.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_postgres_to_sqlite_all_tables_round_trip() {
+        use crate::backend::Backend;
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::copy::{copy_all_tables, AllTablesOptions};
+
+        let Some(mut src) = try_connect().await else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_to_sqlite_all_tables_round_trip"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let parent = format!("ferrule_all_parent_{pid}");
+        let child = format!("ferrule_all_child_{pid}");
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {child}")).await;
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {parent}")).await;
+        src.execute(&format!(
+            "CREATE TABLE {parent} (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .expect("CREATE parent");
+        src.execute(&format!(
+            "CREATE TABLE {child} (id INT PRIMARY KEY, \
+                                   parent_id INT REFERENCES {parent}(id), \
+                                   note TEXT)"
+        ))
+        .await
+        .expect("CREATE child");
+        src.execute(&format!(
+            "INSERT INTO {parent} VALUES (1, 'one'), (2, 'two')"
+        ))
+        .await
+        .expect("seed parent");
+        src.execute(&format!(
+            "INSERT INTO {child} VALUES (10, 1, 'first'), (11, 2, 'second')"
+        ))
+        .await
+        .expect("seed child");
+
+        // Fresh on-disk SQLite destination.
+        let dst_path = std::env::temp_dir()
+            .join(format!("ferrule-pg-all-tables-{pid}.db"));
+        let _ = std::fs::remove_file(&dst_path);
+        let dst_url = DatabaseUrl::parse(&format!("sqlite://{}", dst_path.display())).unwrap();
+        let mut dst = sqlite_connect(&dst_url, &ConnectOptions::default())
+            .await
+            .expect("connect sqlite dst");
+        dst.execute("PRAGMA foreign_keys = ON").await.unwrap();
+
+        let opts = AllTablesOptions {
+            include: vec![format!("ferrule_all_*_{pid}")],
+            create_table: true,
+            ..Default::default()
+        };
+        let copied = copy_all_tables(&mut src, Backend::Postgres, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect("copy_all_tables PG -> SQLite");
+        assert_eq!(copied, 4, "2 parent rows + 2 child rows expected");
+
+        let p = dst
+            .query(&format!("SELECT count(*) FROM {parent}"))
+            .await
+            .expect("verify parent");
+        let c = dst
+            .query(&format!("SELECT count(*) FROM {child}"))
+            .await
+            .expect("verify child");
+        assert!(matches!(&p.rows[0][0], Value::Int64(2)));
+        assert!(matches!(&c.rows[0][0], Value::Int64(2)));
+
+        // Cleanup PG side.
+        let _ = src.execute(&format!("DROP TABLE {child}")).await;
+        let _ = src.execute(&format!("DROP TABLE {parent}")).await;
+        let _ = std::fs::remove_file(&dst_path);
+    }
 }

@@ -8,7 +8,7 @@
 //! [`IfExists`].
 
 use crate::backend::Backend;
-use crate::connection::{BulkInsert, Connection};
+use crate::connection::{BulkInsert, Connection, ForeignKey};
 use crate::error::CoreError;
 use crate::params::render_value;
 use crate::value::{ColumnInfo, TypeHint, Value};
@@ -1177,6 +1177,278 @@ async fn rollback_transaction(
         _ => "ROLLBACK",
     };
     conn.execute(stmt).await.map(|_| ())
+}
+
+// -------------------------------------------------------------------
+// Phase 3: schema-level (--all-tables) copy
+// -------------------------------------------------------------------
+
+/// Options for `copy_all_tables`.
+///
+/// Patterns use simple shell-style globs (`*`, `?`); matching is
+/// case-sensitive against the identifier shape the source returns
+/// (Oracle uppercases unquoted identifiers). Tables are included when
+/// they match *at least one* `--include` (or the include list is
+/// empty) and match *no* `--exclude`.
+pub struct AllTablesOptions {
+    /// Repeatable include patterns. Empty = include everything.
+    pub include: Vec<String>,
+    /// Repeatable exclude patterns. Always applied after include.
+    pub exclude: Vec<String>,
+    /// Carry through to the per-table `CopyOptions`. Per-table
+    /// `source` and `create_table` are derived inside this module.
+    pub if_exists: IfExists,
+    pub atomic: bool,
+    pub batch_size: usize,
+    pub bulk_mode: BulkMode,
+    pub verbose: bool,
+    pub create_table: bool,
+    /// If true, ignore cycle errors from `topo_sort` and copy in a
+    /// deterministic-but-arbitrary order. The user must understand
+    /// FK violations may surface as driver errors on first insert.
+    pub no_fk_check: bool,
+}
+
+impl Default for AllTablesOptions {
+    fn default() -> Self {
+        Self {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            if_exists: IfExists::Error,
+            atomic: false,
+            batch_size: 1000,
+            bulk_mode: BulkMode::Off,
+            verbose: false,
+            create_table: false,
+            no_fk_check: false,
+        }
+    }
+}
+
+/// Match `name` against `pattern` using shell-style `*` and `?`.
+/// `*` matches zero or more characters; `?` matches exactly one.
+/// Case-sensitive. All other characters match literally.
+pub(crate) fn matches_glob(pattern: &str, name: &str) -> bool {
+    fn helper(p: &[u8], n: &[u8]) -> bool {
+        match (p.split_first(), n.split_first()) {
+            (None, None) => true,
+            (Some((b'*', rest)), _) => {
+                // Try matching the rest at every suffix of `n`.
+                if helper(rest, n) {
+                    return true;
+                }
+                if let Some((_, ns)) = n.split_first() {
+                    helper(p, ns)
+                } else {
+                    false
+                }
+            }
+            (Some((b'?', rest_p)), Some((_, rest_n))) => helper(rest_p, rest_n),
+            (Some((pc, rest_p)), Some((nc, rest_n))) if pc == nc => helper(rest_p, rest_n),
+            _ => false,
+        }
+    }
+    helper(pattern.as_bytes(), name.as_bytes())
+}
+
+/// Discover tables on `src` and apply include/exclude filters.
+/// Returns the filtered list in `list_tables` order (alphabetical for
+/// most backends). Caller is expected to feed this into [`topo_sort`]
+/// before issuing copies.
+pub async fn discover_tables(
+    src: &mut dyn Connection,
+    schema: Option<&str>,
+    include: &[String],
+    exclude: &[String],
+) -> Result<Vec<String>, CoreError> {
+    let raw = src.list_tables(schema).await?;
+    Ok(raw
+        .into_iter()
+        .filter(|t| {
+            if !include.is_empty() && !include.iter().any(|p| matches_glob(p, t)) {
+                return false;
+            }
+            if exclude.iter().any(|p| matches_glob(p, t)) {
+                return false;
+            }
+            true
+        })
+        .collect())
+}
+
+/// Error type for [`topo_sort`]. Carries the cycle path so callers
+/// can surface it in the error message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleError {
+    /// Tables that participate in at least one cycle, in
+    /// alphabetical order so the message is deterministic.
+    pub remaining: Vec<String>,
+}
+
+/// Topologically sort `tables` so parents are loaded before
+/// children, using `fks` as the edge set. Tables referenced as
+/// parents but not present in `tables` (e.g. excluded from
+/// `--all-tables` selection) are dropped from the dependency graph.
+///
+/// Returns the load order on success, or [`CycleError`] when the
+/// remaining graph after Kahn's algorithm still has nodes (i.e.
+/// every remaining node sits on a cycle).
+///
+/// The output preserves the relative order of independent tables
+/// from `tables` so successive runs against the same fixture
+/// produce identical orderings.
+pub fn topo_sort(tables: &[String], fks: &[ForeignKey]) -> Result<Vec<String>, CycleError> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    let present: HashSet<String> = tables.iter().cloned().collect();
+    let order_index: HashMap<String, usize> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.clone(), i))
+        .collect();
+    // Map child -> set of parents that are in `tables`.
+    let mut parents: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for t in tables {
+        parents.entry(t.clone()).or_default();
+    }
+    for fk in fks {
+        if !present.contains(&fk.child_table) || !present.contains(&fk.parent_table) {
+            continue;
+        }
+        if fk.child_table == fk.parent_table {
+            // Self-referential FK is not a multi-table cycle.
+            continue;
+        }
+        if parents
+            .get_mut(&fk.child_table)
+            .unwrap()
+            .insert(fk.parent_table.clone())
+        {
+            children
+                .entry(fk.parent_table.clone())
+                .or_default()
+                .push(fk.child_table.clone());
+        }
+    }
+
+    // Kahn's algorithm. Tie-break on the original `tables` order so
+    // the output is deterministic across runs against the same input.
+    let mut ready: Vec<String> = tables
+        .iter()
+        .filter(|t| parents.get(*t).is_some_and(|p| p.is_empty()))
+        .cloned()
+        .collect();
+    let mut out: Vec<String> = Vec::with_capacity(tables.len());
+    let mut emitted: HashSet<String> = HashSet::new();
+    while !ready.is_empty() {
+        let t = ready.remove(0);
+        out.push(t.clone());
+        emitted.insert(t.clone());
+        if let Some(kids) = children.get(&t).cloned() {
+            for kid in kids {
+                if let Some(ps) = parents.get_mut(&kid) {
+                    ps.remove(&t);
+                    if ps.is_empty() && !emitted.contains(&kid) && !ready.contains(&kid) {
+                        let kid_idx = *order_index.get(&kid).unwrap_or(&usize::MAX);
+                        let insert_at = ready
+                            .iter()
+                            .position(|r| {
+                                *order_index.get(r).unwrap_or(&usize::MAX) > kid_idx
+                            })
+                            .unwrap_or(ready.len());
+                        ready.insert(insert_at, kid);
+                    }
+                }
+            }
+        }
+    }
+
+    if out.len() == tables.len() {
+        Ok(out)
+    } else {
+        let mut remaining: Vec<String> = tables
+            .iter()
+            .filter(|t| !emitted.contains(*t))
+            .cloned()
+            .collect();
+        remaining.sort();
+        Err(CycleError { remaining })
+    }
+}
+
+/// Copy every table from `src` to `dst` in FK-respecting order.
+///
+/// Discovers tables via [`discover_tables`], orders them via
+/// [`topo_sort`] (or falls back to discovery order under
+/// `opts.no_fk_check`), then loops [`copy_rows`] per table. Per-table
+/// progress is printed to stderr in `[i/N] copying <table> (<rows> rows)…`
+/// shape.
+///
+/// Returns the total number of rows passed through across all tables.
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_all_tables(
+    src: &mut dyn Connection,
+    src_backend: Backend,
+    dst: &mut dyn Connection,
+    dst_backend: Backend,
+    opts: &AllTablesOptions,
+) -> Result<usize, CoreError> {
+    let tables = discover_tables(src, None, &opts.include, &opts.exclude).await?;
+    if tables.is_empty() {
+        return Err(CoreError::QueryFailed(
+            "copy --all-tables: no tables matched the include/exclude filters."
+                .into(),
+        ));
+    }
+
+    let fks = src.list_foreign_keys(None).await?;
+    let ordered = match topo_sort(&tables, &fks) {
+        Ok(o) => o,
+        Err(cycle) if opts.no_fk_check => {
+            eprintln!(
+                "[ferrule] copy: FK cycle detected among {:?}; \
+                 --no-fk-check is set, copying in discovery order.",
+                cycle.remaining
+            );
+            tables.clone()
+        }
+        Err(cycle) => {
+            return Err(CoreError::QueryFailed(format!(
+                "copy --all-tables: foreign-key cycle prevents a strict load order \
+                 (tables on the cycle: {:?}). Re-run with --no-fk-check to copy in \
+                 discovery order; FK violations may then surface as driver errors.",
+                cycle.remaining
+            )));
+        }
+    };
+
+    let total_tables = ordered.len();
+    let mut total_rows = 0usize;
+    for (idx, table) in ordered.iter().enumerate() {
+        if opts.verbose {
+            eprintln!(
+                "[ferrule] [{}/{total_tables}] copying {table}…",
+                idx + 1
+            );
+        }
+        let per_table = CopyOptions {
+            source: CopySource::Table(table.clone()),
+            create_table: opts.create_table,
+            if_exists: opts.if_exists,
+            atomic: opts.atomic,
+            batch_size: opts.batch_size,
+            bulk_mode: opts.bulk_mode,
+            verbose: opts.verbose,
+            progress: None,
+        };
+        let n = copy_rows(src, src_backend, dst, dst_backend, &per_table).await?;
+        if opts.verbose {
+            eprintln!("[ferrule] [{}/{total_tables}] {table}: {n} rows", idx + 1);
+        }
+        total_rows += n;
+    }
+    Ok(total_rows)
 }
 
 #[cfg(test)]
@@ -2363,6 +2635,272 @@ mod tests {
         // PanicIfCalled would have aborted if bulk_insert_rows had
         // been invoked; assert zero invocations for belt-and-braces.
         assert_eq!(bulk_calls.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // --- Phase 3 unit tests --------------------------------------------
+
+    #[test]
+    fn matches_glob_literal_and_wildcards() {
+        assert!(matches_glob("users", "users"));
+        assert!(!matches_glob("users", "Users"));
+        assert!(matches_glob("*", "anything"));
+        assert!(matches_glob("test_*", "test_users"));
+        assert!(matches_glob("test_*", "test_orders"));
+        assert!(!matches_glob("test_*", "users"));
+        assert!(matches_glob("?ser", "user"));
+        assert!(!matches_glob("?ser", "users"));
+        assert!(matches_glob("a*b*c", "axxxbyyc"));
+        assert!(matches_glob("*", ""));
+        assert!(!matches_glob("nonempty", ""));
+    }
+
+    fn fk(child: &str, parent: &str) -> ForeignKey {
+        ForeignKey {
+            child_table: child.to_string(),
+            child_columns: vec!["fk".into()],
+            parent_table: parent.to_string(),
+            parent_columns: vec!["id".into()],
+            on_delete: None,
+        }
+    }
+
+    #[test]
+    fn topo_sort_simple_dag_orders_parents_first() {
+        let tables: Vec<String> = ["orders", "users", "items"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // orders -> users; orders -> items.
+        let fks = vec![fk("orders", "users"), fk("orders", "items")];
+        let out = topo_sort(&tables, &fks).expect("ordered");
+        let users_pos = out.iter().position(|t| t == "users").unwrap();
+        let items_pos = out.iter().position(|t| t == "items").unwrap();
+        let orders_pos = out.iter().position(|t| t == "orders").unwrap();
+        assert!(users_pos < orders_pos, "users must precede orders: {out:?}");
+        assert!(items_pos < orders_pos, "items must precede orders: {out:?}");
+    }
+
+    #[test]
+    fn topo_sort_preserves_input_order_for_independent_tables() {
+        // Three tables with no FKs — output should match input order
+        // so successive runs are deterministic.
+        let tables: Vec<String> = ["c", "a", "b"].iter().map(|s| s.to_string()).collect();
+        let out = topo_sort(&tables, &[]).expect("ordered");
+        assert_eq!(out, tables);
+    }
+
+    #[test]
+    fn topo_sort_drops_edges_to_excluded_parents() {
+        // `users` is excluded from `tables` — the FK orders -> users
+        // should be ignored entirely, not block orders from emitting.
+        let tables: Vec<String> = ["orders"].iter().map(|s| s.to_string()).collect();
+        let fks = vec![fk("orders", "users")];
+        let out = topo_sort(&tables, &fks).expect("ordered");
+        assert_eq!(out, vec!["orders".to_string()]);
+    }
+
+    #[test]
+    fn topo_sort_ignores_self_referential_fk() {
+        // tree-shaped tables with a `parent_id REFERENCES tree(id)`
+        // self-FK should still emit cleanly — Kahn would otherwise
+        // see `tree` as having itself as an unsatisfied parent.
+        let tables: Vec<String> = ["tree"].iter().map(|s| s.to_string()).collect();
+        let fks = vec![fk("tree", "tree")];
+        let out = topo_sort(&tables, &fks).expect("ordered");
+        assert_eq!(out, vec!["tree".to_string()]);
+    }
+
+    #[test]
+    fn topo_sort_reports_cycle_with_remaining_nodes_sorted() {
+        let tables: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        // a -> b -> c -> a, a 3-cycle.
+        let fks = vec![fk("a", "b"), fk("b", "c"), fk("c", "a")];
+        let err = topo_sort(&tables, &fks).expect_err("cycle expected");
+        assert_eq!(err.remaining, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn topo_sort_cycle_does_not_block_dag_tables() {
+        // Mix a 2-cycle (a <-> b) with an independent table c. c
+        // should still emit; only a, b are reported as the cycle.
+        let tables: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let fks = vec![fk("a", "b"), fk("b", "a")];
+        let err = topo_sort(&tables, &fks).expect_err("cycle expected");
+        assert_eq!(err.remaining, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// SQLite end-to-end for `--all-tables`: parent + child tables
+    /// copied in FK order; child table is created on the destination
+    /// (via `--create-table`) after the parent so the FK target
+    /// exists when the child rows land.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_all_tables_orders_by_fk_and_copies_everything() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-all-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-all-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        // Enable FK enforcement on the destination so the test would
+        // fail if the load order were wrong (child before parent).
+        dst.execute("PRAGMA foreign_keys = ON").await.unwrap();
+
+        src.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+        ).await.unwrap();
+        src.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, \
+                                  user_id INTEGER REFERENCES users(id), \
+                                  total REAL)",
+        ).await.unwrap();
+        src.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')").await.unwrap();
+        src.execute("INSERT INTO orders VALUES (1, 1, 9.99), (2, 1, 4.50), (3, 2, 12.00)").await.unwrap();
+
+        let opts = AllTablesOptions {
+            create_table: true,
+            ..Default::default()
+        };
+        let copied = copy_all_tables(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect("copy_all_tables");
+        // 2 users + 3 orders.
+        assert_eq!(copied, 5);
+
+        let u = dst.query("SELECT count(*) FROM users").await.unwrap();
+        let o = dst.query("SELECT count(*) FROM orders").await.unwrap();
+        assert!(matches!(&u.rows[0][0], Value::Int64(2)));
+        assert!(matches!(&o.rows[0][0], Value::Int64(3)));
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// `--include` / `--exclude` glob filters: only matched tables
+    /// are copied; topo_sort runs over the filtered subset.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_all_tables_respects_include_and_exclude() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-incl-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-incl-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        // Three independent tables; include `app_*`, exclude `app_logs`.
+        src.execute("CREATE TABLE app_users (id INTEGER, name TEXT)").await.unwrap();
+        src.execute("CREATE TABLE app_logs (id INTEGER, msg TEXT)").await.unwrap();
+        src.execute("CREATE TABLE other (id INTEGER)").await.unwrap();
+        src.execute("INSERT INTO app_users VALUES (1, 'A')").await.unwrap();
+        src.execute("INSERT INTO app_logs VALUES (1, 'noise')").await.unwrap();
+        src.execute("INSERT INTO other VALUES (1)").await.unwrap();
+
+        let opts = AllTablesOptions {
+            include: vec!["app_*".into()],
+            exclude: vec!["app_logs".into()],
+            create_table: true,
+            ..Default::default()
+        };
+        let copied = copy_all_tables(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect("copy_all_tables");
+        // Only app_users (1 row) — app_logs excluded, other not in include.
+        assert_eq!(copied, 1);
+        let tables = dst.list_tables(None).await.unwrap();
+        assert!(tables.contains(&"app_users".to_string()));
+        assert!(!tables.contains(&"app_logs".to_string()));
+        assert!(!tables.contains(&"other".to_string()));
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// FK cycle without `--no-fk-check` hard-errors with the cycle
+    /// path. With `--no-fk-check` set, the copy proceeds (and may or
+    /// may not succeed depending on data; here we just verify the
+    /// dispatcher doesn't gate on the cycle).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_all_tables_rejects_cycle_unless_no_fk_check() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-cyc-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-cyc-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+        // FK enforcement OFF on destination so the cyclic test data
+        // can land at all.
+        dst.execute("PRAGMA foreign_keys = OFF").await.unwrap();
+
+        // a -> b -> a, a 2-cycle.
+        src.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER REFERENCES b(id))").await.unwrap();
+        src.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER REFERENCES a(id))").await.unwrap();
+        src.execute("INSERT INTO a VALUES (1, NULL)").await.unwrap();
+        src.execute("INSERT INTO b VALUES (1, NULL)").await.unwrap();
+
+        let opts = AllTablesOptions {
+            create_table: true,
+            ..Default::default()
+        };
+        let err = copy_all_tables(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect_err("cycle should hard-error");
+        let msg = format!("{err}");
+        assert!(msg.contains("foreign-key cycle"), "{msg}");
+        assert!(msg.contains("--no-fk-check"), "{msg}");
+
+        // Same input with --no-fk-check: should succeed (copies in
+        // discovery order; FK enforcement on dst is OFF).
+        let opts_relaxed = AllTablesOptions {
+            create_table: true,
+            no_fk_check: true,
+            ..Default::default()
+        };
+        let copied = copy_all_tables(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts_relaxed)
+            .await
+            .expect("copy_all_tables with --no-fk-check");
+        assert_eq!(copied, 2);
 
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);

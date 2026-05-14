@@ -613,6 +613,38 @@ source SELECT runs, with a hint at the future `--key` override (#43).
 silently ignored (the bulk loaders carry no MERGE semantics); ferrule
 prints one stderr line and uses the generic INSERT path.
 
+Schema-level (`--all-tables`) smoke — uses the seeded
+`test_users` + `test_orders` FK pair to verify parents load before
+children:
+
+```bash
+# Fresh snapshot of every table in the source DB into a new SQLite file.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-all-tables.db" \
+  --all-tables --create-table --verbose
+# Verify both tables landed with the expected row counts:
+ferrule query "sqlite:///tmp/ferrule-all-tables.db" \
+  "SELECT 'users', count(*) FROM test_users
+   UNION ALL SELECT 'orders', count(*) FROM test_orders" --format table
+
+# --include / --exclude globs (shell-style * and ?).
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-all-tables.db" \
+  --all-tables --create-table \
+  --include 'test_*' --exclude '*_orders' \
+  --if-exists truncate --yes
+# → only test_users lands; test_orders excluded.
+
+rm /tmp/ferrule-all-tables.db
+```
+
+`--all-tables` is mutually exclusive with `--table` and `--query`; the
+inline tests at `ferrule-core/src/copy.rs::copy_all_tables_*` cover the
+DAG ordering, include/exclude filters, FK cycle hard-error path, and
+the `--no-fk-check` escape hatch.
+
 Bulk-native paths (`--bulk-native auto|on`) require a destination
 backend with a real bulk loader — see `docs/src/copy.md` for the
 matrix. The flag is destination-only; SQLite stays on the generic

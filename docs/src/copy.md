@@ -97,6 +97,12 @@ ferrule copy prod-mysql warehouse-mssql \
   --query "SELECT id, name FROM users WHERE active = 1" \
   --into active_users --create-table
 
+# Schema-level refresh: copy every table from prod into a fresh
+# SQLite snapshot, FK-ordered. --include narrows the selection;
+# --exclude trims the noise.
+ferrule copy prod-pg snap-sqlite --all-tables --create-table \
+  --include 'app_*' --exclude '*_audit'
+
 # Atomic snapshot, all-or-nothing on the target.
 ferrule copy prod-pg snap-sqlite \
   --table test_users --create-table --atomic
@@ -191,10 +197,85 @@ fallback, you'll see one stderr line per affected batch:
 
 Use `--verbose` to additionally log one line per successful bulk batch.
 
+## Schema-level copy (`--all-tables`)
+
+`ferrule copy <SRC> <DST> --all-tables` discovers every table on the
+source, orders them so foreign-key parents load before children, and
+copies each one through the same per-table pipeline `--table` uses.
+This is the canonical "refresh dev from prod" workflow.
+
+```bash
+ferrule copy prod-pg snap-sqlite --all-tables --create-table
+ferrule copy prod-pg snap-sqlite --all-tables --if-exists truncate --yes
+```
+
+### Filtering
+
+Two repeatable glob flags narrow which tables get copied. Globs use
+shell-style `*` and `?`, matched case-sensitively against the
+identifier shape the source returns:
+
+```bash
+# Only app_* tables, skipping the *_audit log shadows.
+ferrule copy prod-pg snap-sqlite --all-tables --create-table \
+  --include 'app_*' --exclude '*_audit'
+```
+
+- `--include` defaults to "everything"; multiple `--include` patterns
+  OR together.
+- `--exclude` is always applied after the include filter.
+- Tables referenced by foreign keys but excluded from the selection
+  are simply dropped from the dependency graph — the copy will not
+  block waiting for them.
+
+### Order, cycles, and `--no-fk-check`
+
+The load order is computed via Kahn's algorithm over the
+destination-aware view of the FK graph (`Connection::list_foreign_keys`).
+Independent tables retain their `list_tables` order so successive
+runs are deterministic.
+
+Foreign-key *cycles* hard-error before any copy starts, with the
+cycle path in the message. Pass `--no-fk-check` to copy in
+discovery order anyway — useful when:
+
+- the destination has deferrable FKs (Postgres `DEFERRABLE INITIALLY
+  DEFERRED`) or FK enforcement is off (SQLite default;
+  `SET session_replication_role = replica` on Postgres);
+- you plan to drop and recreate constraints after the copy;
+- the cycle is across self-referential columns you'll backfill later.
+
+Self-referential foreign keys (`tree.parent_id REFERENCES tree(id)`)
+do *not* count as cycles and are loaded in a single pass.
+
+### Per-table progress
+
+With `--verbose`, ferrule prints one line at the start and end of
+each table:
+
+```
+[ferrule] [3/12] copying users…
+[ferrule] [3/12] users: 4523 rows
+```
+
+### Combining strategies
+
+`--all-tables` honours every other copy flag:
+
+- `--if-exists truncate --yes` clears each destination table once at
+  the top of its own copy — `--yes` is consulted once for the run,
+  not per table.
+- `--if-exists skip|upsert` requires a PK per table; tables without
+  a PK hard-error at their own step (see [Conflict handling]
+  (#conflict-handling)).
+- `--bulk-native auto|on` applies per table; `skip|upsert` still
+  force the generic path table-by-table.
+- `--atomic` wraps *each table* in its own transaction. A
+  cross-table single transaction is not in this release (it would
+  require deferrable FK support on the destination).
+
 ## Limits
 
-- **Single-table copy only.** Schema-level copy with FK ordering is
-  tracked under #30.
 - **Composite-key / unique-index conflict resolution.** `skip` /
   `upsert` use the destination's declared primary key. A user-supplied
   `--key COL[,COL...]` override (for PK-less tables and conflicts on
