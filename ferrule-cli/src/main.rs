@@ -65,7 +65,9 @@ enum Commands {
     Diff(DiffArgs),
 
     /// Copy rows between two connections (cross-DB)
-    Copy(CopyArgs),
+    // CopyArgs is the largest variant (per-side --src-*/--dst-* flags
+    // push it past Query's footprint); box to keep the enum compact.
+    Copy(Box<CopyArgs>),
 
     /// Export query results to CSV/JSON/SQL
     Export(ExportArgs),
@@ -130,7 +132,7 @@ fn main() {
             Commands::Tables(args) => commands::tables::run(args, &global_config).await,
             Commands::Describe(args) => commands::describe::run(args, &global_config).await,
             Commands::Diff(args) => commands::diff::run(args, &global_config).await,
-            Commands::Copy(args) => commands::copy::run(args, &global_config).await,
+            Commands::Copy(args) => commands::copy::run(*args, &global_config).await,
             Commands::Migrate(args) => commands::migrate::run(args, &global_config).await,
         }
     });

@@ -16,8 +16,9 @@ command, no intermediate file, no third tool.
 | `skip` / `upsert`                       | Shipped       | `--if-exists`; PK-driven, force generic path            |
 | Schema-level copy (FK-ordered)          | Shipped       | `--all-tables` with `--include` / `--exclude` / `--no-fk-check` |
 | Postgres binary `COPY`                  | Shipped       | `--copy-format binary`; PG-only                         |
-| Composite-key / unique-index override   | Deferred      | `--key COL[,COL...]` tracked under [#43](https://github.com/rustpunk/ferrule/issues/43) |
-| Per-side `--src-*` / `--dst-*` flags    | Deferred      | Tracked under [#44](https://github.com/rustpunk/ferrule/issues/44) |
+| Composite-key / unique-index override   | Shipped       | `--key COL[,COL...]`; closes [#43](https://github.com/rustpunk/ferrule/issues/43) |
+| Preserve source PK in `--create-table`  | Shipped       | `--preserve-pk`; closes [#45](https://github.com/rustpunk/ferrule/issues/45) |
+| Per-side `--src-*` / `--dst-*` flags    | Shipped       | SSH / proxy / key / insecure; closes [#44](https://github.com/rustpunk/ferrule/issues/44) |
 | Daemon routing for `copy`               | Deferred      | Tracked under [#10](https://github.com/rustpunk/ferrule/issues/10) |
 | Parallel loader (`--parallel N`)        | Deferred      | Depends on the above; tracked under [#38](https://github.com/rustpunk/ferrule/issues/38) |
 | Oracle direct-path `INSERT /*+ APPEND */` | Deferred    | Tracked under [#37](https://github.com/rustpunk/ferrule/issues/37) |
@@ -73,14 +74,46 @@ Override the default with `--if-exists <strategy>`:
   - MSSQL / Oracle: full `MERGE` with both `WHEN MATCHED THEN UPDATE`
     and `WHEN NOT MATCHED THEN INSERT` branches.
 
-`skip` and `upsert` require a declared primary key on the destination
-table. If the destination table has no PK, the copy hard-errors before
-any source SELECT runs, pointing at the future `--key COL[,COL...]`
-override (tracked under issue #43). PK columns are resolved on the
-destination via the per-backend introspection method
-(`Connection::primary_key`); cross-backend copies may need an explicit
-`SELECT col AS "DEST_NAME" …` alias when source and destination disagree
-on identifier case (Oracle uppercases unquoted identifiers).
+`skip` and `upsert` need conflict columns. Three ways to supply them,
+checked in this order:
+
+1. **`--key COL[,COL...]`** — explicit user-supplied list (repeatable
+   or comma-separated). Useful for tables with no declared PK and for
+   keying upsert on a unique index that isn't the PK. Names are
+   validated against the source SELECT shape; a typo fails fast before
+   any INSERT runs. `--key` is ignored (with a one-line stderr notice)
+   for non-conflict strategies.
+2. **Destination's declared primary key** — auto-detected via
+   `Connection::primary_key` when `--key` is absent.
+3. **Otherwise hard error** before the source SELECT runs, listing the
+   three escape hatches: declare a PK on the destination, run
+   `--create-table --preserve-pk`, or pass `--key COL[,COL...]`.
+
+Cross-backend copies may need an explicit `SELECT col AS "DEST_NAME" …`
+alias when source and destination disagree on identifier case (Oracle
+uppercases unquoted identifiers).
+
+### Preserving the source PK in `--create-table`
+
+`--create-table` is data-movement, not schema migration — it emits
+column types only. That collides with `--if-exists skip|upsert`,
+which needs a declared PK on the destination. Pass `--preserve-pk`
+alongside `--create-table` to lift the source table's declared PK
+into the emitted DDL via a `PRIMARY KEY (...)` clause:
+
+```bash
+# Snapshot prod into dev with refresh-able PKs.
+ferrule copy prod-pg snap-sqlite --table users --create-table --preserve-pk
+# Subsequent refresh keys on the lifted PK:
+ferrule copy prod-pg snap-sqlite --table users --if-exists upsert
+```
+
+Best-effort: source tables with no declared PK fall through to the v1
+column-only DDL. `--preserve-pk` is ignored in `--query` mode (no
+canonical source table to inspect). `--preserve-pk` requires
+`--create-table`. Indexes, defaults, and check constraints are still
+not copied — full DDL fidelity remains `ferrule diff` / `ferrule
+migrate` territory.
 
 Conflict resolution always runs through the generic INSERT path: the
 native bulk loaders (`COPY`, `BULK INSERT`, `LOAD DATA`, `Batch`) carry
@@ -312,11 +345,42 @@ each table:
   cross-table single transaction is not in this release (it would
   require deferrable FK support on the destination).
 
+## Per-side connection flags
+
+The shared connection flags (`--ssh-tunnel`, `--ssh-key`,
+`--proxy-url`, `--insecure`) apply to both sides by default. For the
+realistic case where exactly one side needs a tunnel — e.g. SSH into a
+bastion to reach prod, then write to a local-network warehouse — pass
+the corresponding `--src-*` or `--dst-*` override:
+
+| Shared             | Source-only            | Destination-only       |
+|--------------------|------------------------|------------------------|
+| `--ssh-tunnel`     | `--src-ssh-tunnel`     | `--dst-ssh-tunnel`     |
+| `--ssh-key`        | `--src-ssh-key`        | `--dst-ssh-key`        |
+| `--proxy-url`      | `--src-proxy-url`      | `--dst-proxy-url`      |
+| `--insecure`       | `--src-insecure`       | `--dst-insecure`       |
+
+Resolution: per-side override > unsuffixed shared > profile defaults
+in `.ferrule.toml`. Setting both the shared and a per-side form for
+the same field is a usage error (exit 2) — no silent merge.
+
+```bash
+# SSH into a bastion to reach prod Postgres; write to a local-
+# network SQLite warehouse without a tunnel.
+ferrule copy \
+  --src-ssh-tunnel ferrule@bastion.prod --src-ssh-key ~/.ssh/id_ed25519 \
+  prod-pg /tmp/snap.db \
+  --table users --create-table --preserve-pk
+```
+
+`--daemon` is not per-side: the connection pool either runs or doesn't.
+`check_daemon_ssh_compat` continues to reject daemon + SSH on either
+side; the resolved per-side tunnel config is consulted independently.
+
 ## Known limits
 
 The "Deferred" rows in the [v1 matrix](#what-ships-in-v1) above are
-the explicit known limits — `--key` for PK-less / unique-index
-conflicts (#43), per-side connection flags (#44), daemon-routed
-`copy` (#10), parallel multi-table fan-out (#38), Oracle direct-path
-(#37), and the `--bulk-native` default flip (#39). Each links to a
-GitHub issue with the rationale and follow-up plan.
+the explicit known limits — daemon-routed `copy` (#10), parallel
+multi-table fan-out (#38), Oracle direct-path (#37), and the
+`--bulk-native` default flip (#39). Each links to a GitHub issue with
+the rationale and follow-up plan.
