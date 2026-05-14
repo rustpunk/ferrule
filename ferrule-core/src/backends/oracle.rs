@@ -391,17 +391,24 @@ fn null_bind_for_hint(hint: TypeHint) -> OwnedBind {
 /// Parse a UUID hex string into 16 raw bytes for binding into an
 /// Oracle `RAW(16)` column. Accepts the canonical 8-4-4-4-12 dashed
 /// form, the 32-character undashed form, an optional `urn:uuid:`
-/// prefix (RFC 4122 §3), and Microsoft / .NET curly-brace form
-/// `{...}`. Case-insensitive (`u8::from_str_radix` accepts a-f and
-/// A-F). Surrounding whitespace is tolerated.
+/// prefix (RFC 4122 §3, case-insensitive per the RFC), and Microsoft /
+/// .NET curly-brace form `{...}`. Hex digits are case-insensitive
+/// (`u8::from_str_radix` accepts a-f and A-F). Surrounding whitespace
+/// is tolerated.
 fn parse_uuid_hex(s: &str) -> Result<Vec<u8>, String> {
     let trimmed = s.trim();
-    // RFC 4122 §3 URN prefix: `urn:uuid:550e8400-...`. Case-insensitive
-    // per the RFC, but in practice always lowercase from real sources.
-    let stripped_urn = trimmed
-        .strip_prefix("urn:uuid:")
-        .or_else(|| trimmed.strip_prefix("URN:UUID:"))
-        .unwrap_or(trimmed);
+    // RFC 4122 §3: "The prefix 'urn:uuid:' is case insensitive".
+    // Match any casing — `urn:uuid:`, `URN:UUID:`, `Urn:Uuid:`,
+    // `uRn:UuId:`, etc.
+    const URN_PREFIX: &str = "urn:uuid:";
+    let stripped_urn = if trimmed.len() >= URN_PREFIX.len()
+        && trimmed.is_char_boundary(URN_PREFIX.len())
+        && trimmed[..URN_PREFIX.len()].eq_ignore_ascii_case(URN_PREFIX)
+    {
+        &trimmed[URN_PREFIX.len()..]
+    } else {
+        trimmed
+    };
     // .NET / Microsoft curly-brace form: `{550e8400-...}`. Both braces
     // must be present; one without the other is a malformed input.
     let stripped_braces = if let Some(inner) = stripped_urn.strip_prefix('{') {
@@ -1062,13 +1069,24 @@ mod tests {
     #[test]
     fn parse_uuid_accepts_urn_prefix() {
         // RFC 4122 §3 — UUIDs from URN-aware sources arrive prefixed.
-        let bytes =
+        let canonical =
             parse_uuid_hex("urn:uuid:550e8400-e29b-41d4-a716-446655440000").expect("parse");
-        assert_eq!(bytes.len(), 16);
-        // Uppercase URN prefix per RFC 4122 §3 (case-insensitive).
-        let bytes2 =
-            parse_uuid_hex("URN:UUID:550e8400-e29b-41d4-a716-446655440000").expect("parse");
-        assert_eq!(bytes, bytes2);
+        assert_eq!(canonical.len(), 16);
+        // RFC 4122 §3: "The prefix 'urn:uuid:' is case insensitive".
+        // Every casing of the prefix MUST decode to the same bytes.
+        for prefix in &[
+            "urn:uuid:",
+            "URN:UUID:",
+            "Urn:Uuid:",
+            "uRn:UuId:",
+            "URN:uuid:",
+            "urn:UUID:",
+        ] {
+            let s = format!("{prefix}550e8400-e29b-41d4-a716-446655440000");
+            let parsed =
+                parse_uuid_hex(&s).unwrap_or_else(|e| panic!("prefix {prefix:?} should parse: {e}"));
+            assert_eq!(parsed, canonical, "prefix {prefix:?} mismatch");
+        }
     }
 
     #[test]

@@ -232,23 +232,49 @@ impl Connection for MssqlConnection {
 
 impl MssqlConnection {
     /// Fetch destination column names in physical order, filtered to
-    /// *non-IDENTITY* columns (the same set `tiberius::Client::bulk_insert`
-    /// will accept).
+    /// the same set `tiberius::Client::bulk_insert` will accept.
+    ///
+    /// Tiberius filters server-side using the TDS `ColumnFlag::Updateable`
+    /// bit (tiberius-0.12.3 client.rs:332). Server-side, that bit is
+    /// cleared for:
+    /// - IDENTITY columns,
+    /// - Computed (persisted or virtual) columns,
+    /// - ROWVERSION / TIMESTAMP columns (auto-maintained by the server).
+    ///
+    /// We can't query TDS column flags via INFORMATION_SCHEMA, so we
+    /// match each condition with its property/type equivalent. Missing
+    /// any of these would surface as either a silent column mis-
+    /// alignment (Updateable count mismatches expectations) or a
+    /// hard error from tiberius mid-stream — both of which the
+    /// `verify_bulk_column_alignment` step catches downstream, but
+    /// filtering here keeps the auto-fallback path clean.
     async fn fetch_bulk_updatable_columns(
         &mut self,
         table: &str,
     ) -> Result<Vec<String>, CoreError> {
-        // `OBJECT_ID(QUOTENAME(...))` resolves the table without
-        // requiring a schema prefix in `table` (matches the existing
-        // describe_table behaviour). `COLUMNPROPERTY(..., 'IsIdentity')`
-        // returns 1 for IDENTITY columns, 0 otherwise.
+        // Schema-qualified target (`schema.table`)? Split on the last
+        // dot so embedded dots inside bracketed identifiers don't
+        // confuse the split. ferrule's quote_identifier always emits
+        // ANSI quotes around a single identifier, so by the time we
+        // get here `target.table` is the unquoted form the user gave
+        // — `dbo.test_users`, `test_users`, or rarely `[my schema].[my table]`.
+        let (schema_filter, table_name) = match table.rsplit_once('.') {
+            Some((schema, name)) => (
+                format!(" AND c.TABLE_SCHEMA = '{}'", escape_mssql_string(schema)),
+                name.to_string(),
+            ),
+            None => (String::new(), table.to_string()),
+        };
         let sql = format!(
             "SELECT c.COLUMN_NAME, \
-                    COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS is_identity \
+                    COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS is_identity, \
+                    COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsComputed') AS is_computed, \
+                    c.DATA_TYPE \
              FROM INFORMATION_SCHEMA.COLUMNS c \
-             WHERE c.TABLE_NAME = '{}' \
+             WHERE c.TABLE_NAME = '{}'{} \
              ORDER BY c.ORDINAL_POSITION",
-            escape_mssql_string(table)
+            escape_mssql_string(&table_name),
+            schema_filter,
         );
         let result = self.query(&sql).await.map_err(|e| {
             CoreError::BulkUnavailable(format!(
@@ -257,13 +283,12 @@ impl MssqlConnection {
         })?;
         let mut cols = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
-            // Skip IDENTITY columns — tiberius excludes them.
-            let is_identity = match &row[1] {
-                Value::Bool(b) => *b,
-                Value::Int64(n) => *n != 0,
-                _ => false,
-            };
-            if is_identity {
+            // Skip columns tiberius will skip via ColumnFlag::Updateable:
+            // IDENTITY, computed, and ROWVERSION (DATA_TYPE = 'timestamp').
+            let is_identity = column_flag_bool(&row[1]);
+            let is_computed = column_flag_bool(&row[2]);
+            let is_rowversion = matches!(&row[3], Value::String(s) if s.eq_ignore_ascii_case("timestamp"));
+            if is_identity || is_computed || is_rowversion {
                 continue;
             }
             if let Value::String(name) = &row[0] {
@@ -271,6 +296,20 @@ impl MssqlConnection {
             }
         }
         Ok(cols)
+    }
+}
+
+/// Interpret an `is_*` column-property value as a boolean. The MSSQL
+/// driver maps the underlying INT result through `Value::Int64`,
+/// `Value::Bool`, or (when the table is missing or unresolved)
+/// `Value::Null`. Null is treated as `false` — for missing tables
+/// the empty column list will fail downstream with a clearer error
+/// than "destination has 0 non-IDENTITY columns".
+fn column_flag_bool(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Int64(n) => *n != 0,
+        _ => false,
     }
 }
 
@@ -841,6 +880,30 @@ mod tests {
         let target = vec![col("a"), col("b")];
         let err = verify_bulk_column_alignment(&dest, &target).expect_err("extra dest cols");
         assert!(matches!(err, CoreError::BulkUnavailable(_)));
+    }
+
+    // -------- C1 caveat fixes: column_flag_bool unit coverage --------
+    //
+    // The remaining caveat surface (Updateable filter for computed +
+    // ROWVERSION columns, schema-qualified table-name split) is tied
+    // to live SQL Server metadata — the integration test
+    // `test_mssql_bulk_insert_rows_round_trip` exercises the happy
+    // path with a real container; the unit coverage here pins down
+    // the helper invariants the pre-flight relies on.
+
+    #[test]
+    fn column_flag_bool_handles_int_bool_null() {
+        assert!(column_flag_bool(&Value::Bool(true)));
+        assert!(!column_flag_bool(&Value::Bool(false)));
+        assert!(column_flag_bool(&Value::Int64(1)));
+        assert!(!column_flag_bool(&Value::Int64(0)));
+        // COLUMNPROPERTY returns NULL for non-existent column/table;
+        // treat as false so the column is *included*, deferring the
+        // failure to the alignment check (which produces a clearer
+        // "0 dest cols vs N source cols" diagnostic).
+        assert!(!column_flag_bool(&Value::Null));
+        // Unexpected variants default false (defensive).
+        assert!(!column_flag_bool(&Value::String("yes".into())));
     }
 
     #[test]

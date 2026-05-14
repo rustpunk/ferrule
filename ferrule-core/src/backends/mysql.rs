@@ -276,13 +276,35 @@ impl Connection for MySqlConnection {
             // *next* query on this connection — including a hostile
             // user-issued `LOAD DATA LOCAL INFILE '/etc/passwd'`.
             //
-            // `Conn::reset()` issues `COM_RESET_CONNECTION` and
-            // explicitly clears `infile_handler = None` (mysql_async
-            // src/conn/mod.rs:1146). Best-effort: if reset itself
-            // fails, surface the original LOAD DATA error rather than
-            // the reset failure — the caller's next query will fail
-            // at a more obvious place and they'll reconnect.
+            // Two-step defense:
+            //
+            // 1. `Conn::reset()` issues `COM_RESET_CONNECTION` and
+            //    explicitly clears `infile_handler = None`
+            //    (mysql_async src/conn/mod.rs:1146). On modern
+            //    servers this fully neutralizes the threat.
+            //
+            // 2. Reset returns `Ok(false)` without clearing on
+            //    pre-MySQL-5.7.3 / pre-MariaDB-10.2.4 servers, and
+            //    `Err(_)` on transport failure. In both cases we
+            //    install a *poison* local handler that refuses any
+            //    subsequent LOAD DATA on this connection. The poison
+            //    handler is one-shot per mysql_async semantics;
+            //    after it fires once `infile_handler` is `None` and
+            //    further LOAD DATA queries fail with
+            //    `LocalInfileError::NoHandler`. Installing it on top
+            //    of a stale handler overwrites it, so the leaked
+            //    bytes become unreachable even when reset is a no-op.
             let _ = self.conn.reset().await;
+            self.conn.set_infile_handler(async {
+                Err(mysql_async::Error::from(
+                    mysql_async::LocalInfileError::other(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "ferrule: LOAD DATA LOCAL INFILE refused — connection \
+                         state may be tainted after a failed bulk operation. \
+                         Reconnect to re-enable bulk_insert_rows.",
+                    )),
+                ))
+            });
             return Err(my_load_data::classify_load_error(e));
         }
 
