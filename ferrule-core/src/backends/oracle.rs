@@ -405,7 +405,12 @@ fn parse_uuid_hex(s: &str) -> Result<Vec<u8>, String> {
         && trimmed.is_char_boundary(URN_PREFIX.len())
         && trimmed[..URN_PREFIX.len()].eq_ignore_ascii_case(URN_PREFIX)
     {
-        &trimmed[URN_PREFIX.len()..]
+        // Per #42 — tolerate whitespace between the URN prefix and
+        // the hex digits. Real-world sources (JDBC `toString` on
+        // some drivers, hand-pasted examples from RFC docs) often
+        // include `urn:uuid:  550e8400-...`. trim_start matches
+        // every other production UUID parser's leniency.
+        trimmed[URN_PREFIX.len()..].trim_start()
     } else {
         trimmed
     };
@@ -1114,6 +1119,29 @@ mod tests {
         let bytes =
             parse_uuid_hex("  550e8400-e29b-41d4-a716-446655440000\t\n").expect("parse");
         assert_eq!(bytes.len(), 16);
+    }
+
+    #[test]
+    fn parse_uuid_tolerates_whitespace_after_urn_prefix() {
+        // Per #42 — real-world sources (some JDBC drivers, hand-pasted
+        // examples) emit `urn:uuid:  <hex>`. Trim post-prefix
+        // whitespace so these decode to the same bytes as the
+        // canonical form.
+        let canonical =
+            parse_uuid_hex("urn:uuid:550e8400-e29b-41d4-a716-446655440000").expect("canonical");
+        for shape in &[
+            "urn:uuid: 550e8400-e29b-41d4-a716-446655440000",
+            "urn:uuid:  550e8400-e29b-41d4-a716-446655440000",
+            "urn:uuid:\t550e8400-e29b-41d4-a716-446655440000",
+            "urn:uuid: \t 550e8400-e29b-41d4-a716-446655440000",
+            // Mixed-case prefix + post-prefix whitespace.
+            "URN:UUID:  550e8400-e29b-41d4-a716-446655440000",
+            "Urn:Uuid:\t550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            let parsed =
+                parse_uuid_hex(shape).unwrap_or_else(|e| panic!("shape {shape:?}: {e}"));
+            assert_eq!(parsed, canonical, "shape {shape:?} should round-trip");
+        }
     }
 
     #[test]

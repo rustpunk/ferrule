@@ -252,19 +252,20 @@ impl MssqlConnection {
         &mut self,
         table: &str,
     ) -> Result<Vec<String>, CoreError> {
-        // Schema-qualified target (`schema.table`)? Split on the last
-        // dot so embedded dots inside bracketed identifiers don't
-        // confuse the split. ferrule's quote_identifier always emits
-        // ANSI quotes around a single identifier, so by the time we
-        // get here `target.table` is the unquoted form the user gave
-        // — `dbo.test_users`, `test_users`, or rarely `[my schema].[my table]`.
-        let (schema_filter, table_name) = match table.rsplit_once('.') {
-            Some((schema, name)) => (
-                format!(" AND c.TABLE_SCHEMA = '{}'", escape_mssql_string(schema)),
-                name.to_string(),
+        // Resolve the (schema, name) pair from the user's input.
+        // Accepts plain `test_users`, dot-qualified `dbo.test_users`,
+        // T-SQL bracketed `[dbo].[test_users]`, and even brackets
+        // wrapping embedded dots (`[my.weird].[table]`). See #41 for
+        // the regression that motivated bracketed support.
+        let qualified = parse_mssql_qualified_identifier(table);
+        let schema_filter = match &qualified.schema {
+            Some(schema) => format!(
+                " AND c.TABLE_SCHEMA = '{}'",
+                escape_mssql_string(schema)
             ),
-            None => (String::new(), table.to_string()),
+            None => String::new(),
         };
+        let table_name = qualified.name;
         let sql = format!(
             "SELECT c.COLUMN_NAME, \
                     COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS is_identity, \
@@ -310,6 +311,102 @@ fn column_flag_bool(v: &Value) -> bool {
         Value::Bool(b) => *b,
         Value::Int64(n) => *n != 0,
         _ => false,
+    }
+}
+
+/// A T-SQL identifier split into its optional schema and required
+/// name halves. Both halves are *unquoted* — brackets stripped,
+/// `]]` decoded to `]` — and ready to be passed to
+/// `escape_mssql_string` for inclusion in an `INFORMATION_SCHEMA`
+/// lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QualifiedIdentifier {
+    schema: Option<String>,
+    name: String,
+}
+
+/// Parse a target table reference in any of these forms:
+///
+/// - `test_users` — unqualified
+/// - `dbo.test_users` — dot-qualified
+/// - `[dbo].[test_users]` — T-SQL bracketed
+/// - `[my.weird].[table]` — bracketed with embedded dot in the schema
+/// - `dbo.[test_users]` / `[dbo].test_users` — mixed
+///
+/// Surrounding whitespace is trimmed. Within brackets, the T-SQL
+/// escape `]]` decodes to a single `]` (matching `QUOTENAME`
+/// semantics). If the bracket pair is unmatched, the input is
+/// treated as a plain identifier — defensive: producing a "no
+/// columns found" result with a clearer downstream error is better
+/// than panicking here.
+///
+/// See #41 for the regression that motivated bracketed support.
+fn parse_mssql_qualified_identifier(input: &str) -> QualifiedIdentifier {
+    let trimmed = input.trim();
+    let (first, rest) = parse_one_identifier(trimmed);
+    match rest {
+        Some(after_dot) => {
+            // `<first>.<after_dot>` — schema-qualified.
+            let (second, _) = parse_one_identifier(after_dot);
+            QualifiedIdentifier {
+                schema: Some(first),
+                name: second,
+            }
+        }
+        None => QualifiedIdentifier {
+            schema: None,
+            name: first,
+        },
+    }
+}
+
+/// Parse one identifier off the front of `s` and return it along
+/// with the slice after a following `.` separator (or `None` if the
+/// identifier exhausts the input).
+///
+/// Handles `[...]` quoting with `]]` as a literal `]`. Unbracketed
+/// identifiers terminate at the first `.`.
+fn parse_one_identifier(s: &str) -> (String, Option<&str>) {
+    if let Some(after_open) = s.strip_prefix('[') {
+        // Walk bytes looking for the closing `]`, treating `]]` as
+        // an escaped literal `]`. ASCII `]` is a single byte and
+        // can't appear inside a multi-byte UTF-8 codepoint, so a
+        // byte-level scan is safe even on non-ASCII identifiers.
+        let bytes = after_open.as_bytes();
+        let mut i = 0;
+        let mut close = None;
+        while i < bytes.len() {
+            if bytes[i] == b']' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                    i += 2;
+                    continue;
+                }
+                close = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        match close {
+            Some(end) => {
+                let inner = &after_open[..end];
+                let unquoted = inner.replace("]]", "]");
+                let after_close = &after_open[end + 1..];
+                let rest = after_close.strip_prefix('.');
+                (unquoted, rest)
+            }
+            None => {
+                // Unmatched `[` — return the whole input as the
+                // name (without the leading `[`). The downstream
+                // pre-flight lookup will return zero rows and the
+                // alignment check produces a clear diagnostic.
+                (after_open.to_string(), None)
+            }
+        }
+    } else {
+        match s.find('.') {
+            Some(i) => (s[..i].to_string(), Some(&s[i + 1..])),
+            None => (s.to_string(), None),
+        }
     }
 }
 
@@ -880,6 +977,105 @@ mod tests {
         let target = vec![col("a"), col("b")];
         let err = verify_bulk_column_alignment(&dest, &target).expect_err("extra dest cols");
         assert!(matches!(err, CoreError::BulkUnavailable(_)));
+    }
+
+    // -------- #41: parse_mssql_qualified_identifier --------
+
+    fn qual(schema: Option<&str>, name: &str) -> QualifiedIdentifier {
+        QualifiedIdentifier {
+            schema: schema.map(|s| s.to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_qualified_plain_unqualified() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("test_users"),
+            qual(None, "test_users")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_dot_form() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("dbo.test_users"),
+            qual(Some("dbo"), "test_users")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_bracketed_both_halves() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("[dbo].[test_users]"),
+            qual(Some("dbo"), "test_users")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_bracketed_with_embedded_dot() {
+        // The marquee #41 case: a schema name containing a dot is
+        // valid SQL Server only when bracketed. Without bracket
+        // parsing, `rsplit_once('.')` would have produced
+        // `(Some("my.weird"), Some("[table]"))` — both halves bogus.
+        assert_eq!(
+            parse_mssql_qualified_identifier("[my.weird].[table]"),
+            qual(Some("my.weird"), "table")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_mixed_dot_and_brackets() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("dbo.[test users]"),
+            qual(Some("dbo"), "test users")
+        );
+        assert_eq!(
+            parse_mssql_qualified_identifier("[dbo].test_users"),
+            qual(Some("dbo"), "test_users")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_unbracketed_with_space() {
+        // Unbracketed identifiers terminate at the first `.`. This
+        // is unconventional input ("[]"-less but with spaces); we
+        // preserve it rather than rejecting — the downstream
+        // INFORMATION_SCHEMA lookup will simply find no match.
+        assert_eq!(
+            parse_mssql_qualified_identifier("my table"),
+            qual(None, "my table")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_escaped_close_bracket() {
+        // T-SQL escape: `]]` inside `[...]` decodes to a single `]`.
+        // Matches `QUOTENAME` semantics.
+        assert_eq!(
+            parse_mssql_qualified_identifier("[wei]]rd].[table]"),
+            qual(Some("wei]rd"), "table")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_unmatched_bracket_is_defensive() {
+        // Unmatched `[` is malformed; rather than panicking, return
+        // the residual as the name and let the pre-flight lookup
+        // produce its zero-columns diagnostic. The leading `[` is
+        // consumed.
+        assert_eq!(
+            parse_mssql_qualified_identifier("[unfinished"),
+            qual(None, "unfinished")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_trims_surrounding_whitespace() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("  dbo.test_users  "),
+            qual(Some("dbo"), "test_users")
+        );
     }
 
     // -------- C1 caveat fixes: column_flag_bool unit coverage --------
