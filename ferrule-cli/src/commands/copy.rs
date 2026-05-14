@@ -38,7 +38,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
 
     let if_exists = IfExists::parse(&args.if_exists).ok_or_else(|| {
         CliError::usage(format!(
-            "Unknown --if-exists strategy '{}'. Use: error, append, truncate.",
+            "Unknown --if-exists strategy '{}'. Use: error, append, truncate, skip, upsert.",
             args.if_exists
         ))
     })?;

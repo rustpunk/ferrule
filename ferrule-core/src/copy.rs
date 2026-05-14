@@ -28,18 +28,46 @@ pub enum IfExists {
     /// with the first batch in a backend-aware transaction so a transient
     /// failure of the first INSERT cannot leave the target wiped + empty.
     Truncate,
+    /// Insert rows whose primary key does not yet exist on the target;
+    /// silently skip rows whose PK is already present. PG/SQLite use
+    /// `ON CONFLICT (pk) DO NOTHING`, MySQL uses `INSERT IGNORE`,
+    /// MSSQL/Oracle use a `MERGE … WHEN NOT MATCHED` statement.
+    ///
+    /// Requires a declared primary key on the destination table. Tables
+    /// without a PK raise a hard error pointing at the future `--key`
+    /// override (issue #43).
+    Skip,
+    /// Insert rows whose primary key does not yet exist; update all
+    /// non-PK columns when the PK already exists. PG/SQLite use
+    /// `ON CONFLICT (pk) DO UPDATE SET col = EXCLUDED.col`, MySQL
+    /// uses `INSERT … ON DUPLICATE KEY UPDATE col = VALUES(col)`,
+    /// MSSQL/Oracle use a full `MERGE` with both branches.
+    ///
+    /// Requires a declared primary key on the destination table; see
+    /// [`Skip`](Self::Skip) for the no-PK behaviour.
+    Upsert,
 }
 
 impl IfExists {
     /// Parse a strategy name (case-insensitive). Recognised: `error`,
-    /// `append`, `truncate`.
+    /// `append`, `truncate`, `skip`, `upsert`.
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "error" => Some(Self::Error),
             "append" => Some(Self::Append),
             "truncate" => Some(Self::Truncate),
+            "skip" => Some(Self::Skip),
+            "upsert" => Some(Self::Upsert),
             _ => None,
         }
+    }
+
+    /// True for the two PK-driven conflict-resolution strategies.
+    /// Used by `run_copy` to look up the destination PK once up front
+    /// and to force the dispatcher onto the generic INSERT path (the
+    /// native bulk loaders carry no conflict semantics).
+    pub fn resolves_conflicts(self) -> bool {
+        matches!(self, Self::Skip | Self::Upsert)
     }
 }
 
@@ -205,9 +233,42 @@ pub async fn copy_rows(
     {
         return Err(CoreError::QueryFailed(format!(
             "Target table '{target_table}' already contains rows. \
-             Pass --if-exists append, --if-exists truncate, or empty \
-             the table first."
+             Pass --if-exists append, --if-exists truncate, --if-exists skip, \
+             --if-exists upsert, or empty the table first."
         )));
+    }
+
+    // PK resolution for Skip/Upsert. Look up the destination's declared
+    // primary key once; an empty result means the user must supply a
+    // conflict key explicitly via the (still-unimplemented) `--key`
+    // override (issue #43).
+    let pk_columns: Vec<String> = if opts.if_exists.resolves_conflicts() {
+        let pk = dst.primary_key(None, &target_table).await?;
+        if pk.is_empty() {
+            return Err(CoreError::QueryFailed(format!(
+                "Target table '{target_table}' has no declared primary key — \
+                 --if-exists {} requires one. Declare a PK on the destination \
+                 table or wait for --key override (issue #43).",
+                if_exists_name(opts.if_exists)
+            )));
+        }
+        pk
+    } else {
+        Vec::new()
+    };
+
+    // Bulk loaders carry no conflict semantics (PG `COPY` ignores
+    // conflicts, MSSQL bulk has no MERGE, MySQL `LOAD DATA` has its
+    // own IGNORE/REPLACE keywords, Oracle Batch is straight array DML).
+    // When the user opts into Skip or Upsert we force the dispatcher
+    // onto the generic INSERT path so the conflict SQL is actually
+    // emitted. Warn once at the top of the copy rather than per batch.
+    if opts.if_exists.resolves_conflicts() && opts.bulk_mode != BulkMode::Off {
+        eprintln!(
+            "[ferrule] bulk: --if-exists {} requires the generic INSERT path; \
+             ignoring --bulk-native for this copy.",
+            if_exists_name(opts.if_exists)
+        );
     }
 
     // First page from source — establishes the column shape.
@@ -226,6 +287,26 @@ pub async fn copy_rows(
         ));
     }
     let columns: Vec<ColumnInfo> = first_page.columns.clone();
+
+    // Validate that every destination-side PK column is present in the
+    // source column shape. Cross-backend copies can hit case-sensitivity
+    // mismatches here (Oracle returns uppercase names; PG/MySQL return
+    // them as declared) — surface those as an actionable error rather
+    // than letting the conflict SQL fail at execute time with a less
+    // helpful driver message.
+    if !pk_columns.is_empty() {
+        let source_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        for pk in &pk_columns {
+            if !source_names.iter().any(|n| n == pk) {
+                return Err(CoreError::QueryFailed(format!(
+                    "Target PK column '{pk}' is not present in source columns \
+                     {source_names:?}. Cross-backend identifier case mismatches \
+                     can cause this — re-select with explicit aliases (e.g. \
+                     `SELECT id AS \"{pk}\" ...`)."
+                )));
+            }
+        }
+    }
 
     // Translate DDL when creating the target table.
     if !target_exists && opts.create_table {
@@ -252,6 +333,7 @@ pub async fn copy_rows(
         &source_sql,
         &target_table,
         &columns,
+        &pk_columns,
         target_exists,
         first_page.rows,
     )
@@ -309,6 +391,7 @@ async fn run_copy(
     source_sql: &str,
     target_table: &str,
     columns: &[ColumnInfo],
+    pk_columns: &[String],
     target_exists: bool,
     first_rows: Vec<Vec<Value>>,
 ) -> Result<usize, CoreError> {
@@ -340,6 +423,7 @@ async fn run_copy(
         target_exists,
         target_table,
         columns,
+        pk_columns,
         &quoted_table,
         &cols_clause,
         &first_rows,
@@ -389,10 +473,12 @@ async fn run_copy(
                 dst,
                 target_table,
                 columns,
+                pk_columns,
                 &quoted_table,
                 &cols_clause,
                 &page.rows,
                 dst_backend,
+                opts.if_exists,
                 opts.bulk_mode,
                 opts.verbose,
             )
@@ -419,6 +505,7 @@ async fn run_truncate_and_first_batch(
     target_exists: bool,
     target_table: &str,
     columns: &[ColumnInfo],
+    pk_columns: &[String],
     quoted_table: &str,
     cols_clause: &str,
     first_rows: &[Vec<Value>],
@@ -432,10 +519,12 @@ async fn run_truncate_and_first_batch(
             dst,
             target_table,
             columns,
+            pk_columns,
             quoted_table,
             cols_clause,
             first_rows,
             dst_backend,
+            opts.if_exists,
             opts.bulk_mode,
             opts.verbose,
         )
@@ -454,17 +543,24 @@ async fn insert_batch(
     dst: &mut dyn Connection,
     target_table: &str,
     columns: &[ColumnInfo],
+    pk_columns: &[String],
     quoted_table: &str,
     cols_clause: &str,
     rows: &[Vec<Value>],
     dst_backend: Backend,
+    if_exists: IfExists,
     bulk_mode: BulkMode,
     verbose: bool,
 ) -> Result<(), CoreError> {
     if rows.is_empty() {
         return Ok(());
     }
-    if matches!(bulk_mode, BulkMode::Auto | BulkMode::On) {
+    // Conflict-resolution strategies always use the generic path —
+    // the bulk loaders carry no MERGE/ON CONFLICT semantics. The
+    // top-of-copy warning in `copy_rows` already informed the user.
+    let bulk_eligible =
+        matches!(bulk_mode, BulkMode::Auto | BulkMode::On) && !if_exists.resolves_conflicts();
+    if bulk_eligible {
         let target = BulkInsert {
             table: target_table,
             columns,
@@ -501,7 +597,15 @@ async fn insert_batch(
             Err(other) => return Err(other),
         }
     }
-    for sql in build_insert_sql(quoted_table, cols_clause, rows, dst_backend) {
+    for sql in build_insert_sql(
+        quoted_table,
+        cols_clause,
+        rows,
+        dst_backend,
+        columns,
+        if_exists,
+        pk_columns,
+    ) {
         dst.execute(&sql).await?;
     }
     Ok(())
@@ -523,6 +627,9 @@ pub(crate) fn build_insert_sql(
     cols_clause: &str,
     rows: &[Vec<Value>],
     dst_backend: Backend,
+    columns: &[ColumnInfo],
+    if_exists: IfExists,
+    pk_columns: &[String],
 ) -> Vec<String> {
     if rows.is_empty() {
         return Vec::new();
@@ -531,16 +638,44 @@ pub(crate) fn build_insert_sql(
         .unwrap_or(rows.len())
         .max(1);
     rows.chunks(chunk_size)
-        .map(|chunk| build_one_insert(quoted_table, cols_clause, chunk, dst_backend))
+        .map(|chunk| {
+            build_one_insert(
+                quoted_table,
+                cols_clause,
+                chunk,
+                dst_backend,
+                columns,
+                if_exists,
+                pk_columns,
+            )
+        })
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_one_insert(
     quoted_table: &str,
     cols_clause: &str,
     rows: &[Vec<Value>],
     dst_backend: Backend,
+    columns: &[ColumnInfo],
+    if_exists: IfExists,
+    pk_columns: &[String],
 ) -> String {
+    // Conflict-resolution dispatches to a per-backend MERGE / ON
+    // CONFLICT / ODKU shape. Non-conflict paths fall through to the
+    // existing plain INSERT (or INSERT ALL) code below.
+    if if_exists.resolves_conflicts() && !pk_columns.is_empty() {
+        return build_conflict_insert(
+            quoted_table,
+            cols_clause,
+            rows,
+            dst_backend,
+            columns,
+            if_exists,
+            pk_columns,
+        );
+    }
     match dst_backend {
         #[cfg(feature = "oracle")]
         Backend::Oracle => {
@@ -574,6 +709,280 @@ fn build_one_insert(
                 values.join(", ")
             )
         }
+    }
+}
+
+/// Build a single-statement INSERT with backend-specific conflict
+/// resolution: PG/SQLite `ON CONFLICT`, MySQL `INSERT IGNORE` /
+/// `ON DUPLICATE KEY UPDATE`, MSSQL/Oracle `MERGE`.
+///
+/// Pre-conditions enforced by the caller: `pk_columns` is non-empty,
+/// `columns` matches each row's positional shape, and `if_exists` is
+/// one of `Skip` / `Upsert`. The per-statement row cap (MSSQL: 1000;
+/// Oracle: 250) still applies — chunking happens in `build_insert_sql`.
+#[allow(clippy::too_many_arguments)]
+fn build_conflict_insert(
+    quoted_table: &str,
+    cols_clause: &str,
+    rows: &[Vec<Value>],
+    dst_backend: Backend,
+    columns: &[ColumnInfo],
+    if_exists: IfExists,
+    pk_columns: &[String],
+) -> String {
+    // PK columns must be quoted with the destination's identifier
+    // rules — emitted in WHERE / ON / RETURNING positions.
+    let quoted_pks: Vec<String> = pk_columns
+        .iter()
+        .map(|n| quote_identifier(n, dst_backend))
+        .collect();
+    // Non-PK column names, used for the UPDATE SET assignment list.
+    let non_pk_quoted: Vec<String> = columns
+        .iter()
+        .filter(|c| !pk_columns.iter().any(|pk| pk == &c.name))
+        .map(|c| quote_identifier(&c.name, dst_backend))
+        .collect();
+    match dst_backend {
+        #[cfg(feature = "mssql")]
+        Backend::MsSql => build_mssql_merge(
+            quoted_table,
+            cols_clause,
+            rows,
+            columns,
+            if_exists,
+            &quoted_pks,
+            &non_pk_quoted,
+            dst_backend,
+        ),
+        #[cfg(feature = "oracle")]
+        Backend::Oracle => build_oracle_merge(
+            quoted_table,
+            cols_clause,
+            rows,
+            columns,
+            if_exists,
+            &quoted_pks,
+            &non_pk_quoted,
+            dst_backend,
+        ),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => build_mysql_conflict(
+            quoted_table,
+            cols_clause,
+            rows,
+            if_exists,
+            &non_pk_quoted,
+            dst_backend,
+        ),
+        // Postgres + SQLite share ON CONFLICT syntax.
+        _ => build_pg_sqlite_on_conflict(
+            quoted_table,
+            cols_clause,
+            rows,
+            if_exists,
+            &quoted_pks,
+            &non_pk_quoted,
+            dst_backend,
+        ),
+    }
+}
+
+fn build_pg_sqlite_on_conflict(
+    quoted_table: &str,
+    cols_clause: &str,
+    rows: &[Vec<Value>],
+    if_exists: IfExists,
+    quoted_pks: &[String],
+    non_pk_quoted: &[String],
+    dst_backend: Backend,
+) -> String {
+    let values = render_values_vec(rows, dst_backend);
+    let pk_list = quoted_pks.join(", ");
+    let conflict_clause = if if_exists == IfExists::Skip || non_pk_quoted.is_empty() {
+        // Upsert on a PK-only table collapses to DO NOTHING — there
+        // is nothing to update.
+        format!("ON CONFLICT ({pk_list}) DO NOTHING")
+    } else {
+        let assignments: Vec<String> = non_pk_quoted
+            .iter()
+            .map(|c| format!("{c} = EXCLUDED.{c}"))
+            .collect();
+        format!(
+            "ON CONFLICT ({pk_list}) DO UPDATE SET {}",
+            assignments.join(", ")
+        )
+    };
+    format!(
+        "INSERT INTO {quoted_table} ({cols_clause}) VALUES {} {conflict_clause}",
+        values.join(", ")
+    )
+}
+
+#[cfg(feature = "mysql")]
+fn build_mysql_conflict(
+    quoted_table: &str,
+    cols_clause: &str,
+    rows: &[Vec<Value>],
+    if_exists: IfExists,
+    non_pk_quoted: &[String],
+    dst_backend: Backend,
+) -> String {
+    let values = render_values_vec(rows, dst_backend);
+    match if_exists {
+        IfExists::Skip => format!(
+            "INSERT IGNORE INTO {quoted_table} ({cols_clause}) VALUES {}",
+            values.join(", ")
+        ),
+        IfExists::Upsert if !non_pk_quoted.is_empty() => {
+            let assignments: Vec<String> = non_pk_quoted
+                .iter()
+                .map(|c| format!("{c} = VALUES({c})"))
+                .collect();
+            format!(
+                "INSERT INTO {quoted_table} ({cols_clause}) VALUES {} \
+                 ON DUPLICATE KEY UPDATE {}",
+                values.join(", "),
+                assignments.join(", ")
+            )
+        }
+        // Upsert on a PK-only table collapses to INSERT IGNORE.
+        _ => format!(
+            "INSERT IGNORE INTO {quoted_table} ({cols_clause}) VALUES {}",
+            values.join(", ")
+        ),
+    }
+}
+
+#[cfg(feature = "mssql")]
+#[allow(clippy::too_many_arguments)]
+fn build_mssql_merge(
+    quoted_table: &str,
+    cols_clause: &str,
+    rows: &[Vec<Value>],
+    columns: &[ColumnInfo],
+    if_exists: IfExists,
+    quoted_pks: &[String],
+    non_pk_quoted: &[String],
+    dst_backend: Backend,
+) -> String {
+    let source_alias_cols: Vec<String> = columns
+        .iter()
+        .map(|c| quote_identifier(&c.name, dst_backend))
+        .collect();
+    let source_alias_clause = source_alias_cols.join(", ");
+    let values = render_values_vec(rows, dst_backend);
+    let on_clause: Vec<String> = quoted_pks
+        .iter()
+        .map(|pk| format!("dst.{pk} = src.{pk}"))
+        .collect();
+    let insert_values: Vec<String> = source_alias_cols
+        .iter()
+        .map(|c| format!("src.{c}"))
+        .collect();
+    let mut sql = format!(
+        "MERGE INTO {quoted_table} AS dst \
+         USING (VALUES {}) AS src ({source_alias_clause}) \
+         ON {} ",
+        values.join(", "),
+        on_clause.join(" AND "),
+    );
+    if if_exists == IfExists::Upsert && !non_pk_quoted.is_empty() {
+        let assignments: Vec<String> = non_pk_quoted
+            .iter()
+            .map(|c| format!("{c} = src.{c}"))
+            .collect();
+        sql.push_str(&format!(
+            "WHEN MATCHED THEN UPDATE SET {} ",
+            assignments.join(", ")
+        ));
+    }
+    sql.push_str(&format!(
+        "WHEN NOT MATCHED THEN INSERT ({cols_clause}) VALUES ({});",
+        insert_values.join(", ")
+    ));
+    sql
+}
+
+#[cfg(feature = "oracle")]
+#[allow(clippy::too_many_arguments)]
+fn build_oracle_merge(
+    quoted_table: &str,
+    cols_clause: &str,
+    rows: &[Vec<Value>],
+    columns: &[ColumnInfo],
+    if_exists: IfExists,
+    quoted_pks: &[String],
+    non_pk_quoted: &[String],
+    dst_backend: Backend,
+) -> String {
+    let source_alias_cols: Vec<String> = columns
+        .iter()
+        .map(|c| quote_identifier(&c.name, dst_backend))
+        .collect();
+    // Oracle MERGE source clauses use `SELECT ... FROM dual UNION ALL
+    // ...` rather than VALUES — Oracle has no row-constructor.
+    let source_rows: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let cells: Vec<String> = row
+                .iter()
+                .zip(source_alias_cols.iter())
+                .map(|(v, alias)| format!("{} AS {alias}", render_value(v, dst_backend)))
+                .collect();
+            format!("SELECT {} FROM dual", cells.join(", "))
+        })
+        .collect();
+    let on_clause: Vec<String> = quoted_pks
+        .iter()
+        .map(|pk| format!("dst.{pk} = src.{pk}"))
+        .collect();
+    let insert_values: Vec<String> = source_alias_cols
+        .iter()
+        .map(|c| format!("src.{c}"))
+        .collect();
+    let mut sql = format!(
+        "MERGE INTO {quoted_table} dst \
+         USING ({}) src \
+         ON ({}) ",
+        source_rows.join(" UNION ALL "),
+        on_clause.join(" AND "),
+    );
+    if if_exists == IfExists::Upsert && !non_pk_quoted.is_empty() {
+        let assignments: Vec<String> = non_pk_quoted
+            .iter()
+            .map(|c| format!("dst.{c} = src.{c}"))
+            .collect();
+        sql.push_str(&format!(
+            "WHEN MATCHED THEN UPDATE SET {} ",
+            assignments.join(", ")
+        ));
+    }
+    sql.push_str(&format!(
+        "WHEN NOT MATCHED THEN INSERT ({cols_clause}) VALUES ({})",
+        insert_values.join(", ")
+    ));
+    sql
+}
+
+fn render_values_vec(rows: &[Vec<Value>], dst_backend: Backend) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|v| render_value(v, dst_backend))
+                .collect();
+            format!("({})", cells.join(", "))
+        })
+        .collect()
+}
+
+fn if_exists_name(s: IfExists) -> &'static str {
+    match s {
+        IfExists::Error => "error",
+        IfExists::Append => "append",
+        IfExists::Truncate => "truncate",
+        IfExists::Skip => "skip",
+        IfExists::Upsert => "upsert",
     }
 }
 
@@ -788,7 +1197,18 @@ mod tests {
         assert_eq!(IfExists::parse("error"), Some(IfExists::Error));
         assert_eq!(IfExists::parse("APPEND"), Some(IfExists::Append));
         assert_eq!(IfExists::parse("Truncate"), Some(IfExists::Truncate));
-        assert_eq!(IfExists::parse("upsert"), None);
+        assert_eq!(IfExists::parse("skip"), Some(IfExists::Skip));
+        assert_eq!(IfExists::parse("UPSERT"), Some(IfExists::Upsert));
+        assert_eq!(IfExists::parse("merge"), None);
+    }
+
+    #[test]
+    fn if_exists_resolves_conflicts_only_for_skip_and_upsert() {
+        assert!(!IfExists::Error.resolves_conflicts());
+        assert!(!IfExists::Append.resolves_conflicts());
+        assert!(!IfExists::Truncate.resolves_conflicts());
+        assert!(IfExists::Skip.resolves_conflicts());
+        assert!(IfExists::Upsert.resolves_conflicts());
     }
 
     #[test]
@@ -894,17 +1314,45 @@ mod tests {
         vec![Value::Int64(n)]
     }
 
+    /// Single-column `id` schema used by the legacy multi-row INSERT
+    /// tests. Conflict-SQL tests build richer fixtures inline.
+    fn cols_id_only() -> Vec<ColumnInfo> {
+        vec![ColumnInfo {
+            name: "id".to_string(),
+            type_hint: TypeHint::Int64,
+            nullable: false,
+        }]
+    }
+
     #[test]
     fn build_insert_sql_empty_rows_returns_empty() {
-        let out = build_insert_sql("\"t\"", "\"id\"", &[], default_backend_for_test());
+        let cols = cols_id_only();
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\"",
+            &[],
+            default_backend_for_test(),
+            &cols,
+            IfExists::Append,
+            &[],
+        );
         assert!(out.is_empty());
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn build_insert_sql_sqlite_emits_single_multi_row_insert() {
+        let cols = cols_id_only();
         let rows = vec![row_int(1), row_int(2), row_int(3)];
-        let out = build_insert_sql("\"t\"", "\"id\"", &rows, Backend::Sqlite);
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\"",
+            &rows,
+            Backend::Sqlite,
+            &cols,
+            IfExists::Append,
+            &[],
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], "INSERT INTO \"t\" (\"id\") VALUES (1), (2), (3)");
     }
@@ -912,8 +1360,17 @@ mod tests {
     #[cfg(feature = "oracle")]
     #[test]
     fn build_insert_sql_oracle_emits_insert_all_with_select_from_dual() {
+        let cols = cols_id_only();
         let rows = vec![row_int(1), row_int(2), row_int(3)];
-        let out = build_insert_sql("\"t\"", "\"id\"", &rows, Backend::Oracle);
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\"",
+            &rows,
+            Backend::Oracle,
+            &cols,
+            IfExists::Append,
+            &[],
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0],
@@ -928,8 +1385,17 @@ mod tests {
     #[cfg(feature = "mssql")]
     #[test]
     fn build_insert_sql_mssql_splits_above_1000_rows() {
+        let cols = cols_id_only();
         let rows: Vec<Vec<Value>> = (0..2500).map(|i| row_int(i as i64)).collect();
-        let out = build_insert_sql("\"t\"", "\"id\"", &rows, Backend::MsSql);
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\"",
+            &rows,
+            Backend::MsSql,
+            &cols,
+            IfExists::Append,
+            &[],
+        );
         // 2500 rows / 1000 cap = 3 chunks (1000 / 1000 / 500).
         assert_eq!(out.len(), 3);
         // Each chunk should be a single INSERT statement.
@@ -946,8 +1412,17 @@ mod tests {
     #[cfg(feature = "oracle")]
     #[test]
     fn build_insert_sql_oracle_chunks_at_250_rows() {
+        let cols = cols_id_only();
         let rows: Vec<Vec<Value>> = (0..600).map(|i| row_int(i as i64)).collect();
-        let out = build_insert_sql("\"t\"", "\"id\"", &rows, Backend::Oracle);
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\"",
+            &rows,
+            Backend::Oracle,
+            &cols,
+            IfExists::Append,
+            &[],
+        );
         // 600 / 250 = 3 chunks (250 / 250 / 100).
         assert_eq!(out.len(), 3);
         for sql in &out {
@@ -958,6 +1433,268 @@ mod tests {
         assert_eq!(out[0].matches(" INTO ").count(), 250);
         assert_eq!(out[1].matches(" INTO ").count(), 250);
         assert_eq!(out[2].matches(" INTO ").count(), 100);
+    }
+
+    // --- Phase 2 conflict-SQL codegen ----------------------------------
+
+    /// Two-column (id PK, name) row shape used by the conflict tests.
+    fn cols_id_name() -> Vec<ColumnInfo> {
+        vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+        ]
+    }
+
+    fn row_id_name(id: i64, name: &str) -> Vec<Value> {
+        vec![Value::Int64(id), Value::String(name.to_string())]
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn build_insert_sql_pg_skip_emits_on_conflict_do_nothing() {
+        let cols = cols_id_name();
+        let rows = vec![row_id_name(1, "a"), row_id_name(2, "b")];
+        let pk = vec!["id".to_string()];
+        // SQLite shares ON CONFLICT syntax with Postgres; assert on the
+        // common branch using SQLite (default-feature) backend.
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\", \"name\"",
+            &rows,
+            Backend::Sqlite,
+            &cols,
+            IfExists::Skip,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0],
+            "INSERT INTO \"t\" (\"id\", \"name\") VALUES (1, 'a'), (2, 'b') \
+             ON CONFLICT (\"id\") DO NOTHING"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn build_insert_sql_pg_upsert_emits_excluded_assignments() {
+        let cols = cols_id_name();
+        let rows = vec![row_id_name(1, "a"), row_id_name(2, "b")];
+        let pk = vec!["id".to_string()];
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\", \"name\"",
+            &rows,
+            Backend::Sqlite,
+            &cols,
+            IfExists::Upsert,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0],
+            "INSERT INTO \"t\" (\"id\", \"name\") VALUES (1, 'a'), (2, 'b') \
+             ON CONFLICT (\"id\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn build_insert_sql_pg_upsert_pk_only_table_collapses_to_do_nothing() {
+        // A PK-only table (no non-PK columns) has nothing to update;
+        // Upsert collapses to ON CONFLICT DO NOTHING.
+        let cols = vec![ColumnInfo {
+            name: "id".to_string(),
+            type_hint: TypeHint::Int64,
+            nullable: false,
+        }];
+        let rows = vec![row_int(1), row_int(2)];
+        let pk = vec!["id".to_string()];
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\"",
+            &rows,
+            Backend::Sqlite,
+            &cols,
+            IfExists::Upsert,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with("ON CONFLICT (\"id\") DO NOTHING"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn build_insert_sql_pg_upsert_composite_pk_emits_full_pk_list() {
+        let cols = vec![
+            ColumnInfo {
+                name: "a".to_string(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "b".to_string(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "v".to_string(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+        ];
+        let rows = vec![vec![Value::Int64(1), Value::Int64(2), Value::String("x".into())]];
+        let pk = vec!["a".to_string(), "b".to_string()];
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"a\", \"b\", \"v\"",
+            &rows,
+            Backend::Sqlite,
+            &cols,
+            IfExists::Upsert,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("ON CONFLICT (\"a\", \"b\") DO UPDATE SET \"v\" = EXCLUDED.\"v\""));
+        // Crucially: PK columns ('a', 'b') must NOT appear in the SET list.
+        assert!(!out[0].contains("\"a\" = EXCLUDED.\"a\""));
+        assert!(!out[0].contains("\"b\" = EXCLUDED.\"b\""));
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn build_insert_sql_mysql_skip_emits_insert_ignore() {
+        let cols = cols_id_name();
+        let rows = vec![row_id_name(1, "a")];
+        let pk = vec!["id".to_string()];
+        let out = build_insert_sql(
+            "`t`",
+            "`id`, `name`",
+            &rows,
+            Backend::MySql,
+            &cols,
+            IfExists::Skip,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].starts_with("INSERT IGNORE INTO `t`"));
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn build_insert_sql_mysql_upsert_emits_on_duplicate_key_update() {
+        let cols = cols_id_name();
+        let rows = vec![row_id_name(1, "a")];
+        let pk = vec!["id".to_string()];
+        let out = build_insert_sql(
+            "`t`",
+            "`id`, `name`",
+            &rows,
+            Backend::MySql,
+            &cols,
+            IfExists::Upsert,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"));
+    }
+
+    #[cfg(feature = "mssql")]
+    #[test]
+    fn build_insert_sql_mssql_skip_emits_merge_when_not_matched() {
+        let cols = cols_id_name();
+        let rows = vec![row_id_name(1, "a")];
+        let pk = vec!["id".to_string()];
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\", \"name\"",
+            &rows,
+            Backend::MsSql,
+            &cols,
+            IfExists::Skip,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        let sql = &out[0];
+        assert!(sql.starts_with("MERGE INTO \"t\" AS dst USING (VALUES "));
+        assert!(sql.contains("ON dst.\"id\" = src.\"id\""));
+        assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"));
+        // Skip means no UPDATE branch.
+        assert!(!sql.contains("WHEN MATCHED"));
+        assert!(sql.ends_with(';'));
+    }
+
+    #[cfg(feature = "mssql")]
+    #[test]
+    fn build_insert_sql_mssql_upsert_emits_full_merge() {
+        let cols = cols_id_name();
+        let rows = vec![row_id_name(1, "a")];
+        let pk = vec!["id".to_string()];
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\", \"name\"",
+            &rows,
+            Backend::MsSql,
+            &cols,
+            IfExists::Upsert,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        let sql = &out[0];
+        assert!(sql.contains("WHEN MATCHED THEN UPDATE SET \"name\" = src.\"name\""));
+        assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"));
+    }
+
+    #[cfg(feature = "oracle")]
+    #[test]
+    fn build_insert_sql_oracle_skip_emits_merge_with_select_dual_source() {
+        let cols = cols_id_name();
+        let rows = vec![row_id_name(1, "a"), row_id_name(2, "b")];
+        let pk = vec!["id".to_string()];
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\", \"name\"",
+            &rows,
+            Backend::Oracle,
+            &cols,
+            IfExists::Skip,
+            &pk,
+        );
+        assert_eq!(out.len(), 1);
+        let sql = &out[0];
+        assert!(sql.starts_with("MERGE INTO \"t\" dst USING ("));
+        assert!(sql.contains("SELECT 1 AS \"id\", 'a' AS \"name\" FROM dual"));
+        assert!(sql.contains(" UNION ALL "));
+        assert!(sql.contains("ON (dst.\"id\" = src.\"id\")"));
+        assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"));
+        assert!(!sql.contains("WHEN MATCHED"));
+    }
+
+    #[cfg(feature = "oracle")]
+    #[test]
+    fn build_insert_sql_oracle_upsert_includes_update_branch() {
+        let cols = cols_id_name();
+        let rows = vec![row_id_name(1, "a")];
+        let pk = vec!["id".to_string()];
+        let out = build_insert_sql(
+            "\"t\"",
+            "\"id\", \"name\"",
+            &rows,
+            Backend::Oracle,
+            &cols,
+            IfExists::Upsert,
+            &pk,
+        );
+        let sql = &out[0];
+        assert!(sql.contains("WHEN MATCHED THEN UPDATE SET dst.\"name\" = src.\"name\""));
+        assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"));
     }
 
     #[cfg(feature = "sqlite")]
@@ -1403,6 +2140,229 @@ mod tests {
         );
         // Exactly one bulk attempt before the hard error.
         assert_eq!(bulk_calls.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// SQLite end-to-end for `--if-exists skip`: rows whose PK already
+    /// exists are silently dropped; new rows land; existing values on
+    /// conflicting rows are preserved.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_skip_preserves_existing_rows() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-skip-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-skip-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        src.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").await.unwrap();
+        dst.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").await.unwrap();
+        // Destination has id=1 with the "old" value; copy will see
+        // id=1 'new-1' from src and id=2 'src-only' (no dest match).
+        dst.execute("INSERT INTO t VALUES (1, 'kept')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'new-1')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'src-only')").await.unwrap();
+
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            if_exists: IfExists::Skip,
+            ..Default::default()
+        };
+        let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect("copy_rows");
+        // `copied` reports rows passed through the dispatcher, not
+        // rows landed. The destination is the source of truth for
+        // the visible effect.
+        assert_eq!(copied, 2);
+
+        let out = dst.query("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        assert_eq!(out.rows.len(), 2);
+        // id=1 keeps the original 'kept' value (skip), id=2 inserted.
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "kept"));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "src-only"));
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// SQLite end-to-end for `--if-exists upsert`: existing rows are
+    /// overwritten by the source values; new rows are inserted.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_upsert_overwrites_existing_rows() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-up-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-up-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        src.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").await.unwrap();
+        dst.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").await.unwrap();
+        dst.execute("INSERT INTO t VALUES (1, 'old')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'new-1')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'src-only')").await.unwrap();
+
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            if_exists: IfExists::Upsert,
+            ..Default::default()
+        };
+        let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect("copy_rows");
+        assert_eq!(copied, 2);
+
+        let out = dst.query("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        assert_eq!(out.rows.len(), 2);
+        // id=1 overwritten to 'new-1' (upsert), id=2 inserted.
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "src-only"));
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// `--if-exists skip` / `upsert` against a PK-less destination
+    /// must hard-error before the source is touched, pointing at the
+    /// future `--key` override (issue #43).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_skip_without_pk_hard_errors() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-nopk-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-nopk-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        src.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
+        // No PRIMARY KEY — Skip/Upsert can't pick conflict columns.
+        dst.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'a')").await.unwrap();
+
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            if_exists: IfExists::Skip,
+            ..Default::default()
+        };
+        let err = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect_err("expected hard error for no-PK + skip");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no declared primary key"),
+            "error should reference missing PK: {msg}"
+        );
+        assert!(
+            msg.contains("--key") || msg.contains("#43"),
+            "error should point at the future --key override: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// Conflict resolution must force the dispatcher onto the generic
+    /// INSERT path, even under `BulkMode::On` — the bulk loaders
+    /// carry no MERGE / ON CONFLICT semantics.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_upsert_forces_generic_path_even_under_bulk_on() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use dispatcher_harness::{BulkBehaviour, TrackingDst};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-bup-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-bup-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let raw_dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        src.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").await.unwrap();
+        // Seed the destination directly (before wrapping) so we keep
+        // a single TrackingDst handle for the actual copy. The inner
+        // PanicIfCalled wrapper would block bulk attempts during copy
+        // but pass through plain execute()s — but plumbing seed DDL
+        // through it adds noise. Seed via a short-lived second
+        // connection on the same on-disk file instead.
+        let mut seed_dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+        seed_dst.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").await.unwrap();
+        seed_dst.execute("INSERT INTO t VALUES (1, 'old')").await.unwrap();
+        drop(seed_dst);
+        src.execute("INSERT INTO t VALUES (1, 'new-1')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'src-only')").await.unwrap();
+
+        let bulk_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut tracking = TrackingDst {
+            inner: Box::new(raw_dst),
+            bulk_calls: bulk_calls.clone(),
+            behaviour: BulkBehaviour::PanicIfCalled,
+        };
+
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            if_exists: IfExists::Upsert,
+            bulk_mode: BulkMode::On,
+            ..Default::default()
+        };
+        let copied = copy_rows(&mut src, Backend::Sqlite, &mut tracking, Backend::Sqlite, &opts)
+            .await
+            .expect("copy_rows should succeed under forced-generic path");
+        assert_eq!(copied, 2);
+        // PanicIfCalled would have aborted if bulk_insert_rows had
+        // been invoked; assert zero invocations for belt-and-braces.
+        assert_eq!(bulk_calls.load(Ordering::SeqCst), 0);
 
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);

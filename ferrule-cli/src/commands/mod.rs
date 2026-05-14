@@ -297,7 +297,11 @@ pub struct CopyArgs {
     pub create_table: bool,
 
     /// What to do if the target table already contains rows.
-    /// `error` (default, non-destructive), `append`, `truncate`.
+    /// `error` (default, non-destructive), `append`, `truncate`,
+    /// `skip` (PK-driven `ON CONFLICT DO NOTHING` / `INSERT IGNORE` /
+    /// `MERGE … WHEN NOT MATCHED`), or `upsert` (`ON CONFLICT DO UPDATE`
+    /// / `ON DUPLICATE KEY UPDATE` / full `MERGE`). `skip` and
+    /// `upsert` require a declared primary key on the destination.
     #[arg(long, value_name = "STRATEGY", default_value = "error")]
     pub if_exists: String,
 

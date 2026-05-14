@@ -43,11 +43,32 @@ Override the default with `--if-exists <strategy>`:
   requires `--yes` when stdin is a TTY. The DELETE and the first batch
   run inside the same transaction so a transient first-INSERT failure
   cannot leave the target wiped + empty.
+- **`skip`** — INSERT new rows; silently drop rows whose primary key
+  already exists on the destination. Per-backend codegen:
+  - PG / SQLite: `INSERT … ON CONFLICT (pk) DO NOTHING`
+  - MySQL: `INSERT IGNORE INTO …`
+  - MSSQL / Oracle: `MERGE … WHEN NOT MATCHED THEN INSERT`
+- **`upsert`** — INSERT new rows; UPDATE every non-PK column when the
+  primary key already exists. Per-backend codegen:
+  - PG / SQLite: `INSERT … ON CONFLICT (pk) DO UPDATE SET col = EXCLUDED.col, …`
+  - MySQL: `INSERT … ON DUPLICATE KEY UPDATE col = VALUES(col), …`
+  - MSSQL / Oracle: full `MERGE` with both `WHEN MATCHED THEN UPDATE`
+    and `WHEN NOT MATCHED THEN INSERT` branches.
 
-The `skip` (`INSERT … ON CONFLICT DO NOTHING` / `INSERT IGNORE` /
-`MERGE … WHEN NOT MATCHED`) and `upsert` strategies are tracked as a
-backlog enhancement — they require detecting the target's primary key
-per backend.
+`skip` and `upsert` require a declared primary key on the destination
+table. If the destination table has no PK, the copy hard-errors before
+any source SELECT runs, pointing at the future `--key COL[,COL...]`
+override (tracked under issue #43). PK columns are resolved on the
+destination via the per-backend introspection method
+(`Connection::primary_key`); cross-backend copies may need an explicit
+`SELECT col AS "DEST_NAME" …` alias when source and destination disagree
+on identifier case (Oracle uppercases unquoted identifiers).
+
+Conflict resolution always runs through the generic INSERT path: the
+native bulk loaders (`COPY`, `BULK INSERT`, `LOAD DATA`, `Batch`) carry
+no MERGE / ON CONFLICT semantics. Passing `--bulk-native=auto` or
+`--bulk-native=on` alongside `--if-exists skip|upsert` emits a one-line
+stderr notice and silently degrades the bulk path for that copy.
 
 ## Atomicity
 
@@ -170,15 +191,17 @@ fallback, you'll see one stderr line per affected batch:
 
 Use `--verbose` to additionally log one line per successful bulk batch.
 
-## Limits (Phase 1.5)
+## Limits
 
 - **Single-table copy only.** Schema-level copy with FK ordering is
   tracked under #30.
-- **`error` / `append` / `truncate` strategies only.** `skip` and
-  `upsert` are tracked under #29.
+- **Composite-key / unique-index conflict resolution.** `skip` /
+  `upsert` use the destination's declared primary key. A user-supplied
+  `--key COL[,COL...]` override (for PK-less tables and conflicts on
+  unique indexes) is tracked under #43.
 - **Shared connection flags.** `--ssh-tunnel`, `--ssh-key`,
   `--proxy-url`, and `--insecure` apply to *both* source and target
   in this release. Per-side `--src-*` / `--dst-*` flags are tracked
-  as a backlog enhancement.
+  under #44.
 - **No daemon routing for `copy`.** Use direct connections for both
   sides. Tracked under #10.

@@ -1321,4 +1321,95 @@ mod tests {
             .await
             .expect("DROP TABLE");
     }
+
+    /// End-to-end `--if-exists skip` then `upsert` round-trip against
+    /// Postgres. Single container, two pooled connections, two unique
+    /// per-pid tables.
+    #[tokio::test]
+    async fn test_postgres_copy_skip_then_upsert() {
+        use crate::backend::Backend;
+        use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+
+        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_copy_skip_then_upsert"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let src_table = format!("ferrule_pg_skip_src_{pid}");
+        let dst_table = format!("ferrule_pg_skip_dst_{pid}");
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}")).await;
+        src.execute(&format!(
+            "CREATE TABLE {src_table} (id INT PRIMARY KEY, name TEXT, val INT)"
+        ))
+        .await
+        .expect("CREATE src");
+        dst.execute(&format!(
+            "CREATE TABLE {dst_table} (id INT PRIMARY KEY, name TEXT, val INT)"
+        ))
+        .await
+        .expect("CREATE dst");
+        src.execute(&format!(
+            "INSERT INTO {src_table} VALUES (1, 'new-1', 10), (2, 'new-2', 20)"
+        ))
+        .await
+        .expect("seed src");
+        dst.execute(&format!("INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"))
+            .await
+            .expect("seed dst");
+
+        // --- Skip: id=1 preserved as 'old-1' / 99; id=2 inserted. ----------
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY id"),
+                into: dst_table.clone(),
+            },
+            if_exists: IfExists::Skip,
+            ..Default::default()
+        };
+        copy_rows(&mut src, Backend::Postgres, &mut dst, Backend::Postgres, &opts)
+            .await
+            .expect("copy_rows skip");
+
+        let out = dst
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
+            .await
+            .expect("verify skip");
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "old-1"));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
+
+        // --- Upsert: id=1 overwritten to 'new-1' / 10; id=2 unchanged. -----
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY id"),
+                into: dst_table.clone(),
+            },
+            if_exists: IfExists::Upsert,
+            ..Default::default()
+        };
+        copy_rows(&mut src, Backend::Postgres, &mut dst, Backend::Postgres, &opts)
+            .await
+            .expect("copy_rows upsert");
+
+        let out = dst
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
+            .await
+            .expect("verify upsert");
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
+        assert!(matches!(&out.rows[0][2], Value::Int64(10)));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
+
+        // Cleanup.
+        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+    }
 }

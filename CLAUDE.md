@@ -576,8 +576,42 @@ ferrule copy \
   --query "SELECT id, name FROM test_users WHERE active = true" \
   --into active_users --create-table
 
+# --if-exists skip: leave existing rows untouched, insert only new PKs.
+# Bump 'Alice' age in the source first to verify Skip doesn't overwrite.
+ferrule query \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "UPDATE test_users SET age = 999 WHERE name = 'Alice'"
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-smoke.db" \
+  --table test_users --if-exists skip
+ferrule query "sqlite:///tmp/ferrule-copy-smoke.db" \
+  "SELECT name, age FROM test_users WHERE name = 'Alice'"
+# → age stays at the value already present in the destination (Skip).
+
+# --if-exists upsert: overwrite non-PK columns when the PK already exists.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-smoke.db" \
+  --table test_users --if-exists upsert
+ferrule query "sqlite:///tmp/ferrule-copy-smoke.db" \
+  "SELECT name, age FROM test_users WHERE name = 'Alice'"
+# → age is now 999 (Upsert overwrites).
+
+# Restore the seeded value so subsequent smoke runs aren't surprising.
+ferrule query \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "UPDATE test_users SET age = 30 WHERE name = 'Alice'"
+
 rm /tmp/ferrule-copy-smoke.db
 ```
+
+Skip/Upsert require a declared PK on the destination — `test_users.id`
+in the seeded fixtures. Tables without a PK hard-error before the
+source SELECT runs, with a hint at the future `--key` override (#43).
+`--bulk-native auto|on` combined with `--if-exists skip|upsert` is
+silently ignored (the bulk loaders carry no MERGE semantics); ferrule
+prints one stderr line and uses the generic INSERT path.
 
 Bulk-native paths (`--bulk-native auto|on`) require a destination
 backend with a real bulk loader — see `docs/src/copy.md` for the

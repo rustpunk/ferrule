@@ -1579,4 +1579,110 @@ mod tests {
 
         let _ = conn.execute(&format!("DROP TABLE {child}")).await;
     }
+
+    /// End-to-end `--if-exists skip` then `upsert` round-trip against
+    /// Oracle. Exercises the `MERGE … USING (SELECT … FROM dual UNION ALL …)`
+    /// codegen (Skip = WHEN NOT MATCHED only; Upsert = full MERGE).
+    #[tokio::test]
+    async fn test_oracle_copy_skip_then_upsert() {
+        use crate::backend::Backend;
+        use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+
+        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+            eprintln!(
+                "Oracle test container not available, skipping test_oracle_copy_skip_then_upsert"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let src_table = format!("ferrule_or_skip_src_{pid}");
+        let dst_table = format!("ferrule_or_skip_dst_{pid}");
+        // Oracle has no `DROP TABLE IF EXISTS`; best-effort drop then ignore.
+        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+        src.execute(&format!(
+            "CREATE TABLE {src_table} (id NUMBER PRIMARY KEY, name VARCHAR2(64), val NUMBER)"
+        ))
+        .await
+        .expect("CREATE src");
+        dst.execute(&format!(
+            "CREATE TABLE {dst_table} (id NUMBER PRIMARY KEY, name VARCHAR2(64), val NUMBER)"
+        ))
+        .await
+        .expect("CREATE dst");
+        src.execute(&format!(
+            "INSERT INTO {src_table} VALUES (1, 'new-1', 10)"
+        ))
+        .await
+        .expect("seed src 1");
+        src.execute(&format!(
+            "INSERT INTO {src_table} VALUES (2, 'new-2', 20)"
+        ))
+        .await
+        .expect("seed src 2");
+        dst.execute(&format!(
+            "INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"
+        ))
+        .await
+        .expect("seed dst");
+        // Oracle has no autocommit on `execute`; flush both connections.
+        src.execute("COMMIT").await.expect("commit src");
+        dst.execute("COMMIT").await.expect("commit dst");
+
+        // --- Skip ---------------------------------------------------------
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY id"),
+                into: dst_table.clone(),
+            },
+            if_exists: IfExists::Skip,
+            ..Default::default()
+        };
+        copy_rows(&mut src, Backend::Oracle, &mut dst, Backend::Oracle, &opts)
+            .await
+            .expect("copy_rows skip");
+
+        let out = dst
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
+            .await
+            .expect("verify skip");
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "old-1"));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
+
+        // --- Upsert -------------------------------------------------------
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY id"),
+                into: dst_table.clone(),
+            },
+            if_exists: IfExists::Upsert,
+            ..Default::default()
+        };
+        copy_rows(&mut src, Backend::Oracle, &mut dst, Backend::Oracle, &opts)
+            .await
+            .expect("copy_rows upsert");
+
+        let out = dst
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
+            .await
+            .expect("verify upsert");
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
+        // val column for id=1 should now be 10 (was 99).
+        match &out.rows[0][2] {
+            Value::Int64(n) => assert_eq!(*n, 10),
+            Value::Decimal(d) => assert_eq!(d, "10"),
+            other => panic!("unexpected val type: {other:?}"),
+        }
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
+
+        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+    }
 }
