@@ -23,8 +23,12 @@ mod backends;
 #[cfg(feature = "ssh")]
 pub use backend::connect_with_tunnel;
 pub use backend::{connect, Backend};
-pub use connection::{ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult};
-pub use copy::{copy_rows, translate_ddl, translate_type, CopyOptions, CopySource, IfExists};
+pub use connection::{
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+};
+pub use copy::{
+    copy_rows, translate_ddl, translate_type, BulkMode, CopyOptions, CopySource, IfExists,
+};
 pub use dump::{dump_query, dump_table, DumpFormat, DumpOptions};
 pub use error::CoreError;
 pub use explain::{explain_sql, is_modifying, ExplainOutput};

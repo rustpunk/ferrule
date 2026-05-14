@@ -3,7 +3,7 @@ use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::Backend;
 use ferrule_core::connection::ConnectOptions;
-use ferrule_core::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+use ferrule_core::copy::{copy_rows, BulkMode, CopyOptions, CopySource, IfExists};
 use is_terminal::IsTerminal;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -35,6 +35,13 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
         CliError::usage(format!(
             "Unknown --if-exists strategy '{}'. Use: error, append, truncate.",
             args.if_exists
+        ))
+    })?;
+
+    let bulk_mode = BulkMode::parse(&args.bulk_native).ok_or_else(|| {
+        CliError::usage(format!(
+            "Unknown --bulk-native mode '{}'. Use: off, auto, on.",
+            args.bulk_native
         ))
     })?;
 
@@ -123,6 +130,8 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
         if_exists,
         atomic: args.atomic,
         batch_size: args.batch,
+        bulk_mode,
+        verbose: args.output.verbose,
         progress,
     };
 

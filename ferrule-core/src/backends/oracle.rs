@@ -1,5 +1,5 @@
 use crate::connection::{
-    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -151,6 +151,19 @@ impl Connection for OracleConnection {
             ),
         };
         self.query(&sql).await
+    }
+
+    async fn bulk_insert_rows(
+        &mut self,
+        _target: BulkInsert<'_>,
+    ) -> Result<usize, CoreError> {
+        // Phase 5 will implement `oracle::Batch` array DML. Until
+        // then, the dispatcher in copy.rs degrades to the generic
+        // INSERT path (which already uses the Oracle-specific
+        // `INSERT ALL ... SELECT 1 FROM DUAL` form).
+        Err(CoreError::BulkUnavailable(
+            "Oracle bulk path not yet implemented (Phase 5)".into(),
+        ))
     }
 }
 

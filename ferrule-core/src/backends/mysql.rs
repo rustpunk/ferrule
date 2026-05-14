@@ -1,5 +1,5 @@
 use crate::connection::{
-    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -200,6 +200,18 @@ impl Connection for MySqlConnection {
             escape_mysql_string(table)
         );
         self.query(&sql).await
+    }
+
+    async fn bulk_insert_rows(
+        &mut self,
+        _target: BulkInsert<'_>,
+    ) -> Result<usize, CoreError> {
+        // Phase 4 will implement `LOAD DATA LOCAL INFILE` against a
+        // sentinel filename handler. Until then, the dispatcher in
+        // copy.rs degrades to the generic INSERT path.
+        Err(CoreError::BulkUnavailable(
+            "MySQL bulk path not yet implemented (Phase 4)".into(),
+        ))
     }
 }
 

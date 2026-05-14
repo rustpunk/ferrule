@@ -231,6 +231,13 @@ impl crate::Connection for ProxiedConnection {
     ) -> Result<crate::QueryResult, crate::CoreError> {
         self.inner.describe_table(schema, table).await
     }
+
+    async fn bulk_insert_rows(
+        &mut self,
+        target: crate::connection::BulkInsert<'_>,
+    ) -> Result<usize, crate::CoreError> {
+        self.inner.bulk_insert_rows(target).await
+    }
 }
 
 #[cfg(test)]

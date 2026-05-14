@@ -1,5 +1,5 @@
 use crate::connection::{
-    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -238,6 +238,18 @@ impl Connection for PostgresConnection {
             columns,
             rows: data_rows,
         })
+    }
+
+    async fn bulk_insert_rows(
+        &mut self,
+        _target: BulkInsert<'_>,
+    ) -> Result<usize, CoreError> {
+        // Phase 2 will implement `COPY ... FROM STDIN WITH (FORMAT TEXT)`
+        // here via `tokio_postgres::Client::copy_in`. Until then, the
+        // dispatcher in copy.rs degrades to the generic INSERT path.
+        Err(CoreError::BulkUnavailable(
+            "Postgres bulk path not yet implemented (Phase 2)".into(),
+        ))
     }
 }
 

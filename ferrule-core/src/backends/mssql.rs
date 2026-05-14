@@ -1,5 +1,5 @@
 use crate::connection::{
-    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -171,6 +171,18 @@ impl Connection for MssqlConnection {
             escape_mssql_string(table)
         );
         self.query(&sql).await
+    }
+
+    async fn bulk_insert_rows(
+        &mut self,
+        _target: BulkInsert<'_>,
+    ) -> Result<usize, CoreError> {
+        // Phase 3 will implement `Client::bulk_insert` (tiberius's
+        // BulkLoadRequest). Until then, the dispatcher in copy.rs
+        // degrades to the generic INSERT path.
+        Err(CoreError::BulkUnavailable(
+            "MSSQL bulk path not yet implemented (Phase 3)".into(),
+        ))
     }
 }
 

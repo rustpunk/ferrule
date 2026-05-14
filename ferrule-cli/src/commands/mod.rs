@@ -286,6 +286,17 @@ pub struct CopyArgs {
     #[arg(long, value_name = "N", default_value_t = 1000)]
     pub batch: usize,
 
+    /// Route INSERT batches through the destination backend's native
+    /// bulk loader (Postgres `COPY`, MSSQL bulk, MySQL `LOAD DATA`,
+    /// Oracle array DML).
+    ///
+    /// `off` (default) uses the portable INSERT path.  `auto` uses
+    /// the bulk path when available and falls back to INSERT on
+    /// `BulkUnavailable`.  `on` requires the bulk path and errors if
+    /// the backend is not yet implemented.
+    #[arg(long, value_name = "MODE", default_value = "off")]
+    pub bulk_native: String,
+
     /// Password for the source connection (overrides credential stack).
     #[arg(long = "password-src")]
     pub password_src: Option<String>,

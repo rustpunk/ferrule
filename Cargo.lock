@@ -1814,9 +1814,12 @@ dependencies = [
 name = "hasp-core"
 version = "0.1.0-alpha"
 dependencies = [
+ "libc",
  "secrecy",
+ "subtle",
  "thiserror 1.0.69",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

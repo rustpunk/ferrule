@@ -30,6 +30,18 @@ pub enum StatementResult {
     Summary(ExecutionSummary),
 }
 
+/// Payload for [`Connection::bulk_insert_rows`].
+///
+/// `table` is unquoted — each backend is responsible for quoting it
+/// for its own dialect. `columns` is the destination column order;
+/// each row in `rows` must have the same length and match positionally.
+#[derive(Debug)]
+pub struct BulkInsert<'a> {
+    pub table: &'a str,
+    pub columns: &'a [ColumnInfo],
+    pub rows: &'a [Row],
+}
+
 /// Trait implemented by every backend connection.
 #[async_trait]
 pub trait Connection: Send {
@@ -67,4 +79,21 @@ pub trait Connection: Send {
         schema: Option<&str>,
         table: &str,
     ) -> Result<QueryResult, CoreError>;
+
+    /// Insert `target.rows` into `target.table` using the backend's
+    /// native bulk loader (Postgres `COPY FROM STDIN`, MSSQL
+    /// `BulkLoadRequest`, MySQL `LOAD DATA LOCAL INFILE`, Oracle
+    /// `oracle::Batch`). Returns the number of rows accepted.
+    ///
+    /// Backends that have no native bulk loader (SQLite, and the
+    /// proxy / tunnel wrappers in their current shape) must return
+    /// [`CoreError::BulkUnavailable`] so the caller can route the
+    /// batch through the generic INSERT path. Treat this method as
+    /// required — forgetting to implement it on a new backend or
+    /// wrapper is a bug we want to catch at compile time, not at
+    /// runtime in the "just slow" form.
+    async fn bulk_insert_rows(
+        &mut self,
+        target: BulkInsert<'_>,
+    ) -> Result<usize, CoreError>;
 }

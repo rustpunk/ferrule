@@ -8,7 +8,7 @@
 //! [`IfExists`].
 
 use crate::backend::Backend;
-use crate::connection::Connection;
+use crate::connection::{BulkInsert, Connection};
 use crate::error::CoreError;
 use crate::params::render_value;
 use crate::value::{ColumnInfo, TypeHint, Value};
@@ -38,6 +38,45 @@ impl IfExists {
             "error" => Some(Self::Error),
             "append" => Some(Self::Append),
             "truncate" => Some(Self::Truncate),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `copy_rows` should route INSERT batches through the
+/// backend's native bulk loader.
+///
+/// The default is [`Off`] so v1 behaviour is identical to the
+/// Phase 1 generic-INSERT path. Flipping to [`Auto`] is tracked as
+/// a separate follow-up.
+///
+/// [`Off`]: BulkMode::Off
+/// [`Auto`]: BulkMode::Auto
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BulkMode {
+    /// Never use the bulk path. Every batch goes through the generic
+    /// `INSERT INTO ... VALUES (..), (..)` (or backend equivalent).
+    #[default]
+    Off,
+    /// Try the bulk path; on [`CoreError::BulkUnavailable`] emit one
+    /// stderr warning and fall back to the generic path for the
+    /// current batch. Any other error surfaces immediately —
+    /// degrading on, e.g., a FK violation would risk double-inserts.
+    Auto,
+    /// Require the bulk path. If a backend returns
+    /// [`CoreError::BulkUnavailable`], `copy_rows` fails with a
+    /// usage-style error instead of falling back.
+    On,
+}
+
+impl BulkMode {
+    /// Parse a mode name (case-insensitive). Recognised: `off`,
+    /// `auto`, `on`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
             _ => None,
         }
     }
@@ -83,6 +122,15 @@ pub struct CopyOptions {
     pub atomic: bool,
     /// How many rows per source-side page / target-side INSERT batch.
     pub batch_size: usize,
+    /// Whether to route batches through the destination backend's
+    /// native bulk loader. Default [`BulkMode::Off`] preserves
+    /// Phase 1 behaviour.
+    pub bulk_mode: BulkMode,
+    /// Whether `copy_rows` should emit per-event diagnostics on
+    /// stderr (currently: a one-line "using native path" notice when
+    /// the bulk path is selected, plus the standard fallback warning
+    /// in [`BulkMode::Auto`]). Mirrors the CLI `--verbose` flag.
+    pub verbose: bool,
     /// Optional progress callback invoked after each batch with the
     /// running row count.
     pub progress: Option<Box<dyn Fn(usize) + Send>>,
@@ -96,6 +144,8 @@ impl Default for CopyOptions {
             if_exists: IfExists::Error,
             atomic: false,
             batch_size: 1000,
+            bulk_mode: BulkMode::Off,
+            verbose: false,
             progress: None,
         }
     }
@@ -109,6 +159,8 @@ impl std::fmt::Debug for CopyOptions {
             .field("if_exists", &self.if_exists)
             .field("atomic", &self.atomic)
             .field("batch_size", &self.batch_size)
+            .field("bulk_mode", &self.bulk_mode)
+            .field("verbose", &self.verbose)
             .field("progress", &self.progress.is_some())
             .finish()
     }
@@ -260,6 +312,8 @@ async fn run_copy(
         dst_backend,
         opts,
         target_exists,
+        target_table,
+        columns,
         &quoted_table,
         &cols_clause,
         &first_rows,
@@ -305,7 +359,18 @@ async fn run_copy(
                 break;
             }
             let fetched = page.rows.len();
-            insert_batch(dst, &quoted_table, &cols_clause, &page.rows, dst_backend).await?;
+            insert_batch(
+                dst,
+                target_table,
+                columns,
+                &quoted_table,
+                &cols_clause,
+                &page.rows,
+                dst_backend,
+                opts.bulk_mode,
+                opts.verbose,
+            )
+            .await?;
             total += fetched;
             offset += fetched;
             if let Some(cb) = &opts.progress {
@@ -320,11 +385,14 @@ async fn run_copy(
     Ok(total)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_truncate_and_first_batch(
     dst: &mut dyn Connection,
     dst_backend: Backend,
     opts: &CopyOptions,
     target_exists: bool,
+    target_table: &str,
+    columns: &[ColumnInfo],
     quoted_table: &str,
     cols_clause: &str,
     first_rows: &[Vec<Value>],
@@ -334,18 +402,79 @@ async fn run_truncate_and_first_batch(
         dst.execute(&sql).await?;
     }
     if !first_rows.is_empty() {
-        insert_batch(dst, quoted_table, cols_clause, first_rows, dst_backend).await?;
+        insert_batch(
+            dst,
+            target_table,
+            columns,
+            quoted_table,
+            cols_clause,
+            first_rows,
+            dst_backend,
+            opts.bulk_mode,
+            opts.verbose,
+        )
+        .await?;
     }
     Ok(first_rows.len())
 }
 
+/// Insert `rows` into the destination, choosing between the
+/// backend's native bulk loader and the generic INSERT path per
+/// `bulk_mode`. The dispatcher is shared by the truncate prologue
+/// (first batch) and the streaming loop, so a single copy never
+/// mixes the two paths within one run.
+#[allow(clippy::too_many_arguments)]
 async fn insert_batch(
     dst: &mut dyn Connection,
+    target_table: &str,
+    columns: &[ColumnInfo],
     quoted_table: &str,
     cols_clause: &str,
     rows: &[Vec<Value>],
     dst_backend: Backend,
+    bulk_mode: BulkMode,
+    verbose: bool,
 ) -> Result<(), CoreError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if matches!(bulk_mode, BulkMode::Auto | BulkMode::On) {
+        let target = BulkInsert {
+            table: target_table,
+            columns,
+            rows,
+        };
+        match dst.bulk_insert_rows(target).await {
+            Ok(_) => {
+                if verbose {
+                    eprintln!(
+                        "[ferrule] bulk: inserted {} rows via {} native path",
+                        rows.len(),
+                        dst_backend.name()
+                    );
+                }
+                return Ok(());
+            }
+            Err(CoreError::BulkUnavailable(reason)) => {
+                if bulk_mode == BulkMode::On {
+                    return Err(CoreError::QueryFailed(format!(
+                        "--bulk-native=on but {} bulk path unavailable: {reason}. \
+                         Re-run with --bulk-native=auto to fall back to generic INSERT, \
+                         or --bulk-native=off to disable bulk entirely.",
+                        dst_backend.name()
+                    )));
+                }
+                // Auto: warn once per batch, then fall through. Per-batch
+                // is intentional — multi-batch copies on the same broken
+                // path would otherwise silently lose context.
+                eprintln!(
+                    "[ferrule] bulk: {} path unavailable: {reason}; using generic INSERT",
+                    dst_backend.name()
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    }
     for sql in build_insert_sql(quoted_table, cols_clause, rows, dst_backend) {
         dst.execute(&sql).await?;
     }
@@ -641,6 +770,19 @@ mod tests {
         assert_eq!(IfExists::default(), IfExists::Error);
     }
 
+    #[test]
+    fn bulk_mode_parse_recognises_modes() {
+        assert_eq!(BulkMode::parse("off"), Some(BulkMode::Off));
+        assert_eq!(BulkMode::parse("Auto"), Some(BulkMode::Auto));
+        assert_eq!(BulkMode::parse("ON"), Some(BulkMode::On));
+        assert_eq!(BulkMode::parse("native"), None);
+    }
+
+    #[test]
+    fn bulk_mode_default_is_off() {
+        assert_eq!(BulkMode::default(), BulkMode::Off);
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     fn quote_identifier_sqlite_uses_ansi_quotes() {
@@ -840,6 +982,8 @@ mod tests {
             if_exists: IfExists::Error,
             atomic: false,
             batch_size: 2,
+            bulk_mode: BulkMode::Off,
+            verbose: false,
             progress: None,
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
@@ -991,6 +1135,235 @@ mod tests {
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "Alice"));
         assert!(matches!(&out.rows[1][1], Value::String(s) if s == "Carol"));
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// Dispatcher harness: wraps a real [`Connection`] but intercepts
+    /// `bulk_insert_rows` so individual tests can observe how the
+    /// `copy_rows` dispatcher routes batches per [`BulkMode`].
+    #[cfg(feature = "sqlite")]
+    mod dispatcher_harness {
+        use crate::connection::{
+            BulkInsert, Connection, ExecutionSummary, QueryResult, StatementResult,
+        };
+        use crate::error::CoreError;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// What `bulk_insert_rows` should do on the destination wrapper.
+        pub enum BulkBehaviour {
+            /// Test asserts the bulk path is never invoked.
+            PanicIfCalled,
+            /// Always return `BulkUnavailable`.
+            AlwaysUnavailable,
+        }
+
+        pub struct TrackingDst {
+            pub inner: Box<dyn Connection>,
+            pub bulk_calls: Arc<AtomicUsize>,
+            pub behaviour: BulkBehaviour,
+        }
+
+        #[async_trait]
+        impl Connection for TrackingDst {
+            async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError> {
+                self.inner.execute(sql).await
+            }
+            async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError> {
+                self.inner.query(sql).await
+            }
+            async fn execute_multi(
+                &mut self,
+                sql: &str,
+            ) -> Result<Vec<StatementResult>, CoreError> {
+                self.inner.execute_multi(sql).await
+            }
+            async fn ping(&mut self) -> Result<(), CoreError> {
+                self.inner.ping().await
+            }
+            async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError> {
+                self.inner.list_tables(schema).await
+            }
+            async fn describe_table(
+                &mut self,
+                schema: Option<&str>,
+                table: &str,
+            ) -> Result<QueryResult, CoreError> {
+                self.inner.describe_table(schema, table).await
+            }
+            async fn bulk_insert_rows(
+                &mut self,
+                _target: BulkInsert<'_>,
+            ) -> Result<usize, CoreError> {
+                self.bulk_calls.fetch_add(1, Ordering::SeqCst);
+                match self.behaviour {
+                    BulkBehaviour::PanicIfCalled => {
+                        panic!("bulk_insert_rows was invoked under BulkMode::Off");
+                    }
+                    BulkBehaviour::AlwaysUnavailable => Err(CoreError::BulkUnavailable(
+                        "test wrapper: bulk path forced unavailable".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn seed_pair_for_dispatcher_test(
+        tag: &str,
+    ) -> (
+        Box<dyn crate::connection::Connection>,
+        Box<dyn crate::connection::Connection>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir()
+            .join(format!("ferrule-copy-test-{pid}-{n_a}-{tag}-src.db"));
+        let path_b = std::env::temp_dir()
+            .join(format!("ferrule-copy-test-{pid}-{n_b}-{tag}-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        src.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'a')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'b')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (3, 'c')").await.unwrap();
+
+        (Box::new(src), Box::new(dst), path_a, path_b)
+    }
+
+    /// Off mode must never call the destination's bulk path. The
+    /// wrapper panics if it does.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn dispatcher_off_never_invokes_bulk_path() {
+        use dispatcher_harness::{BulkBehaviour, TrackingDst};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (src, dst_inner, path_a, path_b) =
+            seed_pair_for_dispatcher_test("off").await;
+        let bulk_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut src = src;
+        let mut dst = TrackingDst {
+            inner: dst_inner,
+            bulk_calls: bulk_calls.clone(),
+            behaviour: BulkBehaviour::PanicIfCalled,
+        };
+
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            create_table: true,
+            bulk_mode: BulkMode::Off,
+            ..Default::default()
+        };
+        let copied =
+            copy_rows(src.as_mut(), Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+                .await
+                .expect("copy_rows");
+        assert_eq!(copied, 3);
+        assert_eq!(bulk_calls.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// Auto mode tries the bulk path; on BulkUnavailable it falls
+    /// back per batch and the rows still land via INSERT.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn dispatcher_auto_falls_back_on_bulk_unavailable() {
+        use dispatcher_harness::{BulkBehaviour, TrackingDst};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (src, dst_inner, path_a, path_b) =
+            seed_pair_for_dispatcher_test("auto").await;
+        let bulk_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut src = src;
+        let mut dst = TrackingDst {
+            inner: dst_inner,
+            bulk_calls: bulk_calls.clone(),
+            behaviour: BulkBehaviour::AlwaysUnavailable,
+        };
+
+        // batch_size=2 against 3 source rows means: 1 prologue
+        // (2 rows) + 1 streaming batch (1 row) = 2 dispatcher calls.
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            create_table: true,
+            batch_size: 2,
+            bulk_mode: BulkMode::Auto,
+            ..Default::default()
+        };
+        let copied =
+            copy_rows(src.as_mut(), Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+                .await
+                .expect("copy_rows");
+        assert_eq!(copied, 3);
+        // Both batches attempted the bulk path before falling back.
+        assert_eq!(bulk_calls.load(Ordering::SeqCst), 2);
+        // Rows landed via the generic INSERT path.
+        let out = dst
+            .inner
+            .query("SELECT id, name FROM t ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(out.rows.len(), 3);
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// On mode does not fall back: BulkUnavailable becomes a hard
+    /// error with `--bulk-native` mentioned in the message.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn dispatcher_on_errors_when_bulk_unavailable() {
+        use dispatcher_harness::{BulkBehaviour, TrackingDst};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (src, dst_inner, path_a, path_b) =
+            seed_pair_for_dispatcher_test("on").await;
+        let bulk_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut src = src;
+        let mut dst = TrackingDst {
+            inner: dst_inner,
+            bulk_calls: bulk_calls.clone(),
+            behaviour: BulkBehaviour::AlwaysUnavailable,
+        };
+
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            create_table: true,
+            bulk_mode: BulkMode::On,
+            ..Default::default()
+        };
+        let result =
+            copy_rows(src.as_mut(), Backend::Sqlite, &mut dst, Backend::Sqlite, &opts).await;
+        let err = result.expect_err("copy should fail when bulk path unavailable in On mode");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--bulk-native"),
+            "error should mention --bulk-native: {msg}"
+        );
+        // Exactly one bulk attempt before the hard error.
+        assert_eq!(bulk_calls.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);
