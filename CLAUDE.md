@@ -110,8 +110,22 @@ CREATE TABLE test_users (
 INSERT INTO test_users (name, age, score, active, meta) VALUES
   ('Alice', 30, 99.5,  TRUE,  '{"role": "admin"}'),
   ('Bob',   25, 88.25, FALSE, '{"role": "user"}');
+CREATE TABLE test_orders (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT,
+  total DECIMAL(10,2),
+  FOREIGN KEY (user_id) REFERENCES test_users(id) ON DELETE CASCADE
+);
+INSERT INTO test_orders (user_id, total) VALUES
+  (1, 19.99), (1, 4.50), (2, 12.00);
 SQL
 ```
+
+`test_orders` adds a child table with an ON DELETE CASCADE FK back to
+`test_users`. The Phase-1 introspection tests
+(`Connection::primary_key` / `list_foreign_keys`) and the Phase-3
+multi-table copy fixtures (`ferrule copy --all-tables`) both rely on
+this edge to exercise FK ordering.
 
 Smoke commands (mirrors the Postgres section):
 
@@ -162,8 +176,21 @@ CREATE TABLE test_users (
 INSERT INTO test_users (name, age, score, active, meta)
   VALUES ('Alice', 30, 99.5, true, '{\"role\": \"admin\"}'),
          ('Bob', 25, 88.25, false, '{\"role\": \"user\"}');
+CREATE TABLE test_orders (
+  id SERIAL PRIMARY KEY,
+  user_id INT REFERENCES test_users(id) ON DELETE CASCADE,
+  total NUMERIC(10,2)
+);
+INSERT INTO test_orders (user_id, total) VALUES
+  (1, 19.99), (1, 4.50), (2, 12.00);
 "
 ```
+
+`test_orders` adds a child table with an `ON DELETE CASCADE` FK back
+to `test_users`. The Phase-1 introspection tests
+(`Connection::primary_key` / `list_foreign_keys`) and the Phase-3
+multi-table copy fixtures (`ferrule copy --all-tables`) both rely on
+this edge to exercise FK ordering.
 
 Verify the three backend paths (extended protocol, single DML, multi-statement):
 
@@ -248,8 +275,20 @@ INSERT INTO test_users (name, age, score, active, meta) VALUES
   ('Alice', 30, 99.5,  1, '{"role": "admin"}'),
   ('Bob',   25, 88.25, 0, '{"role": "user"}');
 GO
+CREATE TABLE test_orders (
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  user_id INT FOREIGN KEY REFERENCES test_users(id) ON DELETE CASCADE,
+  total DECIMAL(10,2)
+);
+INSERT INTO test_orders (user_id, total) VALUES
+  (1, 19.99), (1, 4.50), (2, 12.00);
+GO
 SQL
 ```
+
+`test_orders` is the child table used by Phase-1 introspection tests
+(`Connection::primary_key` / `list_foreign_keys`) and the Phase-3
+multi-table copy fixtures.
 
 Schema deviations from Postgres: MSSQL has no native `BOOLEAN` (use `BIT`),
 no native JSON type (store JSON in `NVARCHAR(MAX)` — the type-mapping test
@@ -331,10 +370,25 @@ CREATE TABLE test_users (
 );
 INSERT INTO test_users (name, age, score, active, meta) VALUES ('Alice', 30, 99.5,  1, '{"role": "admin"}');
 INSERT INTO test_users (name, age, score, active, meta) VALUES ('Bob',   25, 88.25, 0, '{"role": "user"}');
+CREATE TABLE test_orders (
+  id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id NUMBER,
+  total NUMBER(10,2),
+  CONSTRAINT test_orders_user_fk FOREIGN KEY (user_id)
+    REFERENCES test_users(id) ON DELETE CASCADE
+);
+INSERT INTO test_orders (user_id, total) VALUES (1, 19.99);
+INSERT INTO test_orders (user_id, total) VALUES (1,  4.50);
+INSERT INTO test_orders (user_id, total) VALUES (2, 12.00);
 COMMIT;
 EXIT
 SQL
 ```
+
+`test_orders` mirrors the other backends' child-table fixture for the
+Phase-1 introspection tests and the Phase-3 `--all-tables` copy
+smokes. Note Oracle requires the constraint to be named (no anonymous
+inline `FOREIGN KEY ... REFERENCES`).
 
 Schema deviations from Postgres: Oracle has no native `BOOLEAN` until 23c
 (`NUMBER(1)`), no `UUID` type (use `RAW(16)` + `SYS_GUID()` -- note `guid` not
@@ -475,9 +529,12 @@ Notes:
 ### Cross-DB copy — smoke against the seeded containers
 
 `ferrule copy <SRC> <DST>` streams rows between any pair of backends.
-Phase 1 uses a generic batched-INSERT path on the destination;
-backend-native bulk loaders (PG `COPY FROM STDIN`, MySQL `LOAD DATA`,
-MSSQL `BULK INSERT`, Oracle direct-path) are tracked separately.
+The default path is a generic batched INSERT; pass `--bulk-native auto`
+or `on` to opt into the destination's native bulk loader (PG `COPY FROM
+STDIN`, MySQL `LOAD DATA LOCAL INFILE`, MSSQL TDS bulk-load,
+Oracle `oracle::Batch` array DML). For Postgres, `--copy-format binary`
+selects the binary frame; see `docs/src/copy.md` for when each is
+faster.
 
 Default conflict policy is non-destructive: ferrule refuses to copy
 into a non-empty existing target unless `--if-exists append` or
@@ -522,8 +579,74 @@ ferrule copy \
   --query "SELECT id, name FROM test_users WHERE active = true" \
   --into active_users --create-table
 
+# --if-exists skip: leave existing rows untouched, insert only new PKs.
+# Bump 'Alice' age in the source first to verify Skip doesn't overwrite.
+ferrule query \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "UPDATE test_users SET age = 999 WHERE name = 'Alice'"
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-smoke.db" \
+  --table test_users --if-exists skip
+ferrule query "sqlite:///tmp/ferrule-copy-smoke.db" \
+  "SELECT name, age FROM test_users WHERE name = 'Alice'"
+# → age stays at the value already present in the destination (Skip).
+
+# --if-exists upsert: overwrite non-PK columns when the PK already exists.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-smoke.db" \
+  --table test_users --if-exists upsert
+ferrule query "sqlite:///tmp/ferrule-copy-smoke.db" \
+  "SELECT name, age FROM test_users WHERE name = 'Alice'"
+# → age is now 999 (Upsert overwrites).
+
+# Restore the seeded value so subsequent smoke runs aren't surprising.
+ferrule query \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "UPDATE test_users SET age = 30 WHERE name = 'Alice'"
+
 rm /tmp/ferrule-copy-smoke.db
 ```
+
+Skip/Upsert require a declared PK on the destination — `test_users.id`
+in the seeded fixtures. Tables without a PK hard-error before the
+source SELECT runs, with a hint at the future `--key` override (#43).
+`--bulk-native auto|on` combined with `--if-exists skip|upsert` is
+silently ignored (the bulk loaders carry no MERGE semantics); ferrule
+prints one stderr line and uses the generic INSERT path.
+
+Schema-level (`--all-tables`) smoke — uses the seeded
+`test_users` + `test_orders` FK pair to verify parents load before
+children:
+
+```bash
+# Fresh snapshot of every table in the source DB into a new SQLite file.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-all-tables.db" \
+  --all-tables --create-table --verbose
+# Verify both tables landed with the expected row counts:
+ferrule query "sqlite:///tmp/ferrule-all-tables.db" \
+  "SELECT 'users', count(*) FROM test_users
+   UNION ALL SELECT 'orders', count(*) FROM test_orders" --format table
+
+# --include / --exclude globs (shell-style * and ?).
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-all-tables.db" \
+  --all-tables --create-table \
+  --include 'test_*' --exclude '*_orders' \
+  --if-exists truncate --yes
+# → only test_users lands; test_orders excluded.
+
+rm /tmp/ferrule-all-tables.db
+```
+
+`--all-tables` is mutually exclusive with `--table` and `--query`; the
+inline tests at `ferrule-core/src/copy.rs::copy_all_tables_*` cover the
+DAG ordering, include/exclude filters, FK cycle hard-error path, and
+the `--no-fk-check` escape hatch.
 
 Bulk-native paths (`--bulk-native auto|on`) require a destination
 backend with a real bulk loader — see `docs/src/copy.md` for the
@@ -533,12 +656,28 @@ container, since PG is the only backend that has a `COPY` source
 that ferrule's source-side SELECT already exercises):
 
 ```bash
-# Bulk-on path: Postgres native COPY ... FROM STDIN.
+# Bulk-on path: Postgres native COPY ... FROM STDIN (text frame).
 ferrule copy \
   "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
   "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
   --query "SELECT * FROM test_users" --into bulk_pg_smoke \
   --create-table --bulk-native on
+
+# Same path, but using FORMAT BINARY (faster for numeric / TIMESTAMPTZ
+# / UUID / NUMERIC-heavy schemas; PG-only flag).
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  --query "SELECT * FROM test_users" --into bulk_pg_smoke_bin \
+  --create-table --bulk-native on --copy-format binary
+
+# --copy-format binary without --bulk-native is a usage error: the
+# generic INSERT path doesn't use COPY at all.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  --table test_users --copy-format binary
+# → "--copy-format binary requires --bulk-native auto or on; ..."
 
 # Auto path: chooses native if available, falls back if not.
 ferrule copy \

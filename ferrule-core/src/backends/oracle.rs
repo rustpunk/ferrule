@@ -1,5 +1,6 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -153,6 +154,125 @@ impl Connection for OracleConnection {
             ),
         };
         self.query(&sql).await
+    }
+
+    async fn primary_key(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<String>, CoreError> {
+        // `all_constraints.constraint_type = 'P'` is the PK; join
+        // `all_cons_columns` for key positions.
+        let sql = match schema {
+            Some(s) => format!(
+                "SELECT cc.column_name \
+                 FROM all_constraints c \
+                 JOIN all_cons_columns cc \
+                   ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name \
+                 WHERE c.constraint_type = 'P' \
+                   AND c.owner = UPPER('{}') AND c.table_name = UPPER('{}') \
+                 ORDER BY cc.position",
+                escape_oracle_string(s),
+                escape_oracle_string(table),
+            ),
+            None => format!(
+                "SELECT cc.column_name \
+                 FROM user_constraints c \
+                 JOIN user_cons_columns cc ON cc.constraint_name = c.constraint_name \
+                 WHERE c.constraint_type = 'P' AND c.table_name = UPPER('{}') \
+                 ORDER BY cc.position",
+                escape_oracle_string(table),
+            ),
+        };
+        let result = self.query(&sql).await?;
+        Ok(result
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                row.into_iter().next().and_then(|v| match v {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    async fn list_foreign_keys(
+        &mut self,
+        schema: Option<&str>,
+    ) -> Result<Vec<ForeignKey>, CoreError> {
+        // FK rows live in `all_constraints` with constraint_type 'R'.
+        // The referenced PK is on the parent's constraint, joined
+        // via `r_constraint_name`. `delete_rule` is on the FK itself.
+        let sql = match schema {
+            Some(s) => format!(
+                "SELECT c.constraint_name, c.table_name AS child_table, cc.column_name AS child_col, \
+                        pc.table_name AS parent_table, pcc.column_name AS parent_col, \
+                        c.delete_rule, cc.position \
+                 FROM all_constraints c \
+                 JOIN all_cons_columns cc \
+                   ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name \
+                 JOIN all_constraints pc \
+                   ON pc.owner = c.r_owner AND pc.constraint_name = c.r_constraint_name \
+                 JOIN all_cons_columns pcc \
+                   ON pcc.owner = pc.owner AND pcc.constraint_name = pc.constraint_name \
+                  AND pcc.position = cc.position \
+                 WHERE c.constraint_type = 'R' AND c.owner = UPPER('{}') \
+                 ORDER BY c.constraint_name, cc.position",
+                escape_oracle_string(s),
+            ),
+            None => "SELECT c.constraint_name, c.table_name AS child_table, cc.column_name AS child_col, \
+                        pc.table_name AS parent_table, pcc.column_name AS parent_col, \
+                        c.delete_rule, cc.position \
+                 FROM user_constraints c \
+                 JOIN user_cons_columns cc ON cc.constraint_name = c.constraint_name \
+                 JOIN user_constraints pc ON pc.constraint_name = c.r_constraint_name \
+                 JOIN user_cons_columns pcc \
+                   ON pcc.constraint_name = pc.constraint_name AND pcc.position = cc.position \
+                 WHERE c.constraint_type = 'R' \
+                 ORDER BY c.constraint_name, cc.position".to_string(),
+        };
+        let result = self.query(&sql).await?;
+        let mut map: indexmap::IndexMap<String, ForeignKey> = indexmap::IndexMap::new();
+        for row in result.rows {
+            let mut cols = row.into_iter();
+            let conname = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let child_table = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let child_col = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let parent_table = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let parent_col = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let on_delete = match cols.next() {
+                // Oracle reports "NO ACTION" as a literal absence;
+                // surface it as None for parity with the other backends.
+                Some(Value::String(s)) if !s.is_empty() && s != "NO ACTION" => Some(s),
+                _ => None,
+            };
+            let entry = map.entry(conname).or_insert_with(|| ForeignKey {
+                child_table: child_table.clone(),
+                child_columns: Vec::new(),
+                parent_table: parent_table.clone(),
+                parent_columns: Vec::new(),
+                on_delete,
+            });
+            entry.child_columns.push(child_col);
+            entry.parent_columns.push(parent_col);
+        }
+        Ok(map.into_values().collect())
     }
 
     async fn bulk_insert_rows(
@@ -630,12 +750,9 @@ fn end_suffix(bytes: &[u8], end_pos: usize) -> Option<&'static str> {
     while j < bytes.len() && bytes[j].is_ascii_whitespace() {
         j += 1;
     }
-    for kw in ["if", "loop", "case"] {
-        if matches_keyword(bytes, j, kw) {
-            return Some(kw);
-        }
-    }
-    None
+    ["if", "loop", "case"]
+        .into_iter()
+        .find(|kw| matches_keyword(bytes, j, kw))
 }
 
 fn map_oracle_error(e: oracle::Error) -> CoreError {
@@ -1369,6 +1486,7 @@ mod tests {
                 table: &table,
                 columns: &columns,
                 rows: &rows,
+                copy_format: crate::copy::CopyFormat::Text,
             })
             .await
             .expect("bulk_insert_rows");
@@ -1408,5 +1526,164 @@ mod tests {
         let _ = conn
             .execute(&format!("DROP TABLE {table}"))
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_oracle_primary_key() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("Oracle test container not available, skipping test_oracle_primary_key");
+            return;
+        };
+        // The CLAUDE.md seed declares `id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY`.
+        // Oracle uppercases unquoted identifiers.
+        let pk = conn
+            .primary_key(None, "test_users")
+            .await
+            .expect("primary_key");
+        assert_eq!(pk, vec!["ID".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_oracle_list_foreign_keys() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "Oracle test container not available, skipping test_oracle_list_foreign_keys"
+            );
+            return;
+        };
+        let pid = std::process::id();
+        let child = format!("ferrule_fk_test_orders_{pid}");
+        let _ = conn.execute(&format!("DROP TABLE {child}")).await;
+        conn.execute(&format!(
+            "CREATE TABLE {child} (\
+               id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+               user_id NUMBER, \
+               CONSTRAINT {child}_fk FOREIGN KEY (user_id) \
+                 REFERENCES test_users(id) ON DELETE CASCADE\
+             )"
+        ))
+        .await
+        .expect("CREATE TABLE");
+
+        let fks = conn
+            .list_foreign_keys(None)
+            .await
+            .expect("list_foreign_keys");
+        let child_upper = child.to_uppercase();
+        let matching: Vec<_> = fks.iter().filter(|fk| fk.child_table == child_upper).collect();
+        assert_eq!(matching.len(), 1, "expected 1 FK from {child_upper}, got {fks:?}");
+        let fk = matching[0];
+        assert_eq!(fk.child_columns, vec!["USER_ID".to_string()]);
+        assert_eq!(fk.parent_table, "TEST_USERS");
+        assert_eq!(fk.parent_columns, vec!["ID".to_string()]);
+        assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
+
+        let _ = conn.execute(&format!("DROP TABLE {child}")).await;
+    }
+
+    /// End-to-end `--if-exists skip` then `upsert` round-trip against
+    /// Oracle. Exercises the `MERGE … USING (SELECT … FROM dual UNION ALL …)`
+    /// codegen (Skip = WHEN NOT MATCHED only; Upsert = full MERGE).
+    #[tokio::test]
+    async fn test_oracle_copy_skip_then_upsert() {
+        use crate::backend::Backend;
+        use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+
+        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+            eprintln!(
+                "Oracle test container not available, skipping test_oracle_copy_skip_then_upsert"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let src_table = format!("ferrule_or_skip_src_{pid}");
+        let dst_table = format!("ferrule_or_skip_dst_{pid}");
+        // Oracle has no `DROP TABLE IF EXISTS`; best-effort drop then ignore.
+        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+        src.execute(&format!(
+            "CREATE TABLE {src_table} (id NUMBER PRIMARY KEY, name VARCHAR2(64), val NUMBER)"
+        ))
+        .await
+        .expect("CREATE src");
+        dst.execute(&format!(
+            "CREATE TABLE {dst_table} (id NUMBER PRIMARY KEY, name VARCHAR2(64), val NUMBER)"
+        ))
+        .await
+        .expect("CREATE dst");
+        src.execute(&format!(
+            "INSERT INTO {src_table} VALUES (1, 'new-1', 10)"
+        ))
+        .await
+        .expect("seed src 1");
+        src.execute(&format!(
+            "INSERT INTO {src_table} VALUES (2, 'new-2', 20)"
+        ))
+        .await
+        .expect("seed src 2");
+        dst.execute(&format!(
+            "INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"
+        ))
+        .await
+        .expect("seed dst");
+        // Oracle has no autocommit on `execute`; flush both connections.
+        src.execute("COMMIT").await.expect("commit src");
+        dst.execute("COMMIT").await.expect("commit dst");
+
+        // --- Skip ---------------------------------------------------------
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY id"),
+                into: dst_table.clone(),
+            },
+            if_exists: IfExists::Skip,
+            ..Default::default()
+        };
+        copy_rows(&mut src, Backend::Oracle, &mut dst, Backend::Oracle, &opts)
+            .await
+            .expect("copy_rows skip");
+
+        let out = dst
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
+            .await
+            .expect("verify skip");
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "old-1"));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
+
+        // --- Upsert -------------------------------------------------------
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY id"),
+                into: dst_table.clone(),
+            },
+            if_exists: IfExists::Upsert,
+            ..Default::default()
+        };
+        copy_rows(&mut src, Backend::Oracle, &mut dst, Backend::Oracle, &opts)
+            .await
+            .expect("copy_rows upsert");
+
+        let out = dst
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
+            .await
+            .expect("verify upsert");
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
+        // val column for id=1 should now be 10 (was 99).
+        match &out.rows[0][2] {
+            Value::Int64(n) => assert_eq!(*n, 10),
+            Value::Decimal(d) => assert_eq!(d, "10"),
+            other => panic!("unexpected val type: {other:?}"),
+        }
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
+
+        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
     }
 }

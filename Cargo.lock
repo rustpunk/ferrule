@@ -1727,6 +1727,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1794,6 +1800,7 @@ dependencies = [
 name = "hasp-backend-file"
 version = "0.1.0-alpha"
 dependencies = [
+ "glob",
  "hasp-core",
  "secrecy",
  "url",
@@ -1818,6 +1825,7 @@ version = "0.1.0-alpha"
 dependencies = [
  "libc",
  "secrecy",
+ "serde_json",
  "subtle",
  "thiserror 1.0.69",
  "url",

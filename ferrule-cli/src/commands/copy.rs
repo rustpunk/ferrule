@@ -3,7 +3,10 @@ use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::Backend;
 use ferrule_core::connection::ConnectOptions;
-use ferrule_core::copy::{copy_rows, BulkMode, CopyOptions, CopySource, IfExists};
+use ferrule_core::copy::{
+    copy_all_tables, copy_rows, AllTablesOptions, BulkMode, CopyFormat, CopyOptions, CopySource,
+    IfExists,
+};
 
 // `BulkMode` itself comes from ferrule_core; the CLI wraps it in
 // `BulkNativeMode` so clap can enumerate values in --help and reject
@@ -15,30 +18,51 @@ use std::sync::Arc;
 
 pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     // --- arg validation ------------------------------------------------
-    let source = match (args.table.clone(), args.query.clone(), args.into.clone()) {
-        (Some(t), None, _) => CopySource::Table(t),
-        (None, Some(q), Some(i)) => CopySource::Query { sql: q, into: i },
-        (None, Some(_), None) => {
+    // Surface the most specific error first: --include / --exclude /
+    // --no-fk-check are only meaningful in --all-tables mode.
+    if !args.all_tables && (!args.include.is_empty() || !args.exclude.is_empty()) {
+        return Err(CliError::usage(
+            "--include / --exclude require --all-tables.",
+        ));
+    }
+    if !args.all_tables && args.no_fk_check {
+        return Err(CliError::usage("--no-fk-check requires --all-tables."));
+    }
+
+    let source = if args.all_tables {
+        // Belt-and-braces — clap conflicts_with should catch these.
+        if args.table.is_some() || args.query.is_some() || args.into.is_some() {
             return Err(CliError::usage(
-                "--query requires --into NAME for the target table.",
+                "--all-tables is mutually exclusive with --table, --query, and --into.",
             ));
         }
-        (None, None, _) => {
-            return Err(CliError::usage(
-                "Pass --table NAME or --query SQL --into NAME to choose a source.",
-            ));
-        }
-        (Some(_), Some(_), _) => {
-            // clap's conflicts_with should catch this, but belt-and-braces.
-            return Err(CliError::usage(
-                "--table and --query are mutually exclusive.",
-            ));
-        }
+        None
+    } else {
+        Some(match (args.table.clone(), args.query.clone(), args.into.clone()) {
+            (Some(t), None, _) => CopySource::Table(t),
+            (None, Some(q), Some(i)) => CopySource::Query { sql: q, into: i },
+            (None, Some(_), None) => {
+                return Err(CliError::usage(
+                    "--query requires --into NAME for the target table.",
+                ));
+            }
+            (None, None, _) => {
+                return Err(CliError::usage(
+                    "Pass --table NAME, --query SQL --into NAME, or --all-tables.",
+                ));
+            }
+            (Some(_), Some(_), _) => {
+                // clap's conflicts_with should catch this, but belt-and-braces.
+                return Err(CliError::usage(
+                    "--table and --query are mutually exclusive.",
+                ));
+            }
+        })
     };
 
     let if_exists = IfExists::parse(&args.if_exists).ok_or_else(|| {
         CliError::usage(format!(
-            "Unknown --if-exists strategy '{}'. Use: error, append, truncate.",
+            "Unknown --if-exists strategy '{}'. Use: error, append, truncate, skip, upsert.",
             args.if_exists
         ))
     })?;
@@ -47,6 +71,16 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
     // invalid input with a usage error before we get here, so this
     // conversion is infallible.
     let bulk_mode: BulkMode = args.bulk_native.into();
+    let copy_format: CopyFormat = args.copy_format.into();
+    // --copy-format binary is only meaningful when the bulk path is
+    // selected (the generic INSERT path doesn't use COPY). Surface
+    // the misconfiguration up front rather than silently dropping.
+    if copy_format == CopyFormat::Binary && bulk_mode == BulkMode::Off {
+        return Err(CliError::usage(
+            "--copy-format binary requires --bulk-native auto or on; \
+             the generic INSERT path does not use COPY.",
+        ));
+    }
 
     if if_exists == IfExists::Truncate && !args.yes && std::io::stdin().is_terminal() {
         return Err(CliError::usage(
@@ -115,39 +149,64 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
     let mut conn_src = super::connect_resolved(resolved_src, &conn_opts).await?;
     let mut conn_dst = super::connect_resolved(resolved_dst, &conn_opts).await?;
 
-    // --- progress callback (stderr, every batch) -----------------------
-    let progress: Option<Box<dyn Fn(usize) + Send>> = if args.output.verbose {
-        let last = Arc::new(AtomicUsize::new(0));
-        let l = last.clone();
-        Some(Box::new(move |total: usize| {
-            l.store(total, Ordering::Relaxed);
-            eprintln!("[ferrule] copied {total} rows...");
-        }))
-    } else {
-        None
-    };
-
-    let opts = CopyOptions {
-        source,
-        create_table: args.create_table,
-        if_exists,
-        atomic: args.atomic,
-        batch_size: args.batch,
-        bulk_mode,
-        verbose: args.output.verbose,
-        progress,
-    };
-
     let started = std::time::Instant::now();
-    let copied = copy_rows(
-        conn_src.as_mut(),
-        backend_src,
-        conn_dst.as_mut(),
-        backend_dst,
-        &opts,
-    )
-    .await
-    .map_err(CliError::query)?;
+    let copied = if args.all_tables {
+        let all_opts = AllTablesOptions {
+            include: args.include.clone(),
+            exclude: args.exclude.clone(),
+            if_exists,
+            atomic: args.atomic,
+            batch_size: args.batch,
+            bulk_mode,
+            copy_format,
+            verbose: args.output.verbose,
+            create_table: args.create_table,
+            no_fk_check: args.no_fk_check,
+        };
+        copy_all_tables(
+            conn_src.as_mut(),
+            backend_src,
+            conn_dst.as_mut(),
+            backend_dst,
+            &all_opts,
+        )
+        .await
+        .map_err(CliError::query)?
+    } else {
+        // --- progress callback (stderr, every batch) ------------------
+        let progress: Option<Box<dyn Fn(usize) + Send>> = if args.output.verbose {
+            let last = Arc::new(AtomicUsize::new(0));
+            let l = last.clone();
+            Some(Box::new(move |total: usize| {
+                l.store(total, Ordering::Relaxed);
+                eprintln!("[ferrule] copied {total} rows...");
+            }))
+        } else {
+            None
+        };
+
+        let opts = CopyOptions {
+            source: source.expect("source resolved in the non-all-tables branch"),
+            create_table: args.create_table,
+            if_exists,
+            atomic: args.atomic,
+            batch_size: args.batch,
+            bulk_mode,
+            copy_format,
+            verbose: args.output.verbose,
+            progress,
+        };
+
+        copy_rows(
+            conn_src.as_mut(),
+            backend_src,
+            conn_dst.as_mut(),
+            backend_dst,
+            &opts,
+        )
+        .await
+        .map_err(CliError::query)?
+    };
     let elapsed = started.elapsed();
 
     eprintln!(

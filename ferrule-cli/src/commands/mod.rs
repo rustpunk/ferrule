@@ -26,7 +26,7 @@ pub use watch::WatchArgs;
 
 use clap::{Args, Subcommand, ValueEnum};
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::copy::BulkMode;
+use ferrule_core::copy::{BulkMode, CopyFormat};
 
 /// CLI-side representation of [`BulkMode`]. Derived from
 /// `clap::ValueEnum` so `--help` enumerates the valid values and
@@ -52,6 +52,29 @@ impl From<BulkNativeMode> for BulkMode {
             BulkNativeMode::Off => BulkMode::Off,
             BulkNativeMode::Auto => BulkMode::Auto,
             BulkNativeMode::On => BulkMode::On,
+        }
+    }
+}
+
+/// CLI-side representation of [`CopyFormat`]. Postgres-only; other
+/// destination backends silently ignore the flag.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CopyFormatArg {
+    /// `COPY … WITH (FORMAT TEXT)` — the v1 default. Tab-separated
+    /// wire format; encoded by ferrule's tiny in-crate encoder.
+    Text,
+    /// `COPY … WITH (FORMAT BINARY)` — opt-in. Streamed via
+    /// `tokio_postgres::binary_copy`. Faster on numeric / timestamp /
+    /// UUID-heavy schemas; at-best break-even on TEXT / JSONB / BYTEA-
+    /// heavy ones because typed length prefixes inflate small payloads.
+    Binary,
+}
+
+impl From<CopyFormatArg> for CopyFormat {
+    fn from(arg: CopyFormatArg) -> Self {
+        match arg {
+            CopyFormatArg::Text => CopyFormat::Text,
+            CopyFormatArg::Binary => CopyFormat::Binary,
         }
     }
 }
@@ -278,18 +301,45 @@ pub struct CopyArgs {
     pub dest: String,
 
     /// Whole-table mode: copy `<table>` from source to dest. Mutually
-    /// exclusive with `--query`.
-    #[arg(long, value_name = "NAME", conflicts_with = "query")]
+    /// exclusive with `--query` and `--all-tables`.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["query", "all_tables"])]
     pub table: Option<String>,
 
     /// Query mode: run this SELECT against the source. Requires
     /// `--into NAME` for the target table.
-    #[arg(long, value_name = "SQL", requires = "into")]
+    #[arg(long, value_name = "SQL", requires = "into", conflicts_with = "all_tables")]
     pub query: Option<String>,
 
     /// Target table name when using `--query`.
     #[arg(long, value_name = "NAME")]
     pub into: Option<String>,
+
+    /// Schema-level mode: discover every table on the source and copy
+    /// each one in foreign-key-respecting order (parents before
+    /// children). Mutually exclusive with `--table` and `--query`.
+    /// Pair with `--if-exists truncate` for the "refresh dev from
+    /// prod" workflow; `--yes` is required at most once per copy, not
+    /// per table.
+    #[arg(long)]
+    pub all_tables: bool,
+
+    /// Repeatable glob (shell-style `*` / `?`) restricting which
+    /// tables `--all-tables` includes. Default: include every table.
+    /// Case-sensitive against the identifier shape the source returns.
+    #[arg(long, value_name = "PATTERN")]
+    pub include: Vec<String>,
+
+    /// Repeatable glob (shell-style `*` / `?`) excluding tables from
+    /// `--all-tables`. Applied after `--include`.
+    #[arg(long, value_name = "PATTERN")]
+    pub exclude: Vec<String>,
+
+    /// Tolerate foreign-key cycles in `--all-tables` mode by copying
+    /// in discovery order. FK violations may surface as driver
+    /// errors; useful when targets have deferrable FKs or you plan
+    /// to rebuild constraints after the copy.
+    #[arg(long)]
+    pub no_fk_check: bool,
 
     /// Translate source column metadata into a CREATE TABLE on the
     /// target if it does not yet exist.
@@ -297,7 +347,11 @@ pub struct CopyArgs {
     pub create_table: bool,
 
     /// What to do if the target table already contains rows.
-    /// `error` (default, non-destructive), `append`, `truncate`.
+    /// `error` (default, non-destructive), `append`, `truncate`,
+    /// `skip` (PK-driven `ON CONFLICT DO NOTHING` / `INSERT IGNORE` /
+    /// `MERGE … WHEN NOT MATCHED`), or `upsert` (`ON CONFLICT DO UPDATE`
+    /// / `ON DUPLICATE KEY UPDATE` / full `MERGE`). `skip` and
+    /// `upsert` require a declared primary key on the destination.
     #[arg(long, value_name = "STRATEGY", default_value = "error")]
     pub if_exists: String,
 
@@ -331,6 +385,20 @@ pub struct CopyArgs {
         ignore_case = true,
     )]
     pub bulk_native: BulkNativeMode,
+
+    /// Wire format for the Postgres `COPY` bulk path. `text` (default)
+    /// is the v1 path; `binary` opts into
+    /// `tokio_postgres::binary_copy::BinaryCopyInWriter`. PG-only;
+    /// other destination backends silently ignore. Only consulted when
+    /// `--bulk-native=auto|on` selects the bulk path.
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        default_value = "text",
+        value_enum,
+        ignore_case = true,
+    )]
+    pub copy_format: CopyFormatArg,
 
     /// Password for the source connection (overrides credential stack).
     #[arg(long = "password-src")]

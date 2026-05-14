@@ -1,5 +1,6 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -24,7 +25,7 @@ impl Connection for PostgresConnection {
             .await
             .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
         Ok(ExecutionSummary {
-            rows_affected: Some(rows_affected as u64),
+            rows_affected: Some(rows_affected),
             command_tag: None,
         })
     }
@@ -242,6 +243,82 @@ impl Connection for PostgresConnection {
         })
     }
 
+    async fn primary_key(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<String>, CoreError> {
+        let schema = schema.unwrap_or("public");
+        // `pg_index.indkey` is a smallint[] of attribute numbers in
+        // key order; unnest preserves order with WITH ORDINALITY.
+        let sql = "SELECT a.attname \
+                   FROM pg_index i \
+                   JOIN pg_class c ON c.oid = i.indrelid \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                   JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+                   JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum \
+                   WHERE i.indisprimary AND n.nspname = $1 AND c.relname = $2 \
+                   ORDER BY k.ord";
+        let rows = self
+            .client
+            .query(sql, &[&schema, &table])
+            .await
+            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    async fn list_foreign_keys(
+        &mut self,
+        schema: Option<&str>,
+    ) -> Result<Vec<ForeignKey>, CoreError> {
+        let schema = schema.unwrap_or("public");
+        // One row per (FK, position) pair; aggregate in Rust to keep
+        // the SQL portable.
+        let sql = "SELECT c.conname, \
+                          cl_child.relname AS child_table, \
+                          a_child.attname AS child_col, \
+                          cl_parent.relname AS parent_table, \
+                          a_parent.attname AS parent_col, \
+                          c.confdeltype, \
+                          k.ord \
+                   FROM pg_constraint c \
+                   JOIN pg_class cl_child ON cl_child.oid = c.conrelid \
+                   JOIN pg_namespace n_child ON n_child.oid = cl_child.relnamespace \
+                   JOIN pg_class cl_parent ON cl_parent.oid = c.confrelid \
+                   JOIN pg_namespace n_parent ON n_parent.oid = cl_parent.relnamespace \
+                   JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+                   JOIN pg_attribute a_child ON a_child.attrelid = cl_child.oid AND a_child.attnum = k.attnum \
+                   JOIN unnest(c.confkey) WITH ORDINALITY AS kp(attnum, ord) ON kp.ord = k.ord \
+                   JOIN pg_attribute a_parent ON a_parent.attrelid = cl_parent.oid AND a_parent.attnum = kp.attnum \
+                   WHERE c.contype = 'f' AND n_child.nspname = $1 \
+                   ORDER BY c.conname, k.ord";
+        let rows = self
+            .client
+            .query(sql, &[&schema])
+            .await
+            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+        let mut map: indexmap::IndexMap<String, ForeignKey> = indexmap::IndexMap::new();
+        for row in rows {
+            let conname: String = row.get(0);
+            let child_table: String = row.get(1);
+            let child_col: String = row.get(2);
+            let parent_table: String = row.get(3);
+            let parent_col: String = row.get(4);
+            let confdeltype: i8 = row.get(5);
+            let on_delete = pg_confdeltype(confdeltype);
+            let entry = map.entry(conname).or_insert_with(|| ForeignKey {
+                child_table: child_table.clone(),
+                child_columns: Vec::new(),
+                parent_table: parent_table.clone(),
+                parent_columns: Vec::new(),
+                on_delete,
+            });
+            entry.child_columns.push(child_col);
+            entry.parent_columns.push(parent_col);
+        }
+        Ok(map.into_values().collect())
+    }
+
     async fn bulk_insert_rows(
         &mut self,
         target: BulkInsert<'_>,
@@ -260,33 +337,40 @@ impl Connection for PostgresConnection {
             .map(|c| crate::copy::quote_identifier(&c.name, crate::backend::Backend::Postgres))
             .collect::<Vec<_>>()
             .join(", ");
-        let stmt = format!("COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT)");
+        match target.copy_format {
+            crate::copy::CopyFormat::Text => {
+                let stmt = format!("COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT)");
+                let sink = self
+                    .client
+                    .copy_in::<_, Bytes>(stmt.as_str())
+                    .await
+                    .map_err(|e| pg_text_copy::classify_copy_error(&e))?;
+                tokio::pin!(sink);
 
-        let sink = self
-            .client
-            .copy_in::<_, Bytes>(stmt.as_str())
-            .await
-            .map_err(|e| pg_text_copy::classify_copy_error(&e))?;
-        tokio::pin!(sink);
+                // Render each row into one tab-separated line and stream
+                // into the sink one row at a time. Buffering inside Bytes
+                // is small (one row per allocation); CopyInSink will batch
+                // these into network frames internally.
+                let hints: Vec<TypeHint> =
+                    target.columns.iter().map(|c| c.type_hint).collect();
+                for row in target.rows {
+                    let buf = pg_text_copy::encode_row(row, &hints)?;
+                    sink.send(buf)
+                        .await
+                        .map_err(|e| CoreError::QueryFailed(format!("COPY send: {e}")))?;
+                }
 
-        // Render each row into one tab-separated line and stream
-        // into the sink one row at a time. Buffering inside Bytes
-        // is small (one row per allocation); CopyInSink will batch
-        // these into network frames internally.
-        let hints: Vec<TypeHint> = target.columns.iter().map(|c| c.type_hint).collect();
-        for row in target.rows {
-            let buf = pg_text_copy::encode_row(row, &hints)?;
-            sink.send(buf)
-                .await
-                .map_err(|e| CoreError::QueryFailed(format!("COPY send: {e}")))?;
+                let rows = sink
+                    .as_mut()
+                    .finish()
+                    .await
+                    .map_err(|e| CoreError::QueryFailed(format!("COPY finish: {e}")))?;
+                Ok(rows as usize)
+            }
+            crate::copy::CopyFormat::Binary => {
+                pg_binary_copy::run(&mut self.client, &table, &cols, &target).await
+            }
         }
-
-        let rows = sink
-            .as_mut()
-            .finish()
-            .await
-            .map_err(|e| CoreError::QueryFailed(format!("COPY finish: {e}")))?;
-        Ok(rows as usize)
     }
 }
 
@@ -619,6 +703,353 @@ mod pg_text_copy {
     }
 }
 
+/// Postgres BINARY-COPY encoder.
+///
+/// Streams rows through `tokio_postgres::binary_copy::BinaryCopyInWriter`,
+/// which serialises each value via its `ToSql` impl into PG's binary
+/// COPY frame. The wire format is documented at
+/// <https://www.postgresql.org/docs/current/sql-copy.html#id-1.9.3.55.9.4>.
+///
+/// The destination column types are inferred from each
+/// `ColumnInfo::type_hint`. The mapping (TypeHint → PG `Type`) mirrors
+/// the DDL translator in [`crate::copy::translate_type`] so a
+/// `--create-table` pass against the same source produces a table the
+/// binary writer can target without coercion errors. Sources whose
+/// column shape uses [`TypeHint::Other`] cannot be expressed in a
+/// statically-typed `&[Type]` and surface as
+/// [`CoreError::BulkUnavailable`] so the dispatcher can fall back.
+mod pg_binary_copy {
+    use super::pg_text_copy;
+    use crate::connection::BulkInsert;
+    use crate::error::CoreError;
+    use crate::value::{TypeHint, Value};
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+    use tokio_postgres::binary_copy::BinaryCopyInWriter;
+    use tokio_postgres::types::{ToSql, Type};
+    use tokio_postgres::Client;
+    use uuid::Uuid;
+
+    /// Run a `COPY … WITH (FORMAT BINARY)` for the rows in `target`.
+    /// Caller has already pre-quoted `table` and `cols` and verified
+    /// the batch is non-empty.
+    pub async fn run(
+        client: &mut Client,
+        table: &str,
+        cols: &str,
+        target: &BulkInsert<'_>,
+    ) -> Result<usize, CoreError> {
+        let types: Vec<Type> = target
+            .columns
+            .iter()
+            .map(|c| pg_type_for_hint(c.type_hint))
+            .collect::<Result<_, _>>()?;
+
+        let stmt = format!("COPY {table} ({cols}) FROM STDIN WITH (FORMAT BINARY)");
+        let sink = client
+            .copy_in::<_, bytes::Bytes>(stmt.as_str())
+            .await
+            .map_err(|e| pg_text_copy::classify_copy_error(&e))?;
+        let writer = BinaryCopyInWriter::new(sink, &types);
+        tokio::pin!(writer);
+
+        let hints: Vec<TypeHint> = target.columns.iter().map(|c| c.type_hint).collect();
+        for row in target.rows {
+            // Materialize one owned bind per cell, then borrow into a
+            // `Vec<&(dyn ToSql + Sync)>` for write(). The owned vec
+            // outlives the refs vec in the same loop iteration.
+            let cells: Vec<PgBinaryBind> = row
+                .iter()
+                .zip(hints.iter())
+                .map(|(v, h)| value_to_pg_binary_bind(v, *h))
+                .collect::<Result<_, _>>()?;
+            let refs: Vec<&(dyn ToSql + Sync)> = cells.iter().map(PgBinaryBind::as_to_sql).collect();
+            writer
+                .as_mut()
+                .write(&refs)
+                .await
+                .map_err(|e| CoreError::QueryFailed(format!("BINARY COPY write: {e}")))?;
+        }
+
+        let rows = writer
+            .as_mut()
+            .finish()
+            .await
+            .map_err(|e| CoreError::QueryFailed(format!("BINARY COPY finish: {e}")))?;
+        Ok(rows as usize)
+    }
+
+    /// PG `Type` chosen for each `TypeHint`. Mirrors
+    /// [`crate::copy::translate_type`] so a `--create-table` PG
+    /// destination matches the binder's expectations.
+    pub(super) fn pg_type_for_hint(hint: TypeHint) -> Result<Type, CoreError> {
+        Ok(match hint {
+            TypeHint::Bool => Type::BOOL,
+            TypeHint::Int64 => Type::INT8,
+            TypeHint::Float64 => Type::FLOAT8,
+            TypeHint::Decimal => Type::NUMERIC,
+            TypeHint::String => Type::TEXT,
+            TypeHint::Bytes => Type::BYTEA,
+            TypeHint::Date => Type::DATE,
+            TypeHint::Time => Type::TIME,
+            TypeHint::DateTime => Type::TIMESTAMP,
+            TypeHint::DateTimeTz => Type::TIMESTAMPTZ,
+            TypeHint::Json => Type::JSONB,
+            TypeHint::Uuid => Type::UUID,
+            TypeHint::Array => Type::JSONB,
+            TypeHint::Null | TypeHint::Other => {
+                return Err(CoreError::BulkUnavailable(format!(
+                    "PG binary COPY: cannot bind a column with TypeHint::{hint:?} \
+                     (no concrete PG type to declare). Re-run with \
+                     --copy-format text or --bulk-native off."
+                )));
+            }
+        })
+    }
+
+    /// Owned typed wrapper that yields a `&dyn ToSql + Sync` for each
+    /// `Value` variant. NULL is encoded as a typed `Option::None` so
+    /// the writer's per-column type metadata stays valid.
+    #[derive(Debug)]
+    pub(super) enum PgBinaryBind {
+        Bool(Option<bool>),
+        Int8(Option<i64>),
+        Float8(Option<f64>),
+        Numeric(Option<Decimal>),
+        Text(Option<String>),
+        Bytea(Option<Vec<u8>>),
+        Date(Option<NaiveDate>),
+        Time(Option<NaiveTime>),
+        Timestamp(Option<NaiveDateTime>),
+        TimestampTz(Option<DateTime<Utc>>),
+        Json(Option<serde_json::Value>),
+        Uuid(Option<Uuid>),
+    }
+
+    impl PgBinaryBind {
+        pub(super) fn as_to_sql(&self) -> &(dyn ToSql + Sync) {
+            match self {
+                Self::Bool(v) => v,
+                Self::Int8(v) => v,
+                Self::Float8(v) => v,
+                Self::Numeric(v) => v,
+                Self::Text(v) => v,
+                Self::Bytea(v) => v,
+                Self::Date(v) => v,
+                Self::Time(v) => v,
+                Self::Timestamp(v) => v,
+                Self::TimestampTz(v) => v,
+                Self::Json(v) => v,
+                Self::Uuid(v) => v,
+            }
+        }
+    }
+
+    /// Translate one `(Value, TypeHint)` pair into a typed
+    /// `PgBinaryBind`. Hint drives variant selection so NULL picks a
+    /// stable per-column type and so coercions (e.g. `Value::String`
+    /// holding a UUID hex) route to the right binder.
+    pub(super) fn value_to_pg_binary_bind(
+        v: &Value,
+        hint: TypeHint,
+    ) -> Result<PgBinaryBind, CoreError> {
+        Ok(match (v, hint) {
+            (Value::Null, _) => null_bind_for_hint(hint)?,
+            (Value::Bool(b), _) => PgBinaryBind::Bool(Some(*b)),
+            (Value::Int64(n), _) => PgBinaryBind::Int8(Some(*n)),
+            (Value::Float64(f), _) => PgBinaryBind::Float8(Some(*f)),
+            (Value::Decimal(s), _) => PgBinaryBind::Numeric(Some(parse_decimal(s)?)),
+            (Value::String(s), TypeHint::Uuid) => {
+                PgBinaryBind::Uuid(Some(Uuid::parse_str(s).map_err(|e| {
+                    CoreError::QueryFailed(format!("PG binary COPY: bad UUID '{s}': {e}"))
+                })?))
+            }
+            (Value::String(s), _) => PgBinaryBind::Text(Some(s.clone())),
+            (Value::Bytes(b), _) => PgBinaryBind::Bytea(Some(b.clone())),
+            (Value::Date(d), _) => PgBinaryBind::Date(Some(*d)),
+            (Value::Time(t), _) => PgBinaryBind::Time(Some(*t)),
+            (Value::DateTime(dt), _) => PgBinaryBind::Timestamp(Some(*dt)),
+            (Value::DateTimeTz(dt), _) => PgBinaryBind::TimestampTz(Some(*dt)),
+            (Value::Json(j), _) => PgBinaryBind::Json(Some(j.clone())),
+            (Value::Array(arr), _) => {
+                // Map ferrule's structured Array → JSONB to mirror
+                // translate_type's `Array → JSONB` mapping. Round-trip
+                // through serde_json::Value so the binder can use the
+                // existing JSONB ToSql impl.
+                let json = serde_json::to_value(arr).map_err(|e| {
+                    CoreError::QueryFailed(format!(
+                        "PG binary COPY: array serialize: {e}"
+                    ))
+                })?;
+                PgBinaryBind::Json(Some(json))
+            }
+            (Value::Uuid(s), _) => {
+                PgBinaryBind::Uuid(Some(Uuid::parse_str(s).map_err(|e| {
+                    CoreError::QueryFailed(format!("PG binary COPY: bad UUID '{s}': {e}"))
+                })?))
+            }
+        })
+    }
+
+    fn null_bind_for_hint(hint: TypeHint) -> Result<PgBinaryBind, CoreError> {
+        Ok(match hint {
+            TypeHint::Bool => PgBinaryBind::Bool(None),
+            TypeHint::Int64 => PgBinaryBind::Int8(None),
+            TypeHint::Float64 => PgBinaryBind::Float8(None),
+            TypeHint::Decimal => PgBinaryBind::Numeric(None),
+            TypeHint::String => PgBinaryBind::Text(None),
+            TypeHint::Bytes => PgBinaryBind::Bytea(None),
+            TypeHint::Date => PgBinaryBind::Date(None),
+            TypeHint::Time => PgBinaryBind::Time(None),
+            TypeHint::DateTime => PgBinaryBind::Timestamp(None),
+            TypeHint::DateTimeTz => PgBinaryBind::TimestampTz(None),
+            TypeHint::Json | TypeHint::Array => PgBinaryBind::Json(None),
+            TypeHint::Uuid => PgBinaryBind::Uuid(None),
+            TypeHint::Null | TypeHint::Other => {
+                return Err(CoreError::BulkUnavailable(format!(
+                    "PG binary COPY: cannot type-encode NULL for TypeHint::{hint:?}"
+                )));
+            }
+        })
+    }
+
+    fn parse_decimal(s: &str) -> Result<Decimal, CoreError> {
+        Decimal::from_str(s).map_err(|e| {
+            CoreError::QueryFailed(format!("PG binary COPY: invalid NUMERIC '{s}': {e}"))
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pg_type_for_hint_maps_canonical_dest_types() {
+            assert_eq!(pg_type_for_hint(TypeHint::Bool).unwrap(), Type::BOOL);
+            assert_eq!(pg_type_for_hint(TypeHint::Int64).unwrap(), Type::INT8);
+            assert_eq!(pg_type_for_hint(TypeHint::Float64).unwrap(), Type::FLOAT8);
+            assert_eq!(pg_type_for_hint(TypeHint::Decimal).unwrap(), Type::NUMERIC);
+            assert_eq!(pg_type_for_hint(TypeHint::String).unwrap(), Type::TEXT);
+            assert_eq!(pg_type_for_hint(TypeHint::Bytes).unwrap(), Type::BYTEA);
+            assert_eq!(pg_type_for_hint(TypeHint::Date).unwrap(), Type::DATE);
+            assert_eq!(pg_type_for_hint(TypeHint::Time).unwrap(), Type::TIME);
+            assert_eq!(pg_type_for_hint(TypeHint::DateTime).unwrap(), Type::TIMESTAMP);
+            assert_eq!(
+                pg_type_for_hint(TypeHint::DateTimeTz).unwrap(),
+                Type::TIMESTAMPTZ
+            );
+            assert_eq!(pg_type_for_hint(TypeHint::Json).unwrap(), Type::JSONB);
+            assert_eq!(pg_type_for_hint(TypeHint::Uuid).unwrap(), Type::UUID);
+            assert_eq!(pg_type_for_hint(TypeHint::Array).unwrap(), Type::JSONB);
+        }
+
+        #[test]
+        fn pg_type_for_hint_other_falls_back_via_bulk_unavailable() {
+            let err = pg_type_for_hint(TypeHint::Other).unwrap_err();
+            assert!(matches!(err, CoreError::BulkUnavailable(_)));
+            let err = pg_type_for_hint(TypeHint::Null).unwrap_err();
+            assert!(matches!(err, CoreError::BulkUnavailable(_)));
+        }
+
+        #[test]
+        fn null_bind_picks_typed_none_per_hint() {
+            assert!(matches!(
+                null_bind_for_hint(TypeHint::Bool).unwrap(),
+                PgBinaryBind::Bool(None)
+            ));
+            assert!(matches!(
+                null_bind_for_hint(TypeHint::Int64).unwrap(),
+                PgBinaryBind::Int8(None)
+            ));
+            assert!(matches!(
+                null_bind_for_hint(TypeHint::Json).unwrap(),
+                PgBinaryBind::Json(None)
+            ));
+            assert!(matches!(
+                null_bind_for_hint(TypeHint::Uuid).unwrap(),
+                PgBinaryBind::Uuid(None)
+            ));
+        }
+
+        #[test]
+        fn null_bind_array_collapses_to_json_none() {
+            // Array maps to JSONB on the wire (matches translate_type).
+            assert!(matches!(
+                null_bind_for_hint(TypeHint::Array).unwrap(),
+                PgBinaryBind::Json(None)
+            ));
+        }
+
+        #[test]
+        fn value_to_bind_routes_int_bool_string_null() {
+            assert!(matches!(
+                value_to_pg_binary_bind(&Value::Int64(42), TypeHint::Int64).unwrap(),
+                PgBinaryBind::Int8(Some(42))
+            ));
+            assert!(matches!(
+                value_to_pg_binary_bind(&Value::Bool(true), TypeHint::Bool).unwrap(),
+                PgBinaryBind::Bool(Some(true))
+            ));
+            match value_to_pg_binary_bind(&Value::String("hi".into()), TypeHint::String).unwrap() {
+                PgBinaryBind::Text(Some(s)) => assert_eq!(s, "hi"),
+                _ => panic!("expected Text"),
+            }
+            assert!(matches!(
+                value_to_pg_binary_bind(&Value::Null, TypeHint::Int64).unwrap(),
+                PgBinaryBind::Int8(None)
+            ));
+        }
+
+        #[test]
+        fn value_to_bind_decimal_roundtrips_through_rust_decimal() {
+            match value_to_pg_binary_bind(&Value::Decimal("99.5".into()), TypeHint::Decimal)
+                .unwrap()
+            {
+                PgBinaryBind::Numeric(Some(d)) => assert_eq!(d.to_string(), "99.5"),
+                _ => panic!("expected Numeric"),
+            }
+            // Garbage input surfaces as QueryFailed (not BulkUnavailable
+            // — once the dispatcher commits to binary, malformed
+            // numerics aren't recoverable by falling back).
+            let err = value_to_pg_binary_bind(&Value::Decimal("not-a-number".into()), TypeHint::Decimal)
+                .unwrap_err();
+            assert!(matches!(err, CoreError::QueryFailed(_)));
+        }
+
+        #[test]
+        fn value_to_bind_string_to_uuid_when_dest_is_uuid() {
+            let bind = value_to_pg_binary_bind(
+                &Value::String("00112233-4455-6677-8899-aabbccddeeff".into()),
+                TypeHint::Uuid,
+            )
+            .unwrap();
+            match bind {
+                PgBinaryBind::Uuid(Some(u)) => assert_eq!(
+                    u.to_string(),
+                    "00112233-4455-6677-8899-aabbccddeeff"
+                ),
+                _ => panic!("expected Uuid"),
+            }
+        }
+
+        #[test]
+        fn value_to_bind_array_collapses_to_json() {
+            let arr = vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+            ];
+            let bind = value_to_pg_binary_bind(&Value::Array(arr), TypeHint::Array).unwrap();
+            match bind {
+                PgBinaryBind::Json(Some(v)) => {
+                    assert_eq!(v, serde_json::json!(["a", "b"]));
+                }
+                _ => panic!("expected Json"),
+            }
+        }
+    }
+}
+
 pub async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
@@ -784,6 +1215,18 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
             rustls::SignatureScheme::RSA_PKCS1_SHA512,
             rustls::SignatureScheme::ED25519,
         ]
+    }
+}
+
+fn pg_confdeltype(c: i8) -> Option<String> {
+    // pg_constraint.confdeltype encodes ON DELETE as a single char.
+    match c as u8 {
+        b'a' => Some("NO ACTION".into()),
+        b'r' => Some("RESTRICT".into()),
+        b'c' => Some("CASCADE".into()),
+        b'n' => Some("SET NULL".into()),
+        b'd' => Some("SET DEFAULT".into()),
+        _ => None,
     }
 }
 
@@ -1138,6 +1581,7 @@ mod tests {
                 table: &table,
                 columns: &columns,
                 rows: &rows,
+                copy_format: crate::copy::CopyFormat::Text,
             })
             .await
             .expect("bulk_insert_rows");
@@ -1180,5 +1624,348 @@ mod tests {
         conn.execute(&format!("DROP TABLE {table}"))
             .await
             .expect("DROP TABLE");
+    }
+
+    #[tokio::test]
+    async fn test_postgres_primary_key() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("Postgres test container not available, skipping test_postgres_primary_key");
+            return;
+        };
+        // `test_users` seeded with `id SERIAL PRIMARY KEY`.
+        let pk = conn
+            .primary_key(None, "test_users")
+            .await
+            .expect("primary_key");
+        assert_eq!(pk, vec!["id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_postgres_list_foreign_keys() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_list_foreign_keys"
+            );
+            return;
+        };
+        let pid = std::process::id();
+        let child = format!("ferrule_fk_test_orders_{pid}");
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {child}")).await;
+        conn.execute(&format!(
+            "CREATE TABLE {child} (\
+               id SERIAL PRIMARY KEY, \
+               user_id INT REFERENCES test_users(id) ON DELETE CASCADE\
+             )"
+        ))
+        .await
+        .expect("CREATE TABLE");
+
+        let fks = conn
+            .list_foreign_keys(None)
+            .await
+            .expect("list_foreign_keys");
+        let matching: Vec<_> = fks.iter().filter(|fk| fk.child_table == child).collect();
+        assert_eq!(matching.len(), 1, "expected 1 FK from {child}, got {fks:?}");
+        let fk = matching[0];
+        assert_eq!(fk.child_columns, vec!["user_id".to_string()]);
+        assert_eq!(fk.parent_table, "test_users");
+        assert_eq!(fk.parent_columns, vec!["id".to_string()]);
+        assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
+
+        conn.execute(&format!("DROP TABLE {child}"))
+            .await
+            .expect("DROP TABLE");
+    }
+
+    /// End-to-end `--if-exists skip` then `upsert` round-trip against
+    /// Postgres. Single container, two pooled connections, two unique
+    /// per-pid tables.
+    #[tokio::test]
+    async fn test_postgres_copy_skip_then_upsert() {
+        use crate::backend::Backend;
+        use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+
+        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_copy_skip_then_upsert"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let src_table = format!("ferrule_pg_skip_src_{pid}");
+        let dst_table = format!("ferrule_pg_skip_dst_{pid}");
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}")).await;
+        src.execute(&format!(
+            "CREATE TABLE {src_table} (id INT PRIMARY KEY, name TEXT, val INT)"
+        ))
+        .await
+        .expect("CREATE src");
+        dst.execute(&format!(
+            "CREATE TABLE {dst_table} (id INT PRIMARY KEY, name TEXT, val INT)"
+        ))
+        .await
+        .expect("CREATE dst");
+        src.execute(&format!(
+            "INSERT INTO {src_table} VALUES (1, 'new-1', 10), (2, 'new-2', 20)"
+        ))
+        .await
+        .expect("seed src");
+        dst.execute(&format!("INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"))
+            .await
+            .expect("seed dst");
+
+        // --- Skip: id=1 preserved as 'old-1' / 99; id=2 inserted. ----------
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY id"),
+                into: dst_table.clone(),
+            },
+            if_exists: IfExists::Skip,
+            ..Default::default()
+        };
+        copy_rows(&mut src, Backend::Postgres, &mut dst, Backend::Postgres, &opts)
+            .await
+            .expect("copy_rows skip");
+
+        let out = dst
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
+            .await
+            .expect("verify skip");
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "old-1"));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
+
+        // --- Upsert: id=1 overwritten to 'new-1' / 10; id=2 unchanged. -----
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY id"),
+                into: dst_table.clone(),
+            },
+            if_exists: IfExists::Upsert,
+            ..Default::default()
+        };
+        copy_rows(&mut src, Backend::Postgres, &mut dst, Backend::Postgres, &opts)
+            .await
+            .expect("copy_rows upsert");
+
+        let out = dst
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
+            .await
+            .expect("verify upsert");
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
+        assert!(matches!(&out.rows[0][2], Value::Int64(10)));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
+
+        // Cleanup.
+        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+    }
+
+    /// PG → SQLite `--all-tables` round-trip. Two related PG tables
+    /// (parent + child via FK) are copied into a fresh SQLite file in
+    /// FK-respecting order; we verify both tables exist on the
+    /// destination with the expected row counts.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_postgres_to_sqlite_all_tables_round_trip() {
+        use crate::backend::Backend;
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::copy::{copy_all_tables, AllTablesOptions};
+
+        let Some(mut src) = try_connect().await else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_to_sqlite_all_tables_round_trip"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let parent = format!("ferrule_all_parent_{pid}");
+        let child = format!("ferrule_all_child_{pid}");
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {child}")).await;
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {parent}")).await;
+        src.execute(&format!(
+            "CREATE TABLE {parent} (id INT PRIMARY KEY, name TEXT)"
+        ))
+        .await
+        .expect("CREATE parent");
+        src.execute(&format!(
+            "CREATE TABLE {child} (id INT PRIMARY KEY, \
+                                   parent_id INT REFERENCES {parent}(id), \
+                                   note TEXT)"
+        ))
+        .await
+        .expect("CREATE child");
+        src.execute(&format!(
+            "INSERT INTO {parent} VALUES (1, 'one'), (2, 'two')"
+        ))
+        .await
+        .expect("seed parent");
+        src.execute(&format!(
+            "INSERT INTO {child} VALUES (10, 1, 'first'), (11, 2, 'second')"
+        ))
+        .await
+        .expect("seed child");
+
+        // Fresh on-disk SQLite destination.
+        let dst_path = std::env::temp_dir()
+            .join(format!("ferrule-pg-all-tables-{pid}.db"));
+        let _ = std::fs::remove_file(&dst_path);
+        let dst_url = DatabaseUrl::parse(&format!("sqlite://{}", dst_path.display())).unwrap();
+        let mut dst = sqlite_connect(&dst_url, &ConnectOptions::default())
+            .await
+            .expect("connect sqlite dst");
+        dst.execute("PRAGMA foreign_keys = ON").await.unwrap();
+
+        let opts = AllTablesOptions {
+            include: vec![format!("ferrule_all_*_{pid}")],
+            create_table: true,
+            ..Default::default()
+        };
+        let copied = copy_all_tables(&mut src, Backend::Postgres, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect("copy_all_tables PG -> SQLite");
+        assert_eq!(copied, 4, "2 parent rows + 2 child rows expected");
+
+        let p = dst
+            .query(&format!("SELECT count(*) FROM {parent}"))
+            .await
+            .expect("verify parent");
+        let c = dst
+            .query(&format!("SELECT count(*) FROM {child}"))
+            .await
+            .expect("verify child");
+        assert!(matches!(&p.rows[0][0], Value::Int64(2)));
+        assert!(matches!(&c.rows[0][0], Value::Int64(2)));
+
+        // Cleanup PG side.
+        let _ = src.execute(&format!("DROP TABLE {child}")).await;
+        let _ = src.execute(&format!("DROP TABLE {parent}")).await;
+        let _ = std::fs::remove_file(&dst_path);
+    }
+
+    /// PG → PG live round-trip exercising every TypeHint variant
+    /// through the binary COPY path. Verifies the per-Value bind
+    /// enum encodes correctly and that the end-to-end pipeline
+    /// (source SELECT → ferrule Value → BinaryCopyInWriter → PG
+    /// binary frame → readback) is byte-equivalent for the canonical
+    /// PG types.
+    #[tokio::test]
+    async fn test_postgres_binary_copy_round_trip_all_value_variants() {
+        use crate::backend::Backend;
+        use crate::copy::{copy_rows, BulkMode, CopyFormat, CopyOptions, CopySource};
+
+        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_binary_copy_round_trip_all_value_variants"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let src_table = format!("ferrule_pg_bin_src_{pid}");
+        let dst_table = format!("ferrule_pg_bin_dst_{pid}");
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}")).await;
+        // One column per TypeHint that maps to a concrete PG type in
+        // pg_type_for_hint. Order matches the binary writer's expected
+        // shape: any mismatch surfaces as a wire error during write().
+        let create = format!(
+            "CREATE TABLE {src_table} (\
+               b BOOLEAN, \
+               i BIGINT, \
+               f DOUBLE PRECISION, \
+               n NUMERIC, \
+               t TEXT, \
+               by BYTEA, \
+               d DATE, \
+               tm TIME, \
+               dt TIMESTAMP, \
+               dttz TIMESTAMPTZ, \
+               j JSONB, \
+               u UUID\
+             )"
+        );
+        src.execute(&create).await.expect("CREATE src");
+        dst.execute(&create.replace(&src_table, &dst_table))
+            .await
+            .expect("CREATE dst");
+        // Two rows: one fully populated, one all-NULL except the
+        // PK-less identity (just the boolean).
+        src.execute(&format!(
+            "INSERT INTO {src_table} VALUES (\
+               true, 42, 2.5, 99.5, 'hello', '\\xdeadbeef', \
+               DATE '2024-05-14', TIME '12:34:56', \
+               TIMESTAMP '2024-05-14 12:34:56', \
+               TIMESTAMPTZ '2024-05-14 12:34:56+00', \
+               '{{\"k\":\"v\"}}'::jsonb, \
+               '00112233-4455-6677-8899-aabbccddeeff'::uuid\
+             ), (\
+               false, NULL, NULL, NULL, NULL, NULL, \
+               NULL, NULL, NULL, NULL, NULL, NULL\
+             )"
+        ))
+        .await
+        .expect("seed src");
+
+        // Drive the copy via copy_rows so we exercise the dispatcher
+        // → PG bulk path → CopyFormat::Binary branch end-to-end.
+        let opts = CopyOptions {
+            source: CopySource::Query {
+                sql: format!("SELECT * FROM {src_table} ORDER BY i NULLS LAST"),
+                into: dst_table.clone(),
+            },
+            bulk_mode: BulkMode::On,
+            copy_format: CopyFormat::Binary,
+            ..Default::default()
+        };
+        let copied = copy_rows(&mut src, Backend::Postgres, &mut dst, Backend::Postgres, &opts)
+            .await
+            .expect("copy_rows binary COPY");
+        assert_eq!(copied, 2);
+
+        // Read back and assert byte-equivalence per column.
+        let out = dst
+            .query(&format!(
+                "SELECT b, i, f, n::text, t, by, d::text, tm::text, dt::text, \
+                        dttz::text, j::text, u::text \
+                 FROM {dst_table} ORDER BY i NULLS LAST"
+            ))
+            .await
+            .expect("read back");
+        assert_eq!(out.rows.len(), 2);
+        // First (fully populated) row.
+        let r0 = &out.rows[0];
+        assert!(matches!(&r0[0], Value::Bool(true)));
+        assert!(matches!(&r0[1], Value::Int64(42)));
+        match &r0[2] {
+            Value::Float64(f) => assert!((f - 2.5).abs() < 1e-9),
+            other => panic!("expected Float64(2.5), got {other:?}"),
+        }
+        match &r0[3] {
+            Value::String(s) => assert_eq!(s, "99.5"),
+            other => panic!("expected NUMERIC text 99.5, got {other:?}"),
+        }
+        assert!(matches!(&r0[4], Value::String(s) if s == "hello"));
+        assert!(matches!(&r0[5], Value::Bytes(b) if b == &vec![0xde, 0xad, 0xbe, 0xef]));
+        assert!(matches!(&r0[11], Value::String(s) if s == "00112233-4455-6677-8899-aabbccddeeff"));
+
+        // Second row: all NULL except b=false. Verifies typed-NULL
+        // binding for every PgBinaryBind variant.
+        let r1 = &out.rows[1];
+        assert!(matches!(&r1[0], Value::Bool(false)));
+        for col in &r1[1..] {
+            assert!(matches!(col, Value::Null), "expected NULL, got {col:?}");
+        }
+
+        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
     }
 }

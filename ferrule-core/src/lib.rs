@@ -24,10 +24,12 @@ mod backends;
 pub use backend::connect_with_tunnel;
 pub use backend::{connect, Backend};
 pub use connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    StatementResult,
 };
 pub use copy::{
-    copy_rows, translate_ddl, translate_type, BulkMode, CopyOptions, CopySource, IfExists,
+    copy_all_tables, copy_rows, discover_tables, topo_sort, translate_ddl, translate_type,
+    AllTablesOptions, BulkMode, CopyFormat, CopyOptions, CopySource, CycleError, IfExists,
 };
 pub use dump::{dump_query, dump_table, DumpFormat, DumpOptions};
 pub use error::CoreError;
