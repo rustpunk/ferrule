@@ -529,9 +529,12 @@ Notes:
 ### Cross-DB copy — smoke against the seeded containers
 
 `ferrule copy <SRC> <DST>` streams rows between any pair of backends.
-Phase 1 uses a generic batched-INSERT path on the destination;
-backend-native bulk loaders (PG `COPY FROM STDIN`, MySQL `LOAD DATA`,
-MSSQL `BULK INSERT`, Oracle direct-path) are tracked separately.
+The default path is a generic batched INSERT; pass `--bulk-native auto`
+or `on` to opt into the destination's native bulk loader (PG `COPY FROM
+STDIN`, MySQL `LOAD DATA LOCAL INFILE`, MSSQL TDS bulk-load,
+Oracle `oracle::Batch` array DML). For Postgres, `--copy-format binary`
+selects the binary frame; see `docs/src/copy.md` for when each is
+faster.
 
 Default conflict policy is non-destructive: ferrule refuses to copy
 into a non-empty existing target unless `--if-exists append` or

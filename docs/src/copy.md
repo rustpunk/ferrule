@@ -5,6 +5,24 @@ translating column types via ferrule's unified `Value` enum. Postgres
 → SQLite snapshots, MySQL → MSSQL exports, anything → anything — one
 command, no intermediate file, no third tool.
 
+## What ships in v1
+
+| Capability                              | Status        | Notes                                                   |
+|-----------------------------------------|---------------|---------------------------------------------------------|
+| Per-backend type translation            | Shipped       | See "Type translation" below                            |
+| Generic multi-row INSERT                | Shipped       | Default; portable across all five backends              |
+| Native bulk paths                       | Shipped       | `--bulk-native auto\|on`; PG / MSSQL / MySQL / Oracle   |
+| `error` / `append` / `truncate`         | Shipped       | `--if-exists`; `truncate` requires `--yes` from a TTY   |
+| `skip` / `upsert`                       | Shipped       | `--if-exists`; PK-driven, force generic path            |
+| Schema-level copy (FK-ordered)          | Shipped       | `--all-tables` with `--include` / `--exclude` / `--no-fk-check` |
+| Postgres binary `COPY`                  | Shipped       | `--copy-format binary`; PG-only                         |
+| Composite-key / unique-index override   | Deferred      | `--key COL[,COL...]` tracked under [#43](https://github.com/rustpunk/ferrule/issues/43) |
+| Per-side `--src-*` / `--dst-*` flags    | Deferred      | Tracked under [#44](https://github.com/rustpunk/ferrule/issues/44) |
+| Daemon routing for `copy`               | Deferred      | Tracked under [#10](https://github.com/rustpunk/ferrule/issues/10) |
+| Parallel loader (`--parallel N`)        | Deferred      | Depends on the above; tracked under [#38](https://github.com/rustpunk/ferrule/issues/38) |
+| Oracle direct-path `INSERT /*+ APPEND */` | Deferred    | Tracked under [#37](https://github.com/rustpunk/ferrule/issues/37) |
+| `--bulk-native` default flip to `auto`  | Deferred      | Tracked under [#39](https://github.com/rustpunk/ferrule/issues/39); waiting one release cycle |
+
 ## What it does
 
 Source and destination can be any pair of supported backends
@@ -137,8 +155,10 @@ native type carries it. SQLite uses dynamic typing, so most types
 collapse to its five storage classes.
 
 `NOT NULL` is preserved per source column metadata. Primary keys,
-indexes, defaults, and check constraints are *not* copied — Phase 1
-focuses on data movement.
+indexes, defaults, and check constraints are *not* copied — `--create-table`
+focuses on data movement, not schema migration. For full DDL fidelity
+use `ferrule diff` / `ferrule migrate`, or restore from a `pg_dump` /
+`mysqldump`.
 
 ## Native bulk paths (`--bulk-native`)
 
@@ -292,15 +312,11 @@ each table:
   cross-table single transaction is not in this release (it would
   require deferrable FK support on the destination).
 
-## Limits
+## Known limits
 
-- **Composite-key / unique-index conflict resolution.** `skip` /
-  `upsert` use the destination's declared primary key. A user-supplied
-  `--key COL[,COL...]` override (for PK-less tables and conflicts on
-  unique indexes) is tracked under #43.
-- **Shared connection flags.** `--ssh-tunnel`, `--ssh-key`,
-  `--proxy-url`, and `--insecure` apply to *both* source and target
-  in this release. Per-side `--src-*` / `--dst-*` flags are tracked
-  under #44.
-- **No daemon routing for `copy`.** Use direct connections for both
-  sides. Tracked under #10.
+The "Deferred" rows in the [v1 matrix](#what-ships-in-v1) above are
+the explicit known limits — `--key` for PK-less / unique-index
+conflicts (#43), per-side connection flags (#44), daemon-routed
+`copy` (#10), parallel multi-table fan-out (#38), Oracle direct-path
+(#37), and the `--bulk-native` default flip (#39). Each links to a
+GitHub issue with the rationale and follow-up plan.
