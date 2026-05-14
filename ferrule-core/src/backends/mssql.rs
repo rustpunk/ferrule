@@ -7,7 +7,9 @@ use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
 use chrono::{DateTime as ChronoDateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use secrecy::ExposeSecret;
-use tiberius::{Client, ColumnType, EncryptionLevel};
+use tiberius::{
+    numeric::Numeric, Client, ColumnData, ColumnType, EncryptionLevel, IntoSql, TokenRow,
+};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -175,15 +177,180 @@ impl Connection for MssqlConnection {
 
     async fn bulk_insert_rows(
         &mut self,
-        _target: BulkInsert<'_>,
+        target: BulkInsert<'_>,
     ) -> Result<usize, CoreError> {
-        // Phase 3 will implement `Client::bulk_insert` (tiberius's
-        // BulkLoadRequest). Until then, the dispatcher in copy.rs
-        // degrades to the generic INSERT path.
-        Err(CoreError::BulkUnavailable(
-            "MSSQL bulk path not yet implemented (Phase 3)".into(),
-        ))
+        if target.rows.is_empty() {
+            return Ok(0);
+        }
+
+        // tiberius's `client.bulk_insert(table)` issues
+        // `SELECT TOP 0 * FROM <table>` to introspect the column
+        // metadata, then opens a TDS bulk-load stream against the
+        // `Updateable` columns. Both interpolations happen verbatim,
+        // so we pre-quote with the backend's ANSI-quoting helper.
+        let qtable =
+            crate::copy::quote_identifier(target.table, crate::backend::Backend::MsSql);
+        let mut req = self
+            .client
+            .bulk_insert(qtable.as_str())
+            .await
+            .map_err(|e| classify_bulk_setup_error(&e))?;
+
+        let hints: Vec<TypeHint> = target.columns.iter().map(|c| c.type_hint).collect();
+        for row in target.rows {
+            let mut token_row = TokenRow::<'static>::with_capacity(target.columns.len());
+            for (idx, v) in row.iter().enumerate() {
+                let hint = hints.get(idx).copied().unwrap_or(TypeHint::Other);
+                token_row.push(value_to_column_data(v, hint)?);
+            }
+            req.send(token_row).await.map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk send: {e}"))
+            })?;
+        }
+
+        let res = req
+            .finalize()
+            .await
+            .map_err(|e| CoreError::QueryFailed(format!("MSSQL bulk finalize: {e}")))?;
+        Ok(res.total() as usize)
     }
+}
+
+/// Classify a `tiberius::error::Error` raised by `client.bulk_insert`
+/// setup. Returns [`CoreError::BulkUnavailable`] only for conditions
+/// where falling back to a generic INSERT is safe — anything that
+/// could imply a partial insert (post-prologue protocol errors) stays
+/// as `QueryFailed`.
+fn classify_bulk_setup_error(e: &tiberius::error::Error) -> CoreError {
+    let msg = e.to_string();
+    // "Invalid object name '...'" — target is not a base table or
+    // doesn't exist at all. The Auto dispatcher cannot recover by
+    // falling back (the INSERT would fail too), but flag it as
+    // BulkUnavailable so the error message is more informative.
+    // (`On` mode then surfaces it via the dispatcher's hint.)
+    if msg.contains("Invalid object name")
+        || msg.contains("Cannot bulk load")
+        || msg.contains("expecting column metadata")
+    {
+        return CoreError::BulkUnavailable(format!("MSSQL rejected bulk_insert setup: {msg}"));
+    }
+    CoreError::QueryFailed(format!("MSSQL bulk_insert setup: {msg}"))
+}
+
+/// Translate a ferrule [`Value`] into tiberius `ColumnData<'static>`
+/// for the bulk-load stream. The destination column's [`TypeHint`]
+/// is used only to pick the right typed `None` for `Value::Null`;
+/// for non-null values the variant of `Value` is authoritative.
+///
+/// This mirrors [`mssql_to_value`] (the read path) symmetrically.
+fn value_to_column_data(v: &Value, hint: TypeHint) -> Result<ColumnData<'static>, CoreError> {
+    use std::borrow::Cow;
+
+    Ok(match v {
+        Value::Null => null_for_hint(hint),
+        Value::Bool(b) => ColumnData::Bit(Some(*b)),
+        Value::Int64(n) => ColumnData::I64(Some(*n)),
+        Value::Float64(f) => ColumnData::F64(Some(*f)),
+        Value::Decimal(s) => {
+            let n = parse_decimal_to_numeric(s).map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk: decimal {s:?}: {e}"))
+            })?;
+            ColumnData::Numeric(Some(n))
+        }
+        Value::String(s) => ColumnData::String(Some(Cow::Owned(s.clone()))),
+        Value::Bytes(b) => ColumnData::Binary(Some(Cow::Owned(b.clone()))),
+        Value::Date(d) => (*d).into_sql(),
+        Value::Time(t) => (*t).into_sql(),
+        Value::DateTime(dt) => (*dt).into_sql(),
+        Value::DateTimeTz(dt) => (*dt).into_sql(),
+        Value::Json(j) => {
+            // ferrule's DDL translator maps JSON → NVARCHAR(MAX) on
+            // MSSQL — no native JSON column type. Serialize compact.
+            let rendered = serde_json::to_string(j).map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk: JSON serialize: {e}"))
+            })?;
+            ColumnData::String(Some(Cow::Owned(rendered)))
+        }
+        Value::Uuid(s) => {
+            let u = tiberius::Uuid::parse_str(s).map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk: UUID {s:?}: {e}"))
+            })?;
+            ColumnData::Guid(Some(u))
+        }
+        Value::Array(a) => {
+            // DDL translator maps Array → NVARCHAR(MAX) (no native
+            // array type). Serialize compact JSON.
+            let rendered = serde_json::to_string(a).map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk: array serialize: {e}"))
+            })?;
+            ColumnData::String(Some(Cow::Owned(rendered)))
+        }
+    })
+}
+
+/// Pick the typed `None` variant of `ColumnData` matching `hint`. The
+/// destination column type drives the choice — sending the wrong
+/// typed-NULL to a bulk column would fail with a TDS metadata
+/// mismatch.
+fn null_for_hint(hint: TypeHint) -> ColumnData<'static> {
+    match hint {
+        TypeHint::Bool => ColumnData::Bit(None),
+        TypeHint::Int64 => ColumnData::I64(None),
+        TypeHint::Float64 => ColumnData::F64(None),
+        TypeHint::Decimal => ColumnData::Numeric(None),
+        TypeHint::Bytes => ColumnData::Binary(None),
+        TypeHint::Date => ColumnData::Date(None),
+        TypeHint::Time => ColumnData::Time(None),
+        TypeHint::DateTime => ColumnData::DateTime2(None),
+        TypeHint::DateTimeTz => ColumnData::DateTimeOffset(None),
+        TypeHint::Uuid => ColumnData::Guid(None),
+        // NVARCHAR(MAX) is the catch-all on MSSQL — translate_type
+        // sends Json/Array/String/Other/Null all here.
+        _ => ColumnData::String(None),
+    }
+}
+
+/// Parse a decimal string like `"99.5"` / `"-12.345"` / `"42"` into
+/// a tiberius `Numeric { value: i128, scale: u8 }`. Rejects
+/// scientific notation — we always render decimals as plain
+/// `Display` form, so this only fails on malformed input.
+fn parse_decimal_to_numeric(s: &str) -> Result<Numeric, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("empty string".into());
+    }
+    if trimmed.contains(['e', 'E']) {
+        return Err("scientific notation not supported".into());
+    }
+    let (sign, rest) = match trimmed.as_bytes()[0] {
+        b'-' => (-1i128, &trimmed[1..]),
+        b'+' => (1i128, &trimmed[1..]),
+        _ => (1i128, trimmed),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (rest, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err("no digits".into());
+    }
+    let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("non-digit character in {s:?}"));
+    }
+    let raw: i128 = digits
+        .parse()
+        .map_err(|e| format!("parse mantissa: {e}"))?;
+    let scale: u8 = frac_part
+        .len()
+        .try_into()
+        .map_err(|_| "scale exceeds u8".to_string())?;
+    if scale >= 38 {
+        return Err(format!("scale {scale} exceeds MSSQL max 37"));
+    }
+    Ok(Numeric::new_with_scale(sign * raw, scale))
 }
 
 pub async fn connect(
@@ -484,5 +651,265 @@ mod tests {
             matches!(row[4], Value::Json(_) | Value::String(_)),
             "meta should be Json or String"
         );
+    }
+
+    // -------- value_to_column_data + parse_decimal_to_numeric unit tests --------
+
+    #[test]
+    fn parse_decimal_simple() {
+        let n = parse_decimal_to_numeric("99.5").unwrap();
+        assert_eq!(n.value(), 995);
+        assert_eq!(n.scale(), 1);
+    }
+
+    #[test]
+    fn parse_decimal_negative_with_explicit_plus() {
+        let n = parse_decimal_to_numeric("-12.345").unwrap();
+        assert_eq!(n.value(), -12345);
+        assert_eq!(n.scale(), 3);
+        let p = parse_decimal_to_numeric("+0.5").unwrap();
+        assert_eq!(p.value(), 5);
+        assert_eq!(p.scale(), 1);
+    }
+
+    #[test]
+    fn parse_decimal_integer_has_zero_scale() {
+        let n = parse_decimal_to_numeric("42").unwrap();
+        assert_eq!(n.value(), 42);
+        assert_eq!(n.scale(), 0);
+    }
+
+    #[test]
+    fn parse_decimal_rejects_scientific_notation() {
+        assert!(parse_decimal_to_numeric("1.5e10").is_err());
+        assert!(parse_decimal_to_numeric("1E5").is_err());
+    }
+
+    #[test]
+    fn parse_decimal_rejects_malformed() {
+        assert!(parse_decimal_to_numeric("").is_err());
+        assert!(parse_decimal_to_numeric("abc").is_err());
+        assert!(parse_decimal_to_numeric("1..5").is_err());
+        assert!(parse_decimal_to_numeric(".").is_err());
+    }
+
+    #[test]
+    fn value_to_column_data_handles_primitives() {
+        assert!(matches!(
+            value_to_column_data(&Value::Bool(true), TypeHint::Bool).unwrap(),
+            ColumnData::Bit(Some(true))
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Int64(42), TypeHint::Int64).unwrap(),
+            ColumnData::I64(Some(42))
+        ));
+        let f = value_to_column_data(&Value::Float64(1.5), TypeHint::Float64).unwrap();
+        assert!(matches!(f, ColumnData::F64(Some(v)) if (v - 1.5).abs() < 1e-12));
+    }
+
+    #[test]
+    fn value_to_column_data_decimal_routes_through_numeric() {
+        let d = value_to_column_data(&Value::Decimal("12.34".into()), TypeHint::Decimal).unwrap();
+        match d {
+            ColumnData::Numeric(Some(n)) => {
+                assert_eq!(n.value(), 1234);
+                assert_eq!(n.scale(), 2);
+            }
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_column_data_string_bytes_uuid() {
+        match value_to_column_data(&Value::String("hi".into()), TypeHint::String).unwrap() {
+            ColumnData::String(Some(s)) => assert_eq!(s.as_ref(), "hi"),
+            other => panic!("expected String, got {other:?}"),
+        }
+        match value_to_column_data(&Value::Bytes(vec![1, 2, 3]), TypeHint::Bytes).unwrap() {
+            ColumnData::Binary(Some(b)) => assert_eq!(b.as_ref(), &[1u8, 2, 3]),
+            other => panic!("expected Binary, got {other:?}"),
+        }
+        match value_to_column_data(
+            &Value::Uuid("550e8400-e29b-41d4-a716-446655440000".into()),
+            TypeHint::Uuid,
+        )
+        .unwrap()
+        {
+            ColumnData::Guid(Some(u)) => {
+                assert_eq!(u.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+            }
+            other => panic!("expected Guid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_column_data_json_and_array_serialize_as_nvarchar() {
+        let j = serde_json::json!({"role": "admin"});
+        match value_to_column_data(&Value::Json(j), TypeHint::Json).unwrap() {
+            ColumnData::String(Some(s)) => {
+                assert!(s.contains("\"role\":\"admin\""));
+            }
+            other => panic!("expected String for JSON, got {other:?}"),
+        }
+        let a = Value::Array(vec![Value::Int64(1), Value::Int64(2)]);
+        match value_to_column_data(&a, TypeHint::Array).unwrap() {
+            ColumnData::String(Some(s)) => assert_eq!(s.as_ref(), "[1,2]"),
+            other => panic!("expected String for Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_column_data_null_picks_typed_none() {
+        // Each TypeHint should produce its matching typed-None variant.
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Bool).unwrap(),
+            ColumnData::Bit(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Int64).unwrap(),
+            ColumnData::I64(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Decimal).unwrap(),
+            ColumnData::Numeric(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Bytes).unwrap(),
+            ColumnData::Binary(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::DateTimeTz).unwrap(),
+            ColumnData::DateTimeOffset(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Uuid).unwrap(),
+            ColumnData::Guid(None)
+        ));
+        // String/Json/Array/Other all map to NVARCHAR(MAX) → ColumnData::String(None).
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Json).unwrap(),
+            ColumnData::String(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Other).unwrap(),
+            ColumnData::String(None)
+        ));
+    }
+
+    // -------- bulk_insert_rows end-to-end (skip on absent container) --------
+
+    /// Round-trip a scratch table via the bulk path. Verifies that
+    /// tiberius's `bulk_insert` integration with `TokenRow` + our
+    /// value→ColumnData translation produces readable rows on the
+    /// destination. Uses a per-pid table so concurrent test runs
+    /// don't collide.
+    #[tokio::test]
+    async fn test_mssql_bulk_insert_rows_round_trip() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "MSSQL test container not available, skipping test_mssql_bulk_insert_rows_round_trip"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let table = format!("ferrule_bulk_test_{pid}");
+        let _ = conn
+            .execute(&format!(
+                "IF OBJECT_ID('{table}', 'U') IS NOT NULL DROP TABLE {table}"
+            ))
+            .await;
+        conn.execute(&format!(
+            "CREATE TABLE {table} (\
+               id BIGINT NOT NULL, \
+               name NVARCHAR(255) NULL, \
+               active BIT NULL, \
+               score DECIMAL(10,2) NULL, \
+               meta NVARCHAR(MAX) NULL, \
+               uid UNIQUEIDENTIFIER NULL\
+             )"
+        ))
+        .await
+        .expect("CREATE TABLE");
+
+        let columns = vec![
+            ColumnInfo { name: "id".into(), type_hint: TypeHint::Int64, nullable: false },
+            ColumnInfo { name: "name".into(), type_hint: TypeHint::String, nullable: true },
+            ColumnInfo { name: "active".into(), type_hint: TypeHint::Bool, nullable: true },
+            ColumnInfo { name: "score".into(), type_hint: TypeHint::Decimal, nullable: true },
+            ColumnInfo { name: "meta".into(), type_hint: TypeHint::Json, nullable: true },
+            ColumnInfo { name: "uid".into(), type_hint: TypeHint::Uuid, nullable: true },
+        ];
+
+        let rows: Vec<Row> = vec![
+            vec![
+                Value::Int64(1),
+                Value::String("Alice".into()),
+                Value::Bool(true),
+                Value::Decimal("99.50".into()),
+                Value::Json(serde_json::json!({"role": "admin"})),
+                Value::Uuid("550e8400-e29b-41d4-a716-446655440000".into()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::String("Bob".into()),
+                Value::Bool(false),
+                Value::Decimal("-7.25".into()),
+                Value::Json(serde_json::json!({"role": "user"})),
+                Value::Null,
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ];
+
+        let n = conn
+            .bulk_insert_rows(BulkInsert {
+                table: &table,
+                columns: &columns,
+                rows: &rows,
+            })
+            .await
+            .expect("bulk_insert_rows");
+        assert_eq!(n, 3);
+
+        // Round-trip read.
+        let result = conn
+            .query(&format!(
+                "SELECT id, name, active, score, meta, uid FROM {table} ORDER BY id"
+            ))
+            .await
+            .expect("read-back query");
+        assert_eq!(result.rows.len(), 3);
+
+        // Row 1 — verify the decimal landed at the expected value.
+        if let Value::Decimal(s) = &result.rows[0][3] {
+            assert!(
+                s.starts_with("99.5"),
+                "row 1 score should be ~99.50, got {s:?}"
+            );
+        } else if let Value::Float64(f) = result.rows[0][3] {
+            assert!((f - 99.5).abs() < 1e-6, "row 1 score got {f}");
+        } else {
+            panic!("row 1 score should be Decimal or Float64, got {:?}", result.rows[0][3]);
+        }
+
+        // Row 2 — all of name/score/active populated; uid NULL.
+        assert!(matches!(&result.rows[1][5], Value::Null));
+
+        // Row 3 — everything NULL except id.
+        assert!(matches!(&result.rows[2][1], Value::Null));
+        assert!(matches!(&result.rows[2][2], Value::Null));
+        assert!(matches!(&result.rows[2][3], Value::Null));
+
+        // Cleanup.
+        conn.execute(&format!("DROP TABLE {table}"))
+            .await
+            .expect("DROP TABLE");
     }
 }
