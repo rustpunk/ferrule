@@ -181,12 +181,11 @@ pub async fn copy_rows(
         dst.execute(&ddl).await?;
     }
 
-    // Open the wrapping transaction. The truncate strategy and the
-    // explicit --atomic flag both want one. Truncate always wraps so
-    // a failed first INSERT cannot leave the target wiped + empty.
-    let want_tx = opts.atomic
-        || (target_exists && opts.if_exists == IfExists::Truncate);
-    let tx_opened = if want_tx {
+    // --atomic wraps the entire copy in one outer transaction. The
+    // truncate strategy uses a separate, *short* inner transaction
+    // around just the DELETE + first batch (handled inside run_copy)
+    // so it does not hold locks / redo / wal for the whole copy.
+    let outer_tx_opened = if opts.atomic {
         begin_transaction(dst, dst_backend).await
     } else {
         false
@@ -206,7 +205,7 @@ pub async fn copy_rows(
     )
     .await;
 
-    if tx_opened {
+    if outer_tx_opened {
         match &result {
             Ok(_) => {
                 // Commit; if commit fails, surface that as the error.
@@ -235,13 +234,6 @@ async fn run_copy(
     target_exists: bool,
     first_rows: Vec<Vec<Value>>,
 ) -> Result<usize, CoreError> {
-    // Truncate before inserting if requested.
-    if target_exists && opts.if_exists == IfExists::Truncate {
-        let qident = quote_identifier(target_table, dst_backend);
-        let sql = format!("DELETE FROM {qident}");
-        dst.execute(&sql).await?;
-    }
-
     let quoted_table = quote_identifier(target_table, dst_backend);
     let quoted_cols: Vec<String> = columns
         .iter()
@@ -249,18 +241,55 @@ async fn run_copy(
         .collect();
     let cols_clause = quoted_cols.join(", ");
 
-    let mut total = 0usize;
-    let mut offset = 0usize;
-    let first_len = first_rows.len();
+    // Inner mini-transaction wraps DELETE + first batch when the
+    // truncate strategy is in play AND we're not already inside the
+    // outer --atomic transaction. The inner txn commits as soon as the
+    // first batch lands, so subsequent batches do not hold locks.
+    let need_inner_tx = target_exists
+        && opts.if_exists == IfExists::Truncate
+        && !opts.atomic;
+    let inner_tx_opened = if need_inner_tx {
+        begin_transaction(dst, dst_backend).await
+    } else {
+        false
+    };
 
-    if !first_rows.is_empty() {
-        insert_batch(dst, &quoted_table, &cols_clause, &first_rows, dst_backend).await?;
-        total += first_len;
-        offset += first_len;
+    // Prologue: DELETE (if truncate) + first INSERT batch.
+    let prologue = run_truncate_and_first_batch(
+        dst,
+        dst_backend,
+        opts,
+        target_exists,
+        &quoted_table,
+        &cols_clause,
+        &first_rows,
+    )
+    .await;
+
+    let first_len = match prologue {
+        Ok(n) => {
+            if inner_tx_opened {
+                // Commit the short truncate txn before continuing.
+                commit_transaction(dst, dst_backend).await?;
+            }
+            n
+        }
+        Err(e) => {
+            if inner_tx_opened {
+                let _ = rollback_transaction(dst, dst_backend).await;
+            }
+            return Err(e);
+        }
+    };
+
+    if first_len > 0 {
         if let Some(cb) = &opts.progress {
-            cb(total);
+            cb(first_len);
         }
     }
+
+    let mut total = first_len;
+    let mut offset = first_len;
 
     // Continue paging only if the first page was full.
     if first_len >= opts.batch_size {
@@ -291,6 +320,25 @@ async fn run_copy(
     Ok(total)
 }
 
+async fn run_truncate_and_first_batch(
+    dst: &mut dyn Connection,
+    dst_backend: Backend,
+    opts: &CopyOptions,
+    target_exists: bool,
+    quoted_table: &str,
+    cols_clause: &str,
+    first_rows: &[Vec<Value>],
+) -> Result<usize, CoreError> {
+    if target_exists && opts.if_exists == IfExists::Truncate {
+        let sql = format!("DELETE FROM {quoted_table}");
+        dst.execute(&sql).await?;
+    }
+    if !first_rows.is_empty() {
+        insert_batch(dst, quoted_table, cols_clause, first_rows, dst_backend).await?;
+    }
+    Ok(first_rows.len())
+}
+
 async fn insert_batch(
     dst: &mut dyn Connection,
     quoted_table: &str,
@@ -298,22 +346,90 @@ async fn insert_batch(
     rows: &[Vec<Value>],
     dst_backend: Backend,
 ) -> Result<(), CoreError> {
-    if rows.is_empty() {
-        return Ok(());
+    for sql in build_insert_sql(quoted_table, cols_clause, rows, dst_backend) {
+        dst.execute(&sql).await?;
     }
-    let values: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            let cells: Vec<String> = row.iter().map(|v| render_value(v, dst_backend)).collect();
-            format!("({})", cells.join(", "))
-        })
-        .collect();
-    let sql = format!(
-        "INSERT INTO {quoted_table} ({cols_clause}) VALUES {}",
-        values.join(", ")
-    );
-    dst.execute(&sql).await?;
     Ok(())
+}
+
+/// Build one or more INSERT statements for `rows`, chunking and using
+/// backend-appropriate syntax. Returns an empty vec for empty input.
+///
+/// - Oracle uses `INSERT ALL ... SELECT 1 FROM DUAL` (multi-row
+///   `VALUES (..), (..)` is not valid Oracle syntax).
+/// - MSSQL caps each statement at 1000 rows (T-SQL row-constructor
+///   limit; error 10738 above that).
+/// - Oracle caps each statement at 250 rows (defensive — practical
+///   SQL-text-size and `ORA-01795` ceilings tighten quickly past a
+///   few hundred rows of literal values).
+/// - Postgres / MySQL / SQLite emit a single statement.
+pub(crate) fn build_insert_sql(
+    quoted_table: &str,
+    cols_clause: &str,
+    rows: &[Vec<Value>],
+    dst_backend: Backend,
+) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let chunk_size = per_statement_row_cap(dst_backend)
+        .unwrap_or(rows.len())
+        .max(1);
+    rows.chunks(chunk_size)
+        .map(|chunk| build_one_insert(quoted_table, cols_clause, chunk, dst_backend))
+        .collect()
+}
+
+fn build_one_insert(
+    quoted_table: &str,
+    cols_clause: &str,
+    rows: &[Vec<Value>],
+    dst_backend: Backend,
+) -> String {
+    match dst_backend {
+        #[cfg(feature = "oracle")]
+        Backend::Oracle => {
+            let mut sql = String::from("INSERT ALL");
+            for row in rows {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|v| render_value(v, dst_backend))
+                    .collect();
+                sql.push_str(&format!(
+                    " INTO {quoted_table} ({cols_clause}) VALUES ({})",
+                    cells.join(", ")
+                ));
+            }
+            sql.push_str(" SELECT 1 FROM DUAL");
+            sql
+        }
+        _ => {
+            let values: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    let cells: Vec<String> = row
+                        .iter()
+                        .map(|v| render_value(v, dst_backend))
+                        .collect();
+                    format!("({})", cells.join(", "))
+                })
+                .collect();
+            format!(
+                "INSERT INTO {quoted_table} ({cols_clause}) VALUES {}",
+                values.join(", ")
+            )
+        }
+    }
+}
+
+fn per_statement_row_cap(backend: Backend) -> Option<usize> {
+    match backend {
+        #[cfg(feature = "mssql")]
+        Backend::MsSql => Some(1000),
+        #[cfg(feature = "oracle")]
+        Backend::Oracle => Some(250),
+        _ => None,
+    }
 }
 
 /// Backend-aware identifier quoting:
@@ -605,6 +721,87 @@ mod tests {
              \"created_at\" DATETIMEOFFSET)"
         );
     }
+
+    fn row_int(n: i64) -> Vec<Value> {
+        vec![Value::Int64(n)]
+    }
+
+    #[test]
+    fn build_insert_sql_empty_rows_returns_empty() {
+        let out = build_insert_sql("\"t\"", "\"id\"", &[], default_backend_for_test());
+        assert!(out.is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn build_insert_sql_sqlite_emits_single_multi_row_insert() {
+        let rows = vec![row_int(1), row_int(2), row_int(3)];
+        let out = build_insert_sql("\"t\"", "\"id\"", &rows, Backend::Sqlite);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], "INSERT INTO \"t\" (\"id\") VALUES (1), (2), (3)");
+    }
+
+    #[cfg(feature = "oracle")]
+    #[test]
+    fn build_insert_sql_oracle_emits_insert_all_with_select_from_dual() {
+        let rows = vec![row_int(1), row_int(2), row_int(3)];
+        let out = build_insert_sql("\"t\"", "\"id\"", &rows, Backend::Oracle);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0],
+            "INSERT ALL\
+             \u{0020}INTO \"t\" (\"id\") VALUES (1)\
+             \u{0020}INTO \"t\" (\"id\") VALUES (2)\
+             \u{0020}INTO \"t\" (\"id\") VALUES (3)\
+             \u{0020}SELECT 1 FROM DUAL"
+        );
+    }
+
+    #[cfg(feature = "mssql")]
+    #[test]
+    fn build_insert_sql_mssql_splits_above_1000_rows() {
+        let rows: Vec<Vec<Value>> = (0..2500).map(|i| row_int(i as i64)).collect();
+        let out = build_insert_sql("\"t\"", "\"id\"", &rows, Backend::MsSql);
+        // 2500 rows / 1000 cap = 3 chunks (1000 / 1000 / 500).
+        assert_eq!(out.len(), 3);
+        // Each chunk should be a single INSERT statement.
+        for sql in &out {
+            assert!(sql.starts_with("INSERT INTO \"t\" (\"id\") VALUES "));
+        }
+        // Sanity check the row-counts via comma counts: chunk 0 should
+        // have 999 commas separating 1000 row tuples.
+        assert_eq!(out[0].matches("), (").count(), 999);
+        assert_eq!(out[1].matches("), (").count(), 999);
+        assert_eq!(out[2].matches("), (").count(), 499);
+    }
+
+    #[cfg(feature = "oracle")]
+    #[test]
+    fn build_insert_sql_oracle_chunks_at_250_rows() {
+        let rows: Vec<Vec<Value>> = (0..600).map(|i| row_int(i as i64)).collect();
+        let out = build_insert_sql("\"t\"", "\"id\"", &rows, Backend::Oracle);
+        // 600 / 250 = 3 chunks (250 / 250 / 100).
+        assert_eq!(out.len(), 3);
+        for sql in &out {
+            assert!(sql.starts_with("INSERT ALL"));
+            assert!(sql.ends_with(" SELECT 1 FROM DUAL"));
+        }
+        // Each "INTO ... VALUES" occurrence is exactly one row.
+        assert_eq!(out[0].matches(" INTO ").count(), 250);
+        assert_eq!(out[1].matches(" INTO ").count(), 250);
+        assert_eq!(out[2].matches(" INTO ").count(), 100);
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn default_backend_for_test() -> Backend { Backend::Sqlite }
+    #[cfg(all(not(feature = "sqlite"), feature = "postgres"))]
+    fn default_backend_for_test() -> Backend { Backend::Postgres }
+    #[cfg(all(not(feature = "sqlite"), not(feature = "postgres"), feature = "mysql"))]
+    fn default_backend_for_test() -> Backend { Backend::MySql }
+    #[cfg(all(not(feature = "sqlite"), not(feature = "postgres"), not(feature = "mysql"), feature = "mssql"))]
+    fn default_backend_for_test() -> Backend { Backend::MsSql }
+    #[cfg(all(not(feature = "sqlite"), not(feature = "postgres"), not(feature = "mysql"), not(feature = "mssql"), feature = "oracle"))]
+    fn default_backend_for_test() -> Backend { Backend::Oracle }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
