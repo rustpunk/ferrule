@@ -113,18 +113,72 @@ collapse to its five storage classes.
 indexes, defaults, and check constraints are *not* copied — Phase 1
 focuses on data movement.
 
-## Limits (Phase 1)
+## Native bulk paths (`--bulk-native`)
 
-- **Generic INSERT path only.** Backend-native bulk loaders
-  (Postgres `COPY FROM STDIN`, MySQL `LOAD DATA`, MSSQL `BULK INSERT`,
-  Oracle direct-path) are tracked as a Phase 2 enhancement.
-- **One table at a time.** Schema-level copy with FK ordering is
-  Phase 2.
+By default, `ferrule copy` builds one multi-row INSERT per page and
+sends it via the standard driver path. That works everywhere but is
+5–50× slower than each backend's native bulk loader for
+million-row migrations.
+
+Pass `--bulk-native <mode>` to opt into the native path:
+
+| Mode    | Behavior                                                                                                                  |
+|---------|---------------------------------------------------------------------------------------------------------------------------|
+| `off`   | *(default)* Always use the generic multi-row INSERT path. v1 baseline.                                                    |
+| `auto`  | Try the native path; on `BulkUnavailable` emit one stderr warning and fall back to generic INSERT for that batch.         |
+| `on`    | Require the native path. `BulkUnavailable` surfaces as a hard error referencing `--bulk-native`.                          |
+
+The flag is destination-only: each backend ships a native path
+*if it has one*. SQLite stays on the generic path always (its
+bottleneck is fsync, not parse/plan).
+
+| Destination | Native path                                              | Common `BulkUnavailable` triggers                                                          |
+|-------------|----------------------------------------------------------|--------------------------------------------------------------------------------------------|
+| Postgres    | `COPY <tbl> (cols) FROM STDIN WITH (FORMAT TEXT)`        | Target is a VIEW / materialized view / foreign table.                                      |
+| MSSQL       | `tiberius::Client::bulk_insert` (TDS bulk-load token)    | Target is not a base table; `Invalid object name`.                                         |
+| MySQL       | `LOAD DATA LOCAL INFILE` via a per-call infile handler   | Server-side `local_infile=OFF` (default in MySQL 8.0+ — set `local_infile=ON` to enable).  |
+| Oracle      | `oracle::Batch` (array DML via ODPI-C)                   | `ORA-01031` insufficient privilege; `ORA-00942` table does not exist; Instant Client missing.|
+| SQLite      | No native loader. `--bulk-native=on` returns a hard error.| —                                                                                          |
+
+### Format choices
+
+- **Postgres** uses `FORMAT TEXT`, not `BINARY`. Binary payloads can
+  be *larger* than text on int-heavy schemas (4-byte length prefixes
+  inflate small ints), and most of the win over INSERT comes from
+  skipping parse/plan, not from the wire format. Binary COPY is
+  tracked as a follow-up under issue #36.
+- **MySQL** ships UTF-8 tab/newline-delimited with backslash escapes
+  matching `ESCAPED BY '\\'`. The per-call local infile handler is
+  installed only for the duration of one `bulk_insert_rows` call —
+  a hostile `LOAD DATA LOCAL INFILE '/etc/passwd'` typed into
+  `ferrule query` on the same connection fails immediately because
+  there is no handler installed at that moment.
+- **Oracle** uses array DML (safe default — respects triggers,
+  constraints, indexes). The faster but more invasive
+  `INSERT /*+ APPEND */` direct-path is opt-in and tracked under
+  issue #37; on this path bulk loads bypass triggers and require
+  exclusive locks until commit.
+
+### What surfaces in `--bulk-native=auto`
+
+A successful bulk batch in `auto` mode prints nothing extra. On
+fallback, you'll see one stderr line per affected batch:
+
+```
+[ferrule] bulk: <backend> path unavailable: <reason>; using generic INSERT
+```
+
+Use `--verbose` to additionally log one line per successful bulk batch.
+
+## Limits (Phase 1.5)
+
+- **Single-table copy only.** Schema-level copy with FK ordering is
+  tracked under #30.
 - **`error` / `append` / `truncate` strategies only.** `skip` and
-  `upsert` are Phase 2.
+  `upsert` are tracked under #29.
 - **Shared connection flags.** `--ssh-tunnel`, `--ssh-key`,
   `--proxy-url`, and `--insecure` apply to *both* source and target
-  in Phase 1. Per-side `--src-*` / `--dst-*` flags are tracked as a
-  backlog enhancement; today, source and target must be reachable
-  through the same tunnel/proxy.
-- **No daemon routing.** Use direct connections for both sides.
+  in this release. Per-side `--src-*` / `--dst-*` flags are tracked
+  as a backlog enhancement.
+- **No daemon routing for `copy`.** Use direct connections for both
+  sides. Tracked under #10.

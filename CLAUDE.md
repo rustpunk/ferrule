@@ -525,9 +525,56 @@ ferrule copy \
 rm /tmp/ferrule-copy-smoke.db
 ```
 
+Bulk-native paths (`--bulk-native auto|on`) require a destination
+backend with a real bulk loader — see `docs/src/copy.md` for the
+matrix. The flag is destination-only; SQLite stays on the generic
+path. Smoke recipe (Postgres → Postgres against the same seeded
+container, since PG is the only backend that has a `COPY` source
+that ferrule's source-side SELECT already exercises):
+
+```bash
+# Bulk-on path: Postgres native COPY ... FROM STDIN.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  --query "SELECT * FROM test_users" --into bulk_pg_smoke \
+  --create-table --bulk-native on
+
+# Auto path: chooses native if available, falls back if not.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-bulk.db" \
+  --table test_users --create-table --bulk-native auto
+# → SQLite has no native loader; auto silently falls back to INSERT.
+
+# `on` against a no-bulk backend is a hard error referencing
+# --bulk-native, useful in CI to verify the env supports bulk.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-copy-bulk.db" \
+  --table test_users --create-table --bulk-native on
+# → "--bulk-native=on but Sqlite bulk path unavailable: ..."
+
+rm -f /tmp/ferrule-copy-bulk.db
+```
+
+For MySQL `LOAD DATA LOCAL INFILE`, the server-side
+`local_infile=ON` must be set (default is OFF in MySQL 8.0+):
+
+```bash
+docker exec ferrule-mysql-test mysql -uroot -pferrule -e "SET GLOBAL local_infile = ON"
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "mysql://root:ferrule@127.0.0.1:13306/ferrule" \
+  --table test_users --create-table --bulk-native on
+```
+
 Inline tests at `ferrule-core/src/copy.rs` cover the SQLite → SQLite
 round trip, the default-conflict refusal, the truncate-replaces-rows
-path, and the query+into mode. Cross-backend integration tests are
+path, the query+into mode, and the `BulkMode` dispatcher (Off / Auto /
+On behaviour against a tracking wrapper around SQLite). Per-backend
+bulk encoders and bulk_insert_rows round trips are covered in each
+backend module's inline tests. Cross-backend integration tests are
 deferred — the existing per-backend test fixtures already cover both
 sides of the type translation in isolation.
 
