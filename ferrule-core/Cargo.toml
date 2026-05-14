@@ -8,7 +8,7 @@ license.workspace = true
 
 [features]
 default = []
-postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:uuid", "dep:rust_decimal", "dep:rustls"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:uuid", "dep:rust_decimal", "dep:rustls", "dep:bytes", "dep:futures-util"]
 mysql = ["dep:mysql_async"]
 mssql = ["dep:tiberius", "dep:tokio-util"]
 sqlite = ["dep:rusqlite"]
@@ -43,6 +43,11 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 uuid = { workspace = true, optional = true }
+# For PG bulk path (`COPY ... FROM STDIN`): bytes::Bytes is the payload
+# accepted by `tokio_postgres::CopyInSink`, and futures-util::SinkExt
+# is required to call `.send()` / `.close()` on it ergonomically.
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink"] }
 
 # MySQL
 mysql_async = { version = "0.35", optional = true }

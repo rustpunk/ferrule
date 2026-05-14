@@ -1422,9 +1422,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
  "csv",
  "ferrule-config",
+ "futures-util",
  "hex",
  "indexmap",
  "mysql_async",
