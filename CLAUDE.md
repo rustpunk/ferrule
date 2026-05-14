@@ -110,8 +110,22 @@ CREATE TABLE test_users (
 INSERT INTO test_users (name, age, score, active, meta) VALUES
   ('Alice', 30, 99.5,  TRUE,  '{"role": "admin"}'),
   ('Bob',   25, 88.25, FALSE, '{"role": "user"}');
+CREATE TABLE test_orders (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT,
+  total DECIMAL(10,2),
+  FOREIGN KEY (user_id) REFERENCES test_users(id) ON DELETE CASCADE
+);
+INSERT INTO test_orders (user_id, total) VALUES
+  (1, 19.99), (1, 4.50), (2, 12.00);
 SQL
 ```
+
+`test_orders` adds a child table with an ON DELETE CASCADE FK back to
+`test_users`. The Phase-1 introspection tests
+(`Connection::primary_key` / `list_foreign_keys`) and the Phase-3
+multi-table copy fixtures (`ferrule copy --all-tables`) both rely on
+this edge to exercise FK ordering.
 
 Smoke commands (mirrors the Postgres section):
 
@@ -162,8 +176,21 @@ CREATE TABLE test_users (
 INSERT INTO test_users (name, age, score, active, meta)
   VALUES ('Alice', 30, 99.5, true, '{\"role\": \"admin\"}'),
          ('Bob', 25, 88.25, false, '{\"role\": \"user\"}');
+CREATE TABLE test_orders (
+  id SERIAL PRIMARY KEY,
+  user_id INT REFERENCES test_users(id) ON DELETE CASCADE,
+  total NUMERIC(10,2)
+);
+INSERT INTO test_orders (user_id, total) VALUES
+  (1, 19.99), (1, 4.50), (2, 12.00);
 "
 ```
+
+`test_orders` adds a child table with an `ON DELETE CASCADE` FK back
+to `test_users`. The Phase-1 introspection tests
+(`Connection::primary_key` / `list_foreign_keys`) and the Phase-3
+multi-table copy fixtures (`ferrule copy --all-tables`) both rely on
+this edge to exercise FK ordering.
 
 Verify the three backend paths (extended protocol, single DML, multi-statement):
 
@@ -248,8 +275,20 @@ INSERT INTO test_users (name, age, score, active, meta) VALUES
   ('Alice', 30, 99.5,  1, '{"role": "admin"}'),
   ('Bob',   25, 88.25, 0, '{"role": "user"}');
 GO
+CREATE TABLE test_orders (
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  user_id INT FOREIGN KEY REFERENCES test_users(id) ON DELETE CASCADE,
+  total DECIMAL(10,2)
+);
+INSERT INTO test_orders (user_id, total) VALUES
+  (1, 19.99), (1, 4.50), (2, 12.00);
+GO
 SQL
 ```
+
+`test_orders` is the child table used by Phase-1 introspection tests
+(`Connection::primary_key` / `list_foreign_keys`) and the Phase-3
+multi-table copy fixtures.
 
 Schema deviations from Postgres: MSSQL has no native `BOOLEAN` (use `BIT`),
 no native JSON type (store JSON in `NVARCHAR(MAX)` — the type-mapping test
@@ -331,10 +370,25 @@ CREATE TABLE test_users (
 );
 INSERT INTO test_users (name, age, score, active, meta) VALUES ('Alice', 30, 99.5,  1, '{"role": "admin"}');
 INSERT INTO test_users (name, age, score, active, meta) VALUES ('Bob',   25, 88.25, 0, '{"role": "user"}');
+CREATE TABLE test_orders (
+  id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id NUMBER,
+  total NUMBER(10,2),
+  CONSTRAINT test_orders_user_fk FOREIGN KEY (user_id)
+    REFERENCES test_users(id) ON DELETE CASCADE
+);
+INSERT INTO test_orders (user_id, total) VALUES (1, 19.99);
+INSERT INTO test_orders (user_id, total) VALUES (1,  4.50);
+INSERT INTO test_orders (user_id, total) VALUES (2, 12.00);
 COMMIT;
 EXIT
 SQL
 ```
+
+`test_orders` mirrors the other backends' child-table fixture for the
+Phase-1 introspection tests and the Phase-3 `--all-tables` copy
+smokes. Note Oracle requires the constraint to be named (no anonymous
+inline `FOREIGN KEY ... REFERENCES`).
 
 Schema deviations from Postgres: Oracle has no native `BOOLEAN` until 23c
 (`NUMBER(1)`), no `UUID` type (use `RAW(16)` + `SYS_GUID()` -- note `guid` not

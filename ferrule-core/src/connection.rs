@@ -42,6 +42,20 @@ pub struct BulkInsert<'a> {
     pub rows: &'a [Row],
 }
 
+/// A foreign-key edge in a schema, returned by
+/// [`Connection::list_foreign_keys`]. The columns lists are aligned:
+/// `child_columns[i]` references `parent_columns[i]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub child_table: String,
+    pub child_columns: Vec<String>,
+    pub parent_table: String,
+    pub parent_columns: Vec<String>,
+    /// Informational only: e.g. `"CASCADE"`, `"SET NULL"`, `"NO ACTION"`.
+    /// `None` when the backend doesn't expose this (or it isn't set).
+    pub on_delete: Option<String>,
+}
+
 /// Trait implemented by every backend connection.
 #[async_trait]
 pub trait Connection: Send {
@@ -79,6 +93,32 @@ pub trait Connection: Send {
         schema: Option<&str>,
         table: &str,
     ) -> Result<QueryResult, CoreError>;
+
+    /// Return the column names of `table`'s primary key, in key
+    /// position order. Returns an empty `Vec` when the table has no
+    /// declared PK. The `schema` argument follows the same default-
+    /// schema convention as [`describe_table`](Self::describe_table).
+    ///
+    /// Implementations must not infer a PK from unique indexes — only
+    /// declared primary-key constraints. Callers that want to override
+    /// the conflict key supply it explicitly.
+    async fn primary_key(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<String>, CoreError>;
+
+    /// Return every foreign-key edge in `schema` (or the default
+    /// schema if `None`). Used by schema-level copy to topologically
+    /// order tables — load parents before children.
+    ///
+    /// Backends without referential integrity (SQLite when
+    /// `foreign_keys=off`, MySQL on MyISAM, etc.) still return any
+    /// declared FKs; runtime enforcement is a separate concern.
+    async fn list_foreign_keys(
+        &mut self,
+        schema: Option<&str>,
+    ) -> Result<Vec<ForeignKey>, CoreError>;
 
     /// Insert `target.rows` into `target.table` using the backend's
     /// native bulk loader (Postgres `COPY FROM STDIN`, MSSQL

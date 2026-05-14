@@ -295,6 +295,21 @@ mod ssh_impl {
             self.inner.describe_table(schema, table).await
         }
 
+        async fn primary_key(
+            &mut self,
+            schema: Option<&str>,
+            table: &str,
+        ) -> Result<Vec<String>, crate::CoreError> {
+            self.inner.primary_key(schema, table).await
+        }
+
+        async fn list_foreign_keys(
+            &mut self,
+            schema: Option<&str>,
+        ) -> Result<Vec<crate::ForeignKey>, crate::CoreError> {
+            self.inner.list_foreign_keys(schema).await
+        }
+
         async fn bulk_insert_rows(
             &mut self,
             target: crate::connection::BulkInsert<'_>,

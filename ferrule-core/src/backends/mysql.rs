@@ -1,5 +1,6 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -202,6 +203,99 @@ impl Connection for MySqlConnection {
             escape_mysql_string(table)
         );
         self.query(&sql).await
+    }
+
+    async fn primary_key(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<String>, CoreError> {
+        let schema = match schema {
+            Some(s) => s.to_string(),
+            None => current_database(self).await?,
+        };
+        let sql = format!(
+            "SELECT column_name FROM information_schema.key_column_usage \
+             WHERE table_schema = '{}' AND table_name = '{}' \
+               AND constraint_name = 'PRIMARY' \
+             ORDER BY ordinal_position",
+            escape_mysql_string(&schema),
+            escape_mysql_string(table)
+        );
+        let result = self.query(&sql).await?;
+        Ok(result
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                row.into_iter().next().and_then(|v| match v {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    async fn list_foreign_keys(
+        &mut self,
+        schema: Option<&str>,
+    ) -> Result<Vec<ForeignKey>, CoreError> {
+        let schema = match schema {
+            Some(s) => s.to_string(),
+            None => current_database(self).await?,
+        };
+        // KEY_COLUMN_USAGE has one row per (constraint, column position).
+        // referential_constraints gives ON DELETE; join to surface it.
+        let sql = format!(
+            "SELECT k.constraint_name, k.table_name, k.column_name, \
+                    k.referenced_table_name, k.referenced_column_name, \
+                    rc.delete_rule \
+             FROM information_schema.key_column_usage k \
+             JOIN information_schema.referential_constraints rc \
+               ON rc.constraint_schema = k.constraint_schema \
+              AND rc.constraint_name = k.constraint_name \
+             WHERE k.table_schema = '{}' AND k.referenced_table_name IS NOT NULL \
+             ORDER BY k.constraint_name, k.ordinal_position",
+            escape_mysql_string(&schema)
+        );
+        let result = self.query(&sql).await?;
+        let mut map: indexmap::IndexMap<String, ForeignKey> = indexmap::IndexMap::new();
+        for row in result.rows {
+            let mut cols = row.into_iter();
+            let conname = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let child_table = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let child_col = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let parent_table = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let parent_col = match cols.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let on_delete = match cols.next() {
+                Some(Value::String(s)) => Some(s),
+                _ => None,
+            };
+            let entry = map.entry(conname).or_insert_with(|| ForeignKey {
+                child_table: child_table.clone(),
+                child_columns: Vec::new(),
+                parent_table: parent_table.clone(),
+                parent_columns: Vec::new(),
+                on_delete,
+            });
+            entry.child_columns.push(child_col);
+            entry.parent_columns.push(parent_col);
+        }
+        Ok(map.into_values().collect())
     }
 
     async fn bulk_insert_rows(
@@ -500,6 +594,20 @@ fn parse_naive_datetime(s: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
         .ok()
         .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
+}
+
+async fn current_database(conn: &mut MySqlConnection) -> Result<String, CoreError> {
+    let result = conn.query("SELECT DATABASE()").await?;
+    Ok(result
+        .rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.into_iter().next())
+        .and_then(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+        .unwrap_or_default())
 }
 
 fn escape_mysql_identifier(name: &str) -> String {
@@ -1200,5 +1308,54 @@ mod tests {
         let _ = conn
             .execute(&format!("DROP TABLE {table}"))
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_mysql_primary_key() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("MySQL test container not available, skipping test_mysql_primary_key");
+            return;
+        };
+        let pk = conn
+            .primary_key(None, "test_users")
+            .await
+            .expect("primary_key");
+        assert_eq!(pk, vec!["id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_mysql_list_foreign_keys() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "MySQL test container not available, skipping test_mysql_list_foreign_keys"
+            );
+            return;
+        };
+        let pid = std::process::id();
+        let child = format!("ferrule_fk_test_orders_{pid}");
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {child}")).await;
+        conn.execute(&format!(
+            "CREATE TABLE {child} (\
+               id INT AUTO_INCREMENT PRIMARY KEY, \
+               user_id INT, \
+               FOREIGN KEY (user_id) REFERENCES test_users(id) ON DELETE CASCADE\
+             )"
+        ))
+        .await
+        .expect("CREATE TABLE");
+
+        let fks = conn
+            .list_foreign_keys(None)
+            .await
+            .expect("list_foreign_keys");
+        let matching: Vec<_> = fks.iter().filter(|fk| fk.child_table == child).collect();
+        assert_eq!(matching.len(), 1, "expected 1 FK from {child}, got {fks:?}");
+        let fk = matching[0];
+        assert_eq!(fk.child_columns, vec!["user_id".to_string()]);
+        assert_eq!(fk.parent_table, "test_users");
+        assert_eq!(fk.parent_columns, vec!["id".to_string()]);
+        assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
+
+        let _ = conn.execute(&format!("DROP TABLE {child}")).await;
     }
 }

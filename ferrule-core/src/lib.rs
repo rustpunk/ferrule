@@ -24,7 +24,8 @@ mod backends;
 pub use backend::connect_with_tunnel;
 pub use backend::{connect, Backend};
 pub use connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    StatementResult,
 };
 pub use copy::{
     copy_rows, translate_ddl, translate_type, BulkMode, CopyOptions, CopySource, IfExists,

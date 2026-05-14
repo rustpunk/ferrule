@@ -1,5 +1,6 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -24,7 +25,7 @@ impl Connection for PostgresConnection {
             .await
             .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
         Ok(ExecutionSummary {
-            rows_affected: Some(rows_affected as u64),
+            rows_affected: Some(rows_affected),
             command_tag: None,
         })
     }
@@ -240,6 +241,82 @@ impl Connection for PostgresConnection {
             columns,
             rows: data_rows,
         })
+    }
+
+    async fn primary_key(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<String>, CoreError> {
+        let schema = schema.unwrap_or("public");
+        // `pg_index.indkey` is a smallint[] of attribute numbers in
+        // key order; unnest preserves order with WITH ORDINALITY.
+        let sql = "SELECT a.attname \
+                   FROM pg_index i \
+                   JOIN pg_class c ON c.oid = i.indrelid \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                   JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+                   JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum \
+                   WHERE i.indisprimary AND n.nspname = $1 AND c.relname = $2 \
+                   ORDER BY k.ord";
+        let rows = self
+            .client
+            .query(sql, &[&schema, &table])
+            .await
+            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    async fn list_foreign_keys(
+        &mut self,
+        schema: Option<&str>,
+    ) -> Result<Vec<ForeignKey>, CoreError> {
+        let schema = schema.unwrap_or("public");
+        // One row per (FK, position) pair; aggregate in Rust to keep
+        // the SQL portable.
+        let sql = "SELECT c.conname, \
+                          cl_child.relname AS child_table, \
+                          a_child.attname AS child_col, \
+                          cl_parent.relname AS parent_table, \
+                          a_parent.attname AS parent_col, \
+                          c.confdeltype, \
+                          k.ord \
+                   FROM pg_constraint c \
+                   JOIN pg_class cl_child ON cl_child.oid = c.conrelid \
+                   JOIN pg_namespace n_child ON n_child.oid = cl_child.relnamespace \
+                   JOIN pg_class cl_parent ON cl_parent.oid = c.confrelid \
+                   JOIN pg_namespace n_parent ON n_parent.oid = cl_parent.relnamespace \
+                   JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+                   JOIN pg_attribute a_child ON a_child.attrelid = cl_child.oid AND a_child.attnum = k.attnum \
+                   JOIN unnest(c.confkey) WITH ORDINALITY AS kp(attnum, ord) ON kp.ord = k.ord \
+                   JOIN pg_attribute a_parent ON a_parent.attrelid = cl_parent.oid AND a_parent.attnum = kp.attnum \
+                   WHERE c.contype = 'f' AND n_child.nspname = $1 \
+                   ORDER BY c.conname, k.ord";
+        let rows = self
+            .client
+            .query(sql, &[&schema])
+            .await
+            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+        let mut map: indexmap::IndexMap<String, ForeignKey> = indexmap::IndexMap::new();
+        for row in rows {
+            let conname: String = row.get(0);
+            let child_table: String = row.get(1);
+            let child_col: String = row.get(2);
+            let parent_table: String = row.get(3);
+            let parent_col: String = row.get(4);
+            let confdeltype: i8 = row.get(5);
+            let on_delete = pg_confdeltype(confdeltype);
+            let entry = map.entry(conname).or_insert_with(|| ForeignKey {
+                child_table: child_table.clone(),
+                child_columns: Vec::new(),
+                parent_table: parent_table.clone(),
+                parent_columns: Vec::new(),
+                on_delete,
+            });
+            entry.child_columns.push(child_col);
+            entry.parent_columns.push(parent_col);
+        }
+        Ok(map.into_values().collect())
     }
 
     async fn bulk_insert_rows(
@@ -787,6 +864,18 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
     }
 }
 
+fn pg_confdeltype(c: i8) -> Option<String> {
+    // pg_constraint.confdeltype encodes ON DELETE as a single char.
+    match c as u8 {
+        b'a' => Some("NO ACTION".into()),
+        b'r' => Some("RESTRICT".into()),
+        b'c' => Some("CASCADE".into()),
+        b'n' => Some("SET NULL".into()),
+        b'd' => Some("SET DEFAULT".into()),
+        _ => None,
+    }
+}
+
 fn pg_type_to_hint(ty: &Type) -> TypeHint {
     match ty {
         &Type::BOOL => TypeHint::Bool,
@@ -1178,6 +1267,57 @@ mod tests {
 
         // Cleanup.
         conn.execute(&format!("DROP TABLE {table}"))
+            .await
+            .expect("DROP TABLE");
+    }
+
+    #[tokio::test]
+    async fn test_postgres_primary_key() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!("Postgres test container not available, skipping test_postgres_primary_key");
+            return;
+        };
+        // `test_users` seeded with `id SERIAL PRIMARY KEY`.
+        let pk = conn
+            .primary_key(None, "test_users")
+            .await
+            .expect("primary_key");
+        assert_eq!(pk, vec!["id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_postgres_list_foreign_keys() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_list_foreign_keys"
+            );
+            return;
+        };
+        let pid = std::process::id();
+        let child = format!("ferrule_fk_test_orders_{pid}");
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {child}")).await;
+        conn.execute(&format!(
+            "CREATE TABLE {child} (\
+               id SERIAL PRIMARY KEY, \
+               user_id INT REFERENCES test_users(id) ON DELETE CASCADE\
+             )"
+        ))
+        .await
+        .expect("CREATE TABLE");
+
+        let fks = conn
+            .list_foreign_keys(None)
+            .await
+            .expect("list_foreign_keys");
+        let matching: Vec<_> = fks.iter().filter(|fk| fk.child_table == child).collect();
+        assert_eq!(matching.len(), 1, "expected 1 FK from {child}, got {fks:?}");
+        let fk = matching[0];
+        assert_eq!(fk.child_columns, vec!["user_id".to_string()]);
+        assert_eq!(fk.parent_table, "test_users");
+        assert_eq!(fk.parent_columns, vec!["id".to_string()]);
+        assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
+
+        conn.execute(&format!("DROP TABLE {child}"))
             .await
             .expect("DROP TABLE");
     }

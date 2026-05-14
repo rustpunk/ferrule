@@ -1,5 +1,6 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -164,6 +165,113 @@ impl Connection for SqliteConnection {
                 rows.push(values);
             }
             Ok(QueryResult { columns, rows })
+        })
+        .await
+        .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+    }
+
+    async fn primary_key(
+        &mut self,
+        _schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<String>, CoreError> {
+        let table = table.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().unwrap();
+            // `PRAGMA table_info(t)` exposes a `pk` column: 0 for
+            // non-PK columns, otherwise the 1-based key position.
+            let sql = format!("PRAGMA table_info({})", escape_sqlite_identifier(&table));
+            let mut stmt = guard
+                .prepare(&sql)
+                .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            let mut keyed: Vec<(i64, String)> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+            {
+                let name: String = row
+                    .get("name")
+                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                let pk: i64 = row
+                    .get("pk")
+                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                if pk > 0 {
+                    keyed.push((pk, name));
+                }
+            }
+            keyed.sort_by_key(|(pos, _)| *pos);
+            Ok(keyed.into_iter().map(|(_, n)| n).collect())
+        })
+        .await
+        .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+    }
+
+    async fn list_foreign_keys(
+        &mut self,
+        _schema: Option<&str>,
+    ) -> Result<Vec<ForeignKey>, CoreError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().unwrap();
+            // SQLite has no schema-wide FK catalog; enumerate tables
+            // then call `PRAGMA foreign_key_list(t)` per table.
+            let tables: Vec<String> = {
+                let mut stmt = guard
+                    .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                let names: Result<Vec<String>, _> = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+                    .collect();
+                names.map_err(|e| CoreError::QueryFailed(e.to_string()))?
+            };
+            let mut out: Vec<ForeignKey> = Vec::new();
+            for child_table in tables {
+                let sql = format!(
+                    "PRAGMA foreign_key_list({})",
+                    escape_sqlite_identifier(&child_table)
+                );
+                let mut stmt = guard
+                    .prepare(&sql)
+                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                let mut rows = stmt
+                    .query([])
+                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                let mut by_id: indexmap::IndexMap<i64, ForeignKey> = indexmap::IndexMap::new();
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+                {
+                    let id: i64 = row
+                        .get("id")
+                        .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    let parent_table: String = row
+                        .get("table")
+                        .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    let child_col: String = row
+                        .get("from")
+                        .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    let parent_col: String = row
+                        .get("to")
+                        .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    let on_delete: Option<String> = row.get("on_delete").ok();
+                    let entry = by_id.entry(id).or_insert_with(|| ForeignKey {
+                        child_table: child_table.clone(),
+                        child_columns: Vec::new(),
+                        parent_table: parent_table.clone(),
+                        parent_columns: Vec::new(),
+                        on_delete: on_delete.filter(|s| !s.is_empty() && s != "NO ACTION"),
+                    });
+                    entry.child_columns.push(child_col);
+                    entry.parent_columns.push(parent_col);
+                }
+                out.extend(by_id.into_values());
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| CoreError::QueryFailed(e.to_string()))?
@@ -476,5 +584,107 @@ mod tests {
     fn test_escape_sqlite_identifier_doubles_quotes() {
         assert_eq!(escape_sqlite_identifier("plain"), "\"plain\"");
         assert_eq!(escape_sqlite_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_primary_key() {
+        let (mut conn, path) = fresh_conn().await;
+        seed_test_users(&mut conn).await;
+        let pk = conn
+            .primary_key(None, "test_users")
+            .await
+            .expect("primary_key");
+        assert_eq!(pk, vec!["id".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_primary_key_composite_in_order() {
+        let (mut conn, path) = fresh_conn().await;
+        // SQLite uses the column order in the PRIMARY KEY clause for
+        // the `pk` ordinal: tenant first, then resource.
+        conn.execute(
+            "CREATE TABLE membership (
+                tenant TEXT,
+                resource TEXT,
+                role TEXT,
+                PRIMARY KEY (tenant, resource)
+            )",
+        )
+        .await
+        .expect("create membership");
+        let pk = conn
+            .primary_key(None, "membership")
+            .await
+            .expect("primary_key");
+        assert_eq!(pk, vec!["tenant".to_string(), "resource".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_primary_key_none() {
+        let (mut conn, path) = fresh_conn().await;
+        conn.execute("CREATE TABLE no_pk (a INTEGER, b TEXT)")
+            .await
+            .expect("create no_pk");
+        let pk = conn.primary_key(None, "no_pk").await.expect("primary_key");
+        assert!(pk.is_empty(), "expected no PK columns, got {pk:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_list_foreign_keys() {
+        let (mut conn, path) = fresh_conn().await;
+        seed_test_users(&mut conn).await;
+        conn.execute(
+            "CREATE TABLE test_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER REFERENCES test_users(id) ON DELETE CASCADE,
+                total REAL
+            )",
+        )
+        .await
+        .expect("create test_orders");
+        let fks = conn
+            .list_foreign_keys(None)
+            .await
+            .expect("list_foreign_keys");
+        assert_eq!(fks.len(), 1, "expected one FK edge, got {fks:?}");
+        let fk = &fks[0];
+        assert_eq!(fk.child_table, "test_orders");
+        assert_eq!(fk.child_columns, vec!["user_id".to_string()]);
+        assert_eq!(fk.parent_table, "test_users");
+        assert_eq!(fk.parent_columns, vec!["id".to_string()]);
+        assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_list_foreign_keys_composite() {
+        let (mut conn, path) = fresh_conn().await;
+        conn.execute(
+            "CREATE TABLE parent (
+                a INTEGER, b INTEGER,
+                PRIMARY KEY (a, b)
+            )",
+        )
+        .await
+        .expect("create parent");
+        conn.execute(
+            "CREATE TABLE child (
+                x INTEGER, y INTEGER,
+                FOREIGN KEY (x, y) REFERENCES parent(a, b)
+            )",
+        )
+        .await
+        .expect("create child");
+        let fks = conn
+            .list_foreign_keys(None)
+            .await
+            .expect("list_foreign_keys");
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].child_columns, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(fks[0].parent_columns, vec!["a".to_string(), "b".to_string()]);
+        let _ = std::fs::remove_file(&path);
     }
 }
