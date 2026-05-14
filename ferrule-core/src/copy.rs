@@ -33,9 +33,9 @@ pub enum IfExists {
     /// `ON CONFLICT (pk) DO NOTHING`, MySQL uses `INSERT IGNORE`,
     /// MSSQL/Oracle use a `MERGE … WHEN NOT MATCHED` statement.
     ///
-    /// Requires a declared primary key on the destination table. Tables
-    /// without a PK raise a hard error pointing at the future `--key`
-    /// override (issue #43).
+    /// Requires conflict columns on the destination table — either via
+    /// a declared primary key, or via the `--key COL[,COL...]`
+    /// override. Tables without either raise a hard error.
     Skip,
     /// Insert rows whose primary key does not yet exist; update all
     /// non-PK columns when the PK already exists. PG/SQLite use
@@ -189,6 +189,12 @@ pub struct CopyOptions {
     pub preserve_pk: bool,
     /// What to do if the target table already exists with rows.
     pub if_exists: IfExists,
+    /// User-supplied conflict-key column list, overriding the PK
+    /// auto-detection used by [`IfExists::Skip`] / [`IfExists::Upsert`].
+    /// Empty = fall back to the destination's declared primary key.
+    /// Validated against the source column shape during copy preflight.
+    /// Ignored for non-conflict strategies (`Error`/`Append`/`Truncate`).
+    pub conflict_key: Vec<String>,
     /// Wrap the entire copy in a single target-side transaction.
     pub atomic: bool,
     /// How many rows per source-side page / target-side INSERT batch.
@@ -217,6 +223,7 @@ impl Default for CopyOptions {
             create_table: false,
             preserve_pk: false,
             if_exists: IfExists::Error,
+            conflict_key: Vec::new(),
             atomic: false,
             batch_size: 1000,
             bulk_mode: BulkMode::Off,
@@ -234,6 +241,7 @@ impl std::fmt::Debug for CopyOptions {
             .field("create_table", &self.create_table)
             .field("preserve_pk", &self.preserve_pk)
             .field("if_exists", &self.if_exists)
+            .field("conflict_key", &self.conflict_key)
             .field("atomic", &self.atomic)
             .field("batch_size", &self.batch_size)
             .field("bulk_mode", &self.bulk_mode)
@@ -287,13 +295,23 @@ pub async fn copy_rows(
         )));
     }
 
-    // PK resolution for Skip/Upsert. Centralised in `resolve_conflict_key`
-    // so the same code path serves the destination-PK auto-detection
-    // here, the (Phase 3) `--key COL[,COL...]` user override, and any
-    // future composite-key paths. An empty `override_` means "fall back
-    // to PK detection."
+    // `--key` is a conflict-only flag: warn once on stderr if the user
+    // set it alongside a strategy that doesn't resolve conflicts. Same
+    // shape as the `--bulk-native` + conflict warning above.
+    if !opts.conflict_key.is_empty() && !opts.if_exists.resolves_conflicts() {
+        eprintln!(
+            "[ferrule] copy: --key is only meaningful with --if-exists skip|upsert; \
+             ignoring for --if-exists {}.",
+            if_exists_name(opts.if_exists)
+        );
+    }
+
+    // Conflict-key resolution for Skip/Upsert. Centralised in
+    // `resolve_conflict_key` so the same code path serves the
+    // destination-PK auto-detection and the `--key COL[,COL...]` user
+    // override. An empty override means "fall back to PK detection."
     let pk_columns: Vec<String> =
-        resolve_conflict_key(dst, &target_table, opts.if_exists, &[]).await?;
+        resolve_conflict_key(dst, &target_table, opts.if_exists, &opts.conflict_key).await?;
 
     // Bulk loaders carry no conflict semantics (PG `COPY` ignores
     // conflicts, MSSQL bulk has no MERGE, MySQL `LOAD DATA` has its
@@ -447,7 +465,8 @@ async fn resolve_conflict_key(
         return Err(CoreError::QueryFailed(format!(
             "Target table '{target_table}' has no declared primary key — \
              --if-exists {} requires one. Declare a PK on the destination \
-             table or wait for --key override (issue #43).",
+             table, pass --preserve-pk when creating it, or supply \
+             --key COL[,COL...] to override the conflict columns.",
             if_exists_name(if_exists)
         )));
     }
@@ -1311,6 +1330,10 @@ pub struct AllTablesOptions {
     /// combined with `create_table`. See
     /// [`CopyOptions::preserve_pk`](CopyOptions::preserve_pk).
     pub preserve_pk: bool,
+    /// User-supplied conflict-key columns applied to every table.
+    /// Use sparingly with `--all-tables` — a single column list rarely
+    /// makes sense across many tables. Empty = per-table PK detection.
+    pub conflict_key: Vec<String>,
     /// If true, ignore cycle errors from `topo_sort` and copy in a
     /// deterministic-but-arbitrary order. The user must understand
     /// FK violations may surface as driver errors on first insert.
@@ -1330,6 +1353,7 @@ impl Default for AllTablesOptions {
             verbose: false,
             create_table: false,
             preserve_pk: false,
+            conflict_key: Vec::new(),
             no_fk_check: false,
         }
     }
@@ -1547,6 +1571,7 @@ pub async fn copy_all_tables(
             create_table: opts.create_table,
             preserve_pk: opts.preserve_pk,
             if_exists: opts.if_exists,
+            conflict_key: opts.conflict_key.clone(),
             atomic: opts.atomic,
             batch_size: opts.batch_size,
             bulk_mode: opts.bulk_mode,
@@ -2166,6 +2191,7 @@ mod tests {
             create_table: true,
             preserve_pk: false,
             if_exists: IfExists::Error,
+            conflict_key: Vec::new(),
             atomic: false,
             batch_size: 2,
             bulk_mode: BulkMode::Off,
@@ -2788,7 +2814,7 @@ mod tests {
 
     /// `--if-exists skip` / `upsert` against a PK-less destination
     /// must hard-error before the source is touched, pointing at the
-    /// future `--key` override (issue #43).
+    /// `--key` override or `--preserve-pk` for the create-table path.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn copy_skip_without_pk_hard_errors() {
@@ -2830,8 +2856,111 @@ mod tests {
             "error should reference missing PK: {msg}"
         );
         assert!(
-            msg.contains("--key") || msg.contains("#43"),
-            "error should point at the future --key override: {msg}"
+            msg.contains("--key"),
+            "error should point at the --key override: {msg}"
+        );
+        assert!(
+            msg.contains("--preserve-pk"),
+            "error should point at --preserve-pk for create-table users: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// `--key COL[,COL...]` lets the user supply conflict columns
+    /// when the destination has no declared PK. Behaviour matches the
+    /// PK-driven path: existing rows are upserted, new rows inserted.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_key_override_upserts_against_pk_less_table() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-keyup-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-keyup-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        // No PRIMARY KEY on either side; UNIQUE on (id) for the conflict.
+        src.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
+        dst.execute("CREATE TABLE t (id INTEGER, name TEXT, UNIQUE(id))").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'new-1')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'src-only')").await.unwrap();
+        dst.execute("INSERT INTO t VALUES (1, 'old')").await.unwrap();
+
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            if_exists: IfExists::Upsert,
+            conflict_key: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect("copy_rows with --key");
+        assert_eq!(copied, 2);
+
+        let out = dst.query("SELECT id, name FROM t ORDER BY id").await.unwrap();
+        assert_eq!(out.rows.len(), 2);
+        assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
+        assert!(matches!(&out.rows[1][1], Value::String(s) if s == "src-only"));
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// `--key` naming a column that isn't in the source SELECT shape
+    /// fails fast — before any INSERT runs — with an actionable error.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn copy_key_override_unknown_column_fails_fast() {
+        use crate::backends::sqlite::connect as sqlite_connect;
+        use crate::connection::ConnectOptions;
+        use crate::url::DatabaseUrl;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n_a = N.fetch_add(1, Ordering::SeqCst);
+        let n_b = N.fetch_add(1, Ordering::SeqCst);
+        let path_a = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_a}-keybad-src.db"));
+        let path_b = std::env::temp_dir().join(format!("ferrule-copy-test-{pid}-{n_b}-keybad-dst.db"));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
+        let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
+        let mut src = sqlite_connect(&url_a, &ConnectOptions::default()).await.unwrap();
+        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default()).await.unwrap();
+
+        src.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
+        dst.execute("CREATE TABLE t (id INTEGER, name TEXT)").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'a')").await.unwrap();
+
+        let opts = CopyOptions {
+            source: CopySource::Table("t".into()),
+            if_exists: IfExists::Upsert,
+            conflict_key: vec!["nonexistent".to_string()],
+            ..Default::default()
+        };
+        let err = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
+            .await
+            .expect_err("expected error for unknown --key column");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nonexistent"),
+            "error should name the unknown column: {msg}"
         );
 
         let _ = std::fs::remove_file(&path_a);

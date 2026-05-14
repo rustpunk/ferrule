@@ -359,9 +359,18 @@ pub struct CopyArgs {
     /// `skip` (PK-driven `ON CONFLICT DO NOTHING` / `INSERT IGNORE` /
     /// `MERGE … WHEN NOT MATCHED`), or `upsert` (`ON CONFLICT DO UPDATE`
     /// / `ON DUPLICATE KEY UPDATE` / full `MERGE`). `skip` and
-    /// `upsert` require a declared primary key on the destination.
+    /// `upsert` require conflict columns — declared PK on the
+    /// destination, or `--key COL[,COL...]`.
     #[arg(long, value_name = "STRATEGY", default_value = "error")]
     pub if_exists: String,
+
+    /// Override the conflict-key column list for `--if-exists
+    /// skip|upsert`. Repeatable or comma-separated. Useful when the
+    /// destination has no declared primary key or when conflict
+    /// resolution should key on a unique index that isn't the PK.
+    /// Ignored (with a one-line stderr notice) for other strategies.
+    #[arg(long, value_name = "COL", value_delimiter = ',')]
+    pub key: Vec<String>,
 
     /// Required confirmation for destructive `--if-exists truncate`
     /// when stdin is a TTY.

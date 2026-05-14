@@ -162,6 +162,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
             verbose: args.output.verbose,
             create_table: args.create_table,
             preserve_pk: args.preserve_pk,
+            conflict_key: args.key.clone(),
             no_fk_check: args.no_fk_check,
         };
         copy_all_tables(
@@ -191,6 +192,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
             create_table: args.create_table,
             preserve_pk: args.preserve_pk,
             if_exists,
+            conflict_key: args.key.clone(),
             atomic: args.atomic,
             batch_size: args.batch,
             bulk_mode,
