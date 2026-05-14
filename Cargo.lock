@@ -1422,9 +1422,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
  "csv",
  "ferrule-config",
+ "futures-util",
  "hex",
  "indexmap",
  "mysql_async",
@@ -1814,9 +1816,12 @@ dependencies = [
 name = "hasp-core"
 version = "0.1.0-alpha"
 dependencies = [
+ "libc",
  "secrecy",
+ "subtle",
  "thiserror 1.0.69",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

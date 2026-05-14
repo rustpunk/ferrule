@@ -1,5 +1,5 @@
 use crate::connection::{
-    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -7,7 +7,9 @@ use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
 use chrono::{DateTime as ChronoDateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use secrecy::ExposeSecret;
-use tiberius::{Client, ColumnType, EncryptionLevel};
+use tiberius::{
+    numeric::Numeric, Client, ColumnData, ColumnType, EncryptionLevel, IntoSql, TokenRow,
+};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -172,6 +174,417 @@ impl Connection for MssqlConnection {
         );
         self.query(&sql).await
     }
+
+    async fn bulk_insert_rows(
+        &mut self,
+        target: BulkInsert<'_>,
+    ) -> Result<usize, CoreError> {
+        if target.rows.is_empty() {
+            return Ok(0);
+        }
+
+        // tiberius's `client.bulk_insert(table)` issues
+        // `SELECT TOP 0 * FROM <table>` to introspect the column
+        // metadata, then opens a TDS bulk-load stream against the
+        // `Updateable` columns *in physical order*. Both interpolations
+        // happen verbatim, so we pre-quote with the backend's
+        // ANSI-quoting helper.
+        let qtable =
+            crate::copy::quote_identifier(target.table, crate::backend::Backend::MsSql);
+
+        // C1 pre-flight: the destination's physical column order
+        // (minus IDENTITY columns) MUST match `target.columns` exactly
+        // — otherwise we'd push positional `TokenRow`s into the wrong
+        // columns silently, or push N values into N-1 slots (IDENTITY
+        // mismatch). The generic INSERT path uses named column lists
+        // so it doesn't have this hazard; return `BulkUnavailable` on
+        // mismatch so `--bulk-native=auto` degrades cleanly.
+        let dest_cols = self
+            .fetch_bulk_updatable_columns(target.table)
+            .await?;
+        verify_bulk_column_alignment(&dest_cols, target.columns)?;
+
+        let mut req = self
+            .client
+            .bulk_insert(qtable.as_str())
+            .await
+            .map_err(|e| classify_bulk_setup_error(&e))?;
+
+        let hints: Vec<TypeHint> = target.columns.iter().map(|c| c.type_hint).collect();
+        for row in target.rows {
+            let mut token_row = TokenRow::<'static>::with_capacity(target.columns.len());
+            for (idx, v) in row.iter().enumerate() {
+                let hint = hints.get(idx).copied().unwrap_or(TypeHint::Other);
+                token_row.push(value_to_column_data(v, hint)?);
+            }
+            req.send(token_row).await.map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk send: {e}"))
+            })?;
+        }
+
+        let res = req
+            .finalize()
+            .await
+            .map_err(|e| CoreError::QueryFailed(format!("MSSQL bulk finalize: {e}")))?;
+        Ok(res.total() as usize)
+    }
+}
+
+impl MssqlConnection {
+    /// Fetch destination column names in physical order, filtered to
+    /// the same set `tiberius::Client::bulk_insert` will accept.
+    ///
+    /// Tiberius filters server-side using the TDS `ColumnFlag::Updateable`
+    /// bit (tiberius-0.12.3 client.rs:332). Server-side, that bit is
+    /// cleared for:
+    /// - IDENTITY columns,
+    /// - Computed (persisted or virtual) columns,
+    /// - ROWVERSION / TIMESTAMP columns (auto-maintained by the server).
+    ///
+    /// We can't query TDS column flags via INFORMATION_SCHEMA, so we
+    /// match each condition with its property/type equivalent. Missing
+    /// any of these would surface as either a silent column mis-
+    /// alignment (Updateable count mismatches expectations) or a
+    /// hard error from tiberius mid-stream — both of which the
+    /// `verify_bulk_column_alignment` step catches downstream, but
+    /// filtering here keeps the auto-fallback path clean.
+    async fn fetch_bulk_updatable_columns(
+        &mut self,
+        table: &str,
+    ) -> Result<Vec<String>, CoreError> {
+        // Resolve the (schema, name) pair from the user's input.
+        // Accepts plain `test_users`, dot-qualified `dbo.test_users`,
+        // T-SQL bracketed `[dbo].[test_users]`, and even brackets
+        // wrapping embedded dots (`[my.weird].[table]`). See #41 for
+        // the regression that motivated bracketed support.
+        let qualified = parse_mssql_qualified_identifier(table);
+        let schema_filter = match &qualified.schema {
+            Some(schema) => format!(
+                " AND c.TABLE_SCHEMA = '{}'",
+                escape_mssql_string(schema)
+            ),
+            None => String::new(),
+        };
+        let table_name = qualified.name;
+        let sql = format!(
+            "SELECT c.COLUMN_NAME, \
+                    COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS is_identity, \
+                    COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsComputed') AS is_computed, \
+                    c.DATA_TYPE \
+             FROM INFORMATION_SCHEMA.COLUMNS c \
+             WHERE c.TABLE_NAME = '{}'{} \
+             ORDER BY c.ORDINAL_POSITION",
+            escape_mssql_string(&table_name),
+            schema_filter,
+        );
+        let result = self.query(&sql).await.map_err(|e| {
+            CoreError::BulkUnavailable(format!(
+                "MSSQL bulk pre-flight: could not introspect destination columns: {e}"
+            ))
+        })?;
+        let mut cols = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            // Skip columns tiberius will skip via ColumnFlag::Updateable:
+            // IDENTITY, computed, and ROWVERSION (DATA_TYPE = 'timestamp').
+            let is_identity = column_flag_bool(&row[1]);
+            let is_computed = column_flag_bool(&row[2]);
+            let is_rowversion = matches!(&row[3], Value::String(s) if s.eq_ignore_ascii_case("timestamp"));
+            if is_identity || is_computed || is_rowversion {
+                continue;
+            }
+            if let Value::String(name) = &row[0] {
+                cols.push(name.clone());
+            }
+        }
+        Ok(cols)
+    }
+}
+
+/// Interpret an `is_*` column-property value as a boolean. The MSSQL
+/// driver maps the underlying INT result through `Value::Int64`,
+/// `Value::Bool`, or (when the table is missing or unresolved)
+/// `Value::Null`. Null is treated as `false` — for missing tables
+/// the empty column list will fail downstream with a clearer error
+/// than "destination has 0 non-IDENTITY columns".
+fn column_flag_bool(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Int64(n) => *n != 0,
+        _ => false,
+    }
+}
+
+/// A T-SQL identifier split into its optional schema and required
+/// name halves. Both halves are *unquoted* — brackets stripped,
+/// `]]` decoded to `]` — and ready to be passed to
+/// `escape_mssql_string` for inclusion in an `INFORMATION_SCHEMA`
+/// lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QualifiedIdentifier {
+    schema: Option<String>,
+    name: String,
+}
+
+/// Parse a target table reference in any of these forms:
+///
+/// - `test_users` — unqualified
+/// - `dbo.test_users` — dot-qualified
+/// - `[dbo].[test_users]` — T-SQL bracketed
+/// - `[my.weird].[table]` — bracketed with embedded dot in the schema
+/// - `dbo.[test_users]` / `[dbo].test_users` — mixed
+///
+/// Surrounding whitespace is trimmed. Within brackets, the T-SQL
+/// escape `]]` decodes to a single `]` (matching `QUOTENAME`
+/// semantics). If the bracket pair is unmatched, the input is
+/// treated as a plain identifier — defensive: producing a "no
+/// columns found" result with a clearer downstream error is better
+/// than panicking here.
+///
+/// See #41 for the regression that motivated bracketed support.
+fn parse_mssql_qualified_identifier(input: &str) -> QualifiedIdentifier {
+    let trimmed = input.trim();
+    let (first, rest) = parse_one_identifier(trimmed);
+    match rest {
+        Some(after_dot) => {
+            // `<first>.<after_dot>` — schema-qualified.
+            let (second, _) = parse_one_identifier(after_dot);
+            QualifiedIdentifier {
+                schema: Some(first),
+                name: second,
+            }
+        }
+        None => QualifiedIdentifier {
+            schema: None,
+            name: first,
+        },
+    }
+}
+
+/// Parse one identifier off the front of `s` and return it along
+/// with the slice after a following `.` separator (or `None` if the
+/// identifier exhausts the input).
+///
+/// Handles `[...]` quoting with `]]` as a literal `]`. Unbracketed
+/// identifiers terminate at the first `.`.
+fn parse_one_identifier(s: &str) -> (String, Option<&str>) {
+    if let Some(after_open) = s.strip_prefix('[') {
+        // Walk bytes looking for the closing `]`, treating `]]` as
+        // an escaped literal `]`. ASCII `]` is a single byte and
+        // can't appear inside a multi-byte UTF-8 codepoint, so a
+        // byte-level scan is safe even on non-ASCII identifiers.
+        let bytes = after_open.as_bytes();
+        let mut i = 0;
+        let mut close = None;
+        while i < bytes.len() {
+            if bytes[i] == b']' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                    i += 2;
+                    continue;
+                }
+                close = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        match close {
+            Some(end) => {
+                let inner = &after_open[..end];
+                let unquoted = inner.replace("]]", "]");
+                let after_close = &after_open[end + 1..];
+                let rest = after_close.strip_prefix('.');
+                (unquoted, rest)
+            }
+            None => {
+                // Unmatched `[` — return the whole input as the
+                // name (without the leading `[`). The downstream
+                // pre-flight lookup will return zero rows and the
+                // alignment check produces a clear diagnostic.
+                (after_open.to_string(), None)
+            }
+        }
+    } else {
+        match s.find('.') {
+            Some(i) => (s[..i].to_string(), Some(&s[i + 1..])),
+            None => (s.to_string(), None),
+        }
+    }
+}
+
+/// Compare destination physical column order (already filtered to
+/// non-IDENTITY) against `target.columns`. Names must match exactly,
+/// case-insensitive (MSSQL identifiers default to case-insensitive
+/// collation; the destination metadata may return original case but
+/// the source may have produced any case). Returns
+/// [`CoreError::BulkUnavailable`] on mismatch so the dispatcher
+/// degrades to the generic INSERT path (which uses named column
+/// lists and works regardless of physical order).
+fn verify_bulk_column_alignment(
+    dest_cols: &[String],
+    target_cols: &[ColumnInfo],
+) -> Result<(), CoreError> {
+    if dest_cols.len() != target_cols.len() {
+        return Err(CoreError::BulkUnavailable(format!(
+            "MSSQL bulk path requires destination to have exactly the same \
+             non-IDENTITY columns as the source ({} dest cols vs {} source cols). \
+             The destination may have IDENTITY columns the source doesn't, or \
+             columns the source doesn't write to — generic INSERT can handle \
+             this with a named column list",
+            dest_cols.len(),
+            target_cols.len()
+        )));
+    }
+    for (idx, (dest, src)) in dest_cols.iter().zip(target_cols).enumerate() {
+        if !dest.eq_ignore_ascii_case(&src.name) {
+            return Err(CoreError::BulkUnavailable(format!(
+                "MSSQL bulk path requires destination column order to match source. \
+                 Position {idx}: dest = {dest:?}, source = {src_name:?}. \
+                 Generic INSERT uses a named column list and works regardless of order",
+                src_name = src.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Classify a `tiberius::error::Error` raised by `client.bulk_insert`
+/// setup. Returns [`CoreError::BulkUnavailable`] only for conditions
+/// where falling back to a generic INSERT could *actually succeed* —
+/// not for errors that would hit the generic path too (permission
+/// denied, missing table). The `Auto` dispatcher's "fall back to
+/// generic" only helps when the generic path is strictly more capable.
+///
+/// Currently bulk-recoverable on MSSQL:
+/// - "Cannot bulk load" — target is a view or otherwise non-bulk-eligible.
+///   Generic INSERT can still target views if INSTEAD OF triggers exist.
+/// - Missing column metadata — the bulk handshake's
+///   `SELECT TOP 0 *` returned no usable columns. Generic INSERT can
+///   still hit a synonym or other indirection that bulk can't.
+fn classify_bulk_setup_error(e: &tiberius::error::Error) -> CoreError {
+    let msg = e.to_string();
+    if msg.contains("Cannot bulk load") || msg.contains("expecting column metadata") {
+        return CoreError::BulkUnavailable(format!("MSSQL rejected bulk_insert setup: {msg}"));
+    }
+    // "Invalid object name" / permission errors / network errors: the
+    // generic INSERT path would fail with the same root cause, so
+    // surface the error immediately rather than confusing the user
+    // with a "fall back to --bulk-native=auto" hint.
+    CoreError::QueryFailed(format!("MSSQL bulk_insert setup: {msg}"))
+}
+
+/// Translate a ferrule [`Value`] into tiberius `ColumnData<'static>`
+/// for the bulk-load stream. The destination column's [`TypeHint`]
+/// is used only to pick the right typed `None` for `Value::Null`;
+/// for non-null values the variant of `Value` is authoritative.
+///
+/// This mirrors [`mssql_to_value`] (the read path) symmetrically.
+fn value_to_column_data(v: &Value, hint: TypeHint) -> Result<ColumnData<'static>, CoreError> {
+    use std::borrow::Cow;
+
+    Ok(match v {
+        Value::Null => null_for_hint(hint),
+        Value::Bool(b) => ColumnData::Bit(Some(*b)),
+        Value::Int64(n) => ColumnData::I64(Some(*n)),
+        Value::Float64(f) => ColumnData::F64(Some(*f)),
+        Value::Decimal(s) => {
+            let n = parse_decimal_to_numeric(s).map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk: decimal {s:?}: {e}"))
+            })?;
+            ColumnData::Numeric(Some(n))
+        }
+        Value::String(s) => ColumnData::String(Some(Cow::Owned(s.clone()))),
+        Value::Bytes(b) => ColumnData::Binary(Some(Cow::Owned(b.clone()))),
+        Value::Date(d) => (*d).into_sql(),
+        Value::Time(t) => (*t).into_sql(),
+        Value::DateTime(dt) => (*dt).into_sql(),
+        Value::DateTimeTz(dt) => (*dt).into_sql(),
+        Value::Json(j) => {
+            // ferrule's DDL translator maps JSON → NVARCHAR(MAX) on
+            // MSSQL — no native JSON column type. Serialize compact.
+            let rendered = serde_json::to_string(j).map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk: JSON serialize: {e}"))
+            })?;
+            ColumnData::String(Some(Cow::Owned(rendered)))
+        }
+        Value::Uuid(s) => {
+            let u = tiberius::Uuid::parse_str(s).map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk: UUID {s:?}: {e}"))
+            })?;
+            ColumnData::Guid(Some(u))
+        }
+        Value::Array(a) => {
+            // DDL translator maps Array → NVARCHAR(MAX) (no native
+            // array type). Serialize compact JSON.
+            let rendered = serde_json::to_string(a).map_err(|e| {
+                CoreError::QueryFailed(format!("MSSQL bulk: array serialize: {e}"))
+            })?;
+            ColumnData::String(Some(Cow::Owned(rendered)))
+        }
+    })
+}
+
+/// Pick the typed `None` variant of `ColumnData` matching `hint`. The
+/// destination column type drives the choice — sending the wrong
+/// typed-NULL to a bulk column would fail with a TDS metadata
+/// mismatch.
+fn null_for_hint(hint: TypeHint) -> ColumnData<'static> {
+    match hint {
+        TypeHint::Bool => ColumnData::Bit(None),
+        TypeHint::Int64 => ColumnData::I64(None),
+        TypeHint::Float64 => ColumnData::F64(None),
+        TypeHint::Decimal => ColumnData::Numeric(None),
+        TypeHint::Bytes => ColumnData::Binary(None),
+        TypeHint::Date => ColumnData::Date(None),
+        TypeHint::Time => ColumnData::Time(None),
+        TypeHint::DateTime => ColumnData::DateTime2(None),
+        TypeHint::DateTimeTz => ColumnData::DateTimeOffset(None),
+        TypeHint::Uuid => ColumnData::Guid(None),
+        // NVARCHAR(MAX) is the catch-all on MSSQL — translate_type
+        // sends Json/Array/String/Other/Null all here.
+        _ => ColumnData::String(None),
+    }
+}
+
+/// Parse a decimal string like `"99.5"` / `"-12.345"` / `"42"` into
+/// a tiberius `Numeric { value: i128, scale: u8 }`. Rejects
+/// scientific notation — we always render decimals as plain
+/// `Display` form, so this only fails on malformed input.
+fn parse_decimal_to_numeric(s: &str) -> Result<Numeric, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("empty string".into());
+    }
+    if trimmed.contains(['e', 'E']) {
+        return Err("scientific notation not supported".into());
+    }
+    let (sign, rest) = match trimmed.as_bytes()[0] {
+        b'-' => (-1i128, &trimmed[1..]),
+        b'+' => (1i128, &trimmed[1..]),
+        _ => (1i128, trimmed),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (rest, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err("no digits".into());
+    }
+    let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("non-digit character in {s:?}"));
+    }
+    let raw: i128 = digits
+        .parse()
+        .map_err(|e| format!("parse mantissa: {e}"))?;
+    let scale: u8 = frac_part
+        .len()
+        .try_into()
+        .map_err(|_| "scale exceeds u8".to_string())?;
+    if scale >= 38 {
+        return Err(format!("scale {scale} exceeds MSSQL max 37"));
+    }
+    Ok(Numeric::new_with_scale(sign * raw, scale))
 }
 
 pub async fn connect(
@@ -472,5 +885,454 @@ mod tests {
             matches!(row[4], Value::Json(_) | Value::String(_)),
             "meta should be Json or String"
         );
+    }
+
+    // -------- value_to_column_data + parse_decimal_to_numeric unit tests --------
+
+    #[test]
+    fn parse_decimal_simple() {
+        let n = parse_decimal_to_numeric("99.5").unwrap();
+        assert_eq!(n.value(), 995);
+        assert_eq!(n.scale(), 1);
+    }
+
+    #[test]
+    fn parse_decimal_negative_with_explicit_plus() {
+        let n = parse_decimal_to_numeric("-12.345").unwrap();
+        assert_eq!(n.value(), -12345);
+        assert_eq!(n.scale(), 3);
+        let p = parse_decimal_to_numeric("+0.5").unwrap();
+        assert_eq!(p.value(), 5);
+        assert_eq!(p.scale(), 1);
+    }
+
+    #[test]
+    fn parse_decimal_integer_has_zero_scale() {
+        let n = parse_decimal_to_numeric("42").unwrap();
+        assert_eq!(n.value(), 42);
+        assert_eq!(n.scale(), 0);
+    }
+
+    // -------- C1: verify_bulk_column_alignment --------
+
+    fn col(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            type_hint: TypeHint::String,
+            nullable: true,
+        }
+    }
+
+    #[test]
+    fn verify_alignment_accepts_exact_match() {
+        let dest = vec!["id".to_string(), "name".to_string(), "age".to_string()];
+        let target = vec![col("id"), col("name"), col("age")];
+        verify_bulk_column_alignment(&dest, &target).expect("matched columns should pass");
+    }
+
+    #[test]
+    fn verify_alignment_is_case_insensitive() {
+        // MSSQL identifiers default to case-insensitive collation —
+        // the dest might come back as `ID` while the source rendered
+        // `id`. Should not block.
+        let dest = vec!["ID".to_string(), "Name".to_string()];
+        let target = vec![col("id"), col("name")];
+        verify_bulk_column_alignment(&dest, &target).expect("case-insensitive should pass");
+    }
+
+    #[test]
+    fn verify_alignment_rejects_count_mismatch() {
+        let dest = vec!["a".to_string(), "b".to_string()];
+        let target = vec![col("a"), col("b"), col("c")];
+        let err = verify_bulk_column_alignment(&dest, &target).expect_err("count mismatch");
+        assert!(matches!(err, CoreError::BulkUnavailable(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2 dest cols") && msg.contains("3 source cols"),
+            "useful diagnostic: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_alignment_rejects_order_mismatch() {
+        // The silent-corruption hazard: same names, wrong order. The
+        // bulk path would write `a`'s values into `b`'s column.
+        let dest = vec!["b".to_string(), "a".to_string()];
+        let target = vec![col("a"), col("b")];
+        let err = verify_bulk_column_alignment(&dest, &target).expect_err("order mismatch");
+        assert!(matches!(err, CoreError::BulkUnavailable(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Position 0") && msg.contains("\"b\"") && msg.contains("\"a\""),
+            "useful diagnostic: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_alignment_rejects_extra_destination_columns() {
+        // IDENTITY mismatch in the wild: dest has columns the source
+        // doesn't write to. fetch_bulk_updatable_columns filters out
+        // IDENTITY, but a regular extra column should still be caught.
+        let dest = vec!["a".to_string(), "b".to_string(), "extra".to_string()];
+        let target = vec![col("a"), col("b")];
+        let err = verify_bulk_column_alignment(&dest, &target).expect_err("extra dest cols");
+        assert!(matches!(err, CoreError::BulkUnavailable(_)));
+    }
+
+    // -------- #41: parse_mssql_qualified_identifier --------
+
+    fn qual(schema: Option<&str>, name: &str) -> QualifiedIdentifier {
+        QualifiedIdentifier {
+            schema: schema.map(|s| s.to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_qualified_plain_unqualified() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("test_users"),
+            qual(None, "test_users")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_dot_form() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("dbo.test_users"),
+            qual(Some("dbo"), "test_users")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_bracketed_both_halves() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("[dbo].[test_users]"),
+            qual(Some("dbo"), "test_users")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_bracketed_with_embedded_dot() {
+        // The marquee #41 case: a schema name containing a dot is
+        // valid SQL Server only when bracketed. Without bracket
+        // parsing, `rsplit_once('.')` would have produced
+        // `(Some("my.weird"), Some("[table]"))` — both halves bogus.
+        assert_eq!(
+            parse_mssql_qualified_identifier("[my.weird].[table]"),
+            qual(Some("my.weird"), "table")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_mixed_dot_and_brackets() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("dbo.[test users]"),
+            qual(Some("dbo"), "test users")
+        );
+        assert_eq!(
+            parse_mssql_qualified_identifier("[dbo].test_users"),
+            qual(Some("dbo"), "test_users")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_unbracketed_with_space() {
+        // Unbracketed identifiers terminate at the first `.`. This
+        // is unconventional input ("[]"-less but with spaces); we
+        // preserve it rather than rejecting — the downstream
+        // INFORMATION_SCHEMA lookup will simply find no match.
+        assert_eq!(
+            parse_mssql_qualified_identifier("my table"),
+            qual(None, "my table")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_escaped_close_bracket() {
+        // T-SQL escape: `]]` inside `[...]` decodes to a single `]`.
+        // Matches `QUOTENAME` semantics.
+        assert_eq!(
+            parse_mssql_qualified_identifier("[wei]]rd].[table]"),
+            qual(Some("wei]rd"), "table")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_unmatched_bracket_is_defensive() {
+        // Unmatched `[` is malformed; rather than panicking, return
+        // the residual as the name and let the pre-flight lookup
+        // produce its zero-columns diagnostic. The leading `[` is
+        // consumed.
+        assert_eq!(
+            parse_mssql_qualified_identifier("[unfinished"),
+            qual(None, "unfinished")
+        );
+    }
+
+    #[test]
+    fn parse_qualified_trims_surrounding_whitespace() {
+        assert_eq!(
+            parse_mssql_qualified_identifier("  dbo.test_users  "),
+            qual(Some("dbo"), "test_users")
+        );
+    }
+
+    // -------- C1 caveat fixes: column_flag_bool unit coverage --------
+    //
+    // The remaining caveat surface (Updateable filter for computed +
+    // ROWVERSION columns, schema-qualified table-name split) is tied
+    // to live SQL Server metadata — the integration test
+    // `test_mssql_bulk_insert_rows_round_trip` exercises the happy
+    // path with a real container; the unit coverage here pins down
+    // the helper invariants the pre-flight relies on.
+
+    #[test]
+    fn column_flag_bool_handles_int_bool_null() {
+        assert!(column_flag_bool(&Value::Bool(true)));
+        assert!(!column_flag_bool(&Value::Bool(false)));
+        assert!(column_flag_bool(&Value::Int64(1)));
+        assert!(!column_flag_bool(&Value::Int64(0)));
+        // COLUMNPROPERTY returns NULL for non-existent column/table;
+        // treat as false so the column is *included*, deferring the
+        // failure to the alignment check (which produces a clearer
+        // "0 dest cols vs N source cols" diagnostic).
+        assert!(!column_flag_bool(&Value::Null));
+        // Unexpected variants default false (defensive).
+        assert!(!column_flag_bool(&Value::String("yes".into())));
+    }
+
+    #[test]
+    fn parse_decimal_rejects_scientific_notation() {
+        assert!(parse_decimal_to_numeric("1.5e10").is_err());
+        assert!(parse_decimal_to_numeric("1E5").is_err());
+    }
+
+    #[test]
+    fn parse_decimal_rejects_malformed() {
+        assert!(parse_decimal_to_numeric("").is_err());
+        assert!(parse_decimal_to_numeric("abc").is_err());
+        assert!(parse_decimal_to_numeric("1..5").is_err());
+        assert!(parse_decimal_to_numeric(".").is_err());
+    }
+
+    #[test]
+    fn value_to_column_data_handles_primitives() {
+        assert!(matches!(
+            value_to_column_data(&Value::Bool(true), TypeHint::Bool).unwrap(),
+            ColumnData::Bit(Some(true))
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Int64(42), TypeHint::Int64).unwrap(),
+            ColumnData::I64(Some(42))
+        ));
+        let f = value_to_column_data(&Value::Float64(1.5), TypeHint::Float64).unwrap();
+        assert!(matches!(f, ColumnData::F64(Some(v)) if (v - 1.5).abs() < 1e-12));
+    }
+
+    #[test]
+    fn value_to_column_data_decimal_routes_through_numeric() {
+        let d = value_to_column_data(&Value::Decimal("12.34".into()), TypeHint::Decimal).unwrap();
+        match d {
+            ColumnData::Numeric(Some(n)) => {
+                assert_eq!(n.value(), 1234);
+                assert_eq!(n.scale(), 2);
+            }
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_column_data_string_bytes_uuid() {
+        match value_to_column_data(&Value::String("hi".into()), TypeHint::String).unwrap() {
+            ColumnData::String(Some(s)) => assert_eq!(s.as_ref(), "hi"),
+            other => panic!("expected String, got {other:?}"),
+        }
+        match value_to_column_data(&Value::Bytes(vec![1, 2, 3]), TypeHint::Bytes).unwrap() {
+            ColumnData::Binary(Some(b)) => assert_eq!(b.as_ref(), &[1u8, 2, 3]),
+            other => panic!("expected Binary, got {other:?}"),
+        }
+        match value_to_column_data(
+            &Value::Uuid("550e8400-e29b-41d4-a716-446655440000".into()),
+            TypeHint::Uuid,
+        )
+        .unwrap()
+        {
+            ColumnData::Guid(Some(u)) => {
+                assert_eq!(u.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+            }
+            other => panic!("expected Guid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_column_data_json_and_array_serialize_as_nvarchar() {
+        let j = serde_json::json!({"role": "admin"});
+        match value_to_column_data(&Value::Json(j), TypeHint::Json).unwrap() {
+            ColumnData::String(Some(s)) => {
+                assert!(s.contains("\"role\":\"admin\""));
+            }
+            other => panic!("expected String for JSON, got {other:?}"),
+        }
+        let a = Value::Array(vec![Value::Int64(1), Value::Int64(2)]);
+        match value_to_column_data(&a, TypeHint::Array).unwrap() {
+            ColumnData::String(Some(s)) => assert_eq!(s.as_ref(), "[1,2]"),
+            other => panic!("expected String for Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_column_data_null_picks_typed_none() {
+        // Each TypeHint should produce its matching typed-None variant.
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Bool).unwrap(),
+            ColumnData::Bit(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Int64).unwrap(),
+            ColumnData::I64(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Decimal).unwrap(),
+            ColumnData::Numeric(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Bytes).unwrap(),
+            ColumnData::Binary(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::DateTimeTz).unwrap(),
+            ColumnData::DateTimeOffset(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Uuid).unwrap(),
+            ColumnData::Guid(None)
+        ));
+        // String/Json/Array/Other all map to NVARCHAR(MAX) → ColumnData::String(None).
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Json).unwrap(),
+            ColumnData::String(None)
+        ));
+        assert!(matches!(
+            value_to_column_data(&Value::Null, TypeHint::Other).unwrap(),
+            ColumnData::String(None)
+        ));
+    }
+
+    // -------- bulk_insert_rows end-to-end (skip on absent container) --------
+
+    /// Round-trip a scratch table via the bulk path. Verifies that
+    /// tiberius's `bulk_insert` integration with `TokenRow` + our
+    /// value→ColumnData translation produces readable rows on the
+    /// destination. Uses a per-pid table so concurrent test runs
+    /// don't collide.
+    #[tokio::test]
+    async fn test_mssql_bulk_insert_rows_round_trip() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "MSSQL test container not available, skipping test_mssql_bulk_insert_rows_round_trip"
+            );
+            return;
+        };
+
+        let pid = std::process::id();
+        let table = format!("ferrule_bulk_test_{pid}");
+        let _ = conn
+            .execute(&format!(
+                "IF OBJECT_ID('{table}', 'U') IS NOT NULL DROP TABLE {table}"
+            ))
+            .await;
+        conn.execute(&format!(
+            "CREATE TABLE {table} (\
+               id BIGINT NOT NULL, \
+               name NVARCHAR(255) NULL, \
+               active BIT NULL, \
+               score DECIMAL(10,2) NULL, \
+               meta NVARCHAR(MAX) NULL, \
+               uid UNIQUEIDENTIFIER NULL\
+             )"
+        ))
+        .await
+        .expect("CREATE TABLE");
+
+        let columns = vec![
+            ColumnInfo { name: "id".into(), type_hint: TypeHint::Int64, nullable: false },
+            ColumnInfo { name: "name".into(), type_hint: TypeHint::String, nullable: true },
+            ColumnInfo { name: "active".into(), type_hint: TypeHint::Bool, nullable: true },
+            ColumnInfo { name: "score".into(), type_hint: TypeHint::Decimal, nullable: true },
+            ColumnInfo { name: "meta".into(), type_hint: TypeHint::Json, nullable: true },
+            ColumnInfo { name: "uid".into(), type_hint: TypeHint::Uuid, nullable: true },
+        ];
+
+        let rows: Vec<Row> = vec![
+            vec![
+                Value::Int64(1),
+                Value::String("Alice".into()),
+                Value::Bool(true),
+                Value::Decimal("99.50".into()),
+                Value::Json(serde_json::json!({"role": "admin"})),
+                Value::Uuid("550e8400-e29b-41d4-a716-446655440000".into()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::String("Bob".into()),
+                Value::Bool(false),
+                Value::Decimal("-7.25".into()),
+                Value::Json(serde_json::json!({"role": "user"})),
+                Value::Null,
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ];
+
+        let n = conn
+            .bulk_insert_rows(BulkInsert {
+                table: &table,
+                columns: &columns,
+                rows: &rows,
+            })
+            .await
+            .expect("bulk_insert_rows");
+        assert_eq!(n, 3);
+
+        // Round-trip read.
+        let result = conn
+            .query(&format!(
+                "SELECT id, name, active, score, meta, uid FROM {table} ORDER BY id"
+            ))
+            .await
+            .expect("read-back query");
+        assert_eq!(result.rows.len(), 3);
+
+        // Row 1 — verify the decimal landed at the expected value.
+        if let Value::Decimal(s) = &result.rows[0][3] {
+            assert!(
+                s.starts_with("99.5"),
+                "row 1 score should be ~99.50, got {s:?}"
+            );
+        } else if let Value::Float64(f) = result.rows[0][3] {
+            assert!((f - 99.5).abs() < 1e-6, "row 1 score got {f}");
+        } else {
+            panic!("row 1 score should be Decimal or Float64, got {:?}", result.rows[0][3]);
+        }
+
+        // Row 2 — all of name/score/active populated; uid NULL.
+        assert!(matches!(&result.rows[1][5], Value::Null));
+
+        // Row 3 — everything NULL except id.
+        assert!(matches!(&result.rows[2][1], Value::Null));
+        assert!(matches!(&result.rows[2][2], Value::Null));
+        assert!(matches!(&result.rows[2][3], Value::Null));
+
+        // Cleanup.
+        conn.execute(&format!("DROP TABLE {table}"))
+            .await
+            .expect("DROP TABLE");
     }
 }

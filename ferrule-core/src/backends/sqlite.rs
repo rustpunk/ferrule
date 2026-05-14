@@ -1,5 +1,5 @@
 use crate::connection::{
-    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
@@ -167,6 +167,19 @@ impl Connection for SqliteConnection {
         })
         .await
         .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+    }
+
+    async fn bulk_insert_rows(
+        &mut self,
+        _target: BulkInsert<'_>,
+    ) -> Result<usize, CoreError> {
+        // SQLite has no protocol-level bulk loader; its bottleneck
+        // is fsync, not parse/plan. The generic multi-row INSERT in
+        // copy.rs is already optimal for it. Always degrade to the
+        // generic path.
+        Err(CoreError::BulkUnavailable(
+            "SQLite has no native bulk loader; multi-row INSERT is already optimal".into(),
+        ))
     }
 }
 

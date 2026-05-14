@@ -18,6 +18,14 @@ pub enum CoreError {
     #[error("query failed: {0}")]
     QueryFailed(String),
 
+    /// Backend-native bulk-load path is not usable at runtime (server
+    /// config, missing capability, permission denied, target relation
+    /// is not a base table, etc.). Callers may retry on the generic
+    /// INSERT path. The string is intended for stderr only; do not
+    /// match on it.
+    #[error("bulk path unavailable: {0}")]
+    BulkUnavailable(String),
+
     #[error("TLS error: {0}")]
     TlsError(String),
 

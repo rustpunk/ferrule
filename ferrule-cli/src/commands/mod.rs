@@ -24,8 +24,37 @@ pub use repl::ReplArgs;
 pub use resolver::{check_daemon_ssh_compat, connect_resolved, resolve_connection};
 pub use watch::WatchArgs;
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use ferrule_config::profile::GlobalConfig;
+use ferrule_core::copy::BulkMode;
+
+/// CLI-side representation of [`BulkMode`]. Derived from
+/// `clap::ValueEnum` so `--help` enumerates the valid values and
+/// `--bulk-native=invalid` is rejected by clap with a usage error
+/// (exit code 2), rather than the runtime `BulkMode::parse` path
+/// returning `None` and surfacing as `CliError::usage` later.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum BulkNativeMode {
+    /// Always use the generic multi-row INSERT path. v1 default.
+    Off,
+    /// Try the native bulk path; on `BulkUnavailable` fall back to
+    /// generic INSERT for that batch (one stderr warning per
+    /// fallback).
+    Auto,
+    /// Require the native bulk path. `BulkUnavailable` becomes a
+    /// hard error referencing this flag.
+    On,
+}
+
+impl From<BulkNativeMode> for BulkMode {
+    fn from(arg: BulkNativeMode) -> Self {
+        match arg {
+            BulkNativeMode::Off => BulkMode::Off,
+            BulkNativeMode::Auto => BulkMode::Auto,
+            BulkNativeMode::On => BulkMode::On,
+        }
+    }
+}
 
 /// Common flags shared by query-like commands.
 #[derive(Args, Clone, Debug)]
@@ -285,6 +314,23 @@ pub struct CopyArgs {
     /// Source page / target INSERT batch size.
     #[arg(long, value_name = "N", default_value_t = 1000)]
     pub batch: usize,
+
+    /// Route INSERT batches through the destination backend's native
+    /// bulk loader (Postgres `COPY`, MSSQL bulk, MySQL `LOAD DATA`,
+    /// Oracle array DML).
+    ///
+    /// `off` (default) uses the portable INSERT path.  `auto` uses
+    /// the bulk path when available and falls back to INSERT on
+    /// `BulkUnavailable`.  `on` requires the bulk path and errors if
+    /// the backend is not yet implemented.
+    #[arg(
+        long,
+        value_name = "MODE",
+        default_value = "off",
+        value_enum,
+        ignore_case = true,
+    )]
+    pub bulk_native: BulkNativeMode,
 
     /// Password for the source connection (overrides credential stack).
     #[arg(long = "password-src")]

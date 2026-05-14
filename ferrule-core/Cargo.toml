@@ -8,8 +8,8 @@ license.workspace = true
 
 [features]
 default = []
-postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:uuid", "dep:rust_decimal", "dep:rustls"]
-mysql = ["dep:mysql_async"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:uuid", "dep:rust_decimal", "dep:rustls", "dep:bytes", "dep:futures-util"]
+mysql = ["dep:mysql_async", "dep:bytes", "dep:futures-util"]
 mssql = ["dep:tiberius", "dep:tokio-util"]
 sqlite = ["dep:rusqlite"]
 oracle = ["dep:oracle"]
@@ -43,6 +43,17 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 uuid = { workspace = true, optional = true }
+# Shared by the PG `COPY ... FROM STDIN` and MySQL
+# `LOAD DATA LOCAL INFILE` bulk paths: `bytes::Bytes` is the payload
+# accepted by `tokio_postgres::CopyInSink` and by
+# `mysql_async::InfileData`. `futures-util` provides `SinkExt::send`
+# for PG and `stream::iter` + `StreamExt::boxed` for the MySQL
+# infile-data stream — `boxed()` allocates via `Pin<Box<…>>` and
+# requires the `alloc` feature explicitly. (Today it works
+# transitively through mysql_async's default features, but pinning
+# it here keeps a clean rebuild robust to upstream dep changes.)
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "alloc"] }
 
 # MySQL
 mysql_async = { version = "0.35", optional = true }

@@ -1,11 +1,13 @@
 use crate::connection::{
-    ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, QueryResult, StatementResult,
 };
 use crate::error::CoreError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use futures_util::stream::StreamExt;
 use mysql_async::prelude::Queryable;
 use secrecy::ExposeSecret;
 
@@ -200,6 +202,113 @@ impl Connection for MySqlConnection {
             escape_mysql_string(table)
         );
         self.query(&sql).await
+    }
+
+    async fn bulk_insert_rows(
+        &mut self,
+        target: BulkInsert<'_>,
+    ) -> Result<usize, CoreError> {
+        if target.rows.is_empty() {
+            return Ok(0);
+        }
+
+        // Encode all rows upfront. Each row becomes one tab-separated
+        // newline-terminated line, with the MySQL LOAD DATA escape
+        // set applied byte-by-byte. The buffer is a `Vec<u8>` rather
+        // than a `String` so `Value::Bytes` can carry arbitrary
+        // (non-UTF-8) bytes into a BLOB column safely.
+        let hints: Vec<TypeHint> = target.columns.iter().map(|c| c.type_hint).collect();
+        let mut chunks: Vec<Bytes> = Vec::with_capacity(target.rows.len());
+        for row in target.rows {
+            let bytes = my_load_data::encode_row(row, &hints)?;
+            chunks.push(bytes);
+        }
+
+        // mysql_async exposes a *local* per-call infile handler that
+        // is consumed by a single `LOAD DATA LOCAL INFILE` and
+        // auto-cleared afterwards (also on Drop / Conn::reset). This
+        // gives us exactly the lifecycle we need: the handler is
+        // only present while this function is running, so a hostile
+        // `LOAD DATA LOCAL INFILE '/etc/passwd'` typed into
+        // `ferrule query` on this connection fails with
+        // `LocalInfileError::NoHandler` (no global handler installed
+        // at connect time). Security falls out of the API shape.
+        //
+        // The handler future must be `Sync`, so construct the stream
+        // *inside* the async block — capturing only `Vec<Bytes>`
+        // (which is `Sync`) rather than a pre-boxed stream (which is
+        // not). Matches the mysql_async docs example.
+        self.conn.set_infile_handler(async move {
+            Ok(futures_util::stream::iter(chunks).map(Ok).boxed())
+        });
+
+        // Quote the table and column list. The literal filename
+        // ('ferrule_bulk') does not name a real file — the local
+        // handler returns our encoded bytes instead, ignoring the
+        // server-supplied path entirely.
+        let qtable = my_load_data::backtick_quote(target.table);
+        let cols = target
+            .columns
+            .iter()
+            .map(|c| my_load_data::backtick_quote(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let load_sql = format!(
+            "LOAD DATA LOCAL INFILE 'ferrule_bulk' INTO TABLE {qtable} \
+             CHARACTER SET utf8mb4 \
+             FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' \
+             LINES TERMINATED BY '\\n' \
+             ({cols})"
+        );
+
+        // query_drop discards the result set but stores
+        // affected_rows on the connection.
+        let load_result = self.conn.query_drop(load_sql).await;
+
+        if let Err(e) = load_result {
+            // C2: ensure no infile handler lingers on the connection
+            // after a failed LOAD DATA. mysql_async only consumes the
+            // local handler when the *server* asks for the file (see
+            // `helpers.rs::handle_local_infile`); on a parse error,
+            // missing-table error, or any failure *before* that
+            // server prompt, the handler stays in
+            // `Conn::inner.infile_handler` ready to be honored by the
+            // *next* query on this connection — including a hostile
+            // user-issued `LOAD DATA LOCAL INFILE '/etc/passwd'`.
+            //
+            // Two-step defense:
+            //
+            // 1. `Conn::reset()` issues `COM_RESET_CONNECTION` and
+            //    explicitly clears `infile_handler = None`
+            //    (mysql_async src/conn/mod.rs:1146). On modern
+            //    servers this fully neutralizes the threat.
+            //
+            // 2. Reset returns `Ok(false)` without clearing on
+            //    pre-MySQL-5.7.3 / pre-MariaDB-10.2.4 servers, and
+            //    `Err(_)` on transport failure. In both cases we
+            //    install a *poison* local handler that refuses any
+            //    subsequent LOAD DATA on this connection. The poison
+            //    handler is one-shot per mysql_async semantics;
+            //    after it fires once `infile_handler` is `None` and
+            //    further LOAD DATA queries fail with
+            //    `LocalInfileError::NoHandler`. Installing it on top
+            //    of a stale handler overwrites it, so the leaked
+            //    bytes become unreachable even when reset is a no-op.
+            let _ = self.conn.reset().await;
+            self.conn.set_infile_handler(async {
+                Err(mysql_async::Error::from(
+                    mysql_async::LocalInfileError::other(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "ferrule: LOAD DATA LOCAL INFILE refused — connection \
+                         state may be tainted after a failed bulk operation. \
+                         Reconnect to re-enable bulk_insert_rows.",
+                    )),
+                ))
+            });
+            return Err(my_load_data::classify_load_error(e));
+        }
+
+        Ok(self.conn.affected_rows() as usize)
     }
 }
 
@@ -401,6 +510,328 @@ fn escape_mysql_string(s: &str) -> String {
     s.replace("'", "''")
 }
 
+/// MySQL `LOAD DATA LOCAL INFILE` encoder + helpers.
+///
+/// Each row is encoded as one tab-separated, newline-terminated line.
+/// MySQL's `LOAD DATA` default escape set (with `ESCAPED BY '\\'`):
+///
+/// - `\\` → literal backslash
+/// - `\t` → literal tab
+/// - `\n` → literal newline
+/// - `\r` → literal carriage return
+/// - `\0` → literal NUL byte
+/// - `\N` → SQL NULL
+///
+/// The encoder mirrors these byte-by-byte. Backslash escapes FIRST so
+/// a literal backslash isn't double-decoded.
+///
+/// The buffer is a `Vec<u8>` (not `String`) so `Value::Bytes` payloads
+/// — which may contain arbitrary non-UTF-8 bytes — can flow into a
+/// BLOB column without lossy conversion.
+mod my_load_data {
+    use crate::error::CoreError;
+    use crate::value::{TypeHint, Value};
+    use bytes::Bytes;
+
+    /// Encode one row.
+    pub fn encode_row(row: &[Value], hints: &[TypeHint]) -> Result<Bytes, CoreError> {
+        let mut buf: Vec<u8> = Vec::with_capacity(row.len() * 16 + 1);
+        for (i, value) in row.iter().enumerate() {
+            if i > 0 {
+                buf.push(b'\t');
+            }
+            let hint = hints.get(i).copied().unwrap_or(TypeHint::Other);
+            encode_value(&mut buf, value, hint)?;
+        }
+        buf.push(b'\n');
+        Ok(Bytes::from(buf))
+    }
+
+    fn encode_value(out: &mut Vec<u8>, v: &Value, hint: TypeHint) -> Result<(), CoreError> {
+        match v {
+            Value::Null => out.extend_from_slice(b"\\N"),
+            Value::Bool(b) => out.push(if *b { b'1' } else { b'0' }),
+            Value::Int64(n) => out.extend_from_slice(n.to_string().as_bytes()),
+            Value::Float64(f) => {
+                if f.is_nan() {
+                    // MySQL has no NaN literal for DOUBLE; the
+                    // generic-INSERT path also can't represent NaN.
+                    // Substitute NULL so bulk and generic agree.
+                    out.extend_from_slice(b"\\N");
+                } else if f.is_infinite() {
+                    // No literal — substitute NULL (same rationale).
+                    out.extend_from_slice(b"\\N");
+                } else {
+                    out.extend_from_slice(f.to_string().as_bytes());
+                }
+            }
+            Value::Decimal(s) => push_escaped(out, s.as_bytes()),
+            Value::String(s) => push_escaped(out, s.as_bytes()),
+            Value::Bytes(b) => push_escaped(out, b),
+            Value::Date(d) => out.extend_from_slice(d.to_string().as_bytes()),
+            Value::Time(t) => out.extend_from_slice(t.to_string().as_bytes()),
+            Value::DateTime(dt) => {
+                // MySQL DATETIME accepts 'YYYY-MM-DD HH:MM:SS[.fff]'.
+                // chrono's NaiveDateTime Display matches.
+                out.extend_from_slice(dt.to_string().as_bytes());
+            }
+            Value::DateTimeTz(dt) => {
+                // MySQL DATETIME has no timezone; the DDL translator
+                // maps DateTimeTz → DATETIME. Convert to UTC and
+                // render naive.
+                let naive = dt.naive_utc();
+                out.extend_from_slice(naive.to_string().as_bytes());
+            }
+            Value::Json(j) => {
+                let rendered = serde_json::to_string(j).map_err(|e| {
+                    CoreError::QueryFailed(format!("MySQL bulk: JSON serialize: {e}"))
+                })?;
+                push_escaped(out, rendered.as_bytes());
+            }
+            Value::Uuid(s) => push_escaped(out, s.as_bytes()),
+            Value::Array(a) => {
+                // DDL translator maps Array → JSON on MySQL.
+                let _ = hint;
+                let rendered = serde_json::to_string(a).map_err(|e| {
+                    CoreError::QueryFailed(format!("MySQL bulk: array serialize: {e}"))
+                })?;
+                push_escaped(out, rendered.as_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply MySQL LOAD DATA escape rules byte-by-byte. Backslash
+    /// is escaped FIRST, otherwise a literal backslash in field text
+    /// would be misinterpreted on decode.
+    fn push_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
+        for &b in bytes {
+            match b {
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                // `\r` matters because (a) some MySQL clients
+                // interpret a bare `\r` immediately before `\n` as
+                // part of a CRLF row terminator under certain
+                // `LINES TERMINATED BY` settings, and (b) even when
+                // the server doesn't, a bare `\r` survives as a data
+                // byte and corrupts `VARCHAR` round-trips.
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\0' => out.extend_from_slice(b"\\0"),
+                other => out.push(other),
+            }
+        }
+    }
+
+    /// Quote an identifier for MySQL using backticks. Embedded
+    /// backticks are doubled.
+    pub fn backtick_quote(s: &str) -> String {
+        format!("`{}`", s.replace('`', "``"))
+    }
+
+    /// Classify a `mysql_async::Error` raised by `LOAD DATA LOCAL
+    /// INFILE`. Server error codes for "loading local data is
+    /// disabled" / "command not allowed" return
+    /// [`CoreError::BulkUnavailable`] so the Auto dispatcher can
+    /// fall back. Anything else stays `QueryFailed`.
+    pub fn classify_load_error(e: mysql_async::Error) -> CoreError {
+        match &e {
+            mysql_async::Error::Server(srv) => {
+                // 1148 ER_NOT_ALLOWED_COMMAND, 3948
+                // ER_CLIENT_LOCAL_FILES_DISABLED — the two codes the
+                // mysql_async docs page calls out for LOAD DATA
+                // LOCAL being disabled. 3950 ER_LOAD_DATA_INFILE_
+                // _DISABLED appears in some MySQL builds; include it.
+                if matches!(srv.code, 1148 | 3948 | 3950) {
+                    return CoreError::BulkUnavailable(format!(
+                        "MySQL server rejected LOAD DATA LOCAL INFILE \
+                         (error {}: {}). Enable `local_infile=ON` server-side, \
+                         or pass `--bulk-native=off` to use the generic path.",
+                        srv.code, srv.message
+                    ));
+                }
+                CoreError::QueryFailed(format!("MySQL bulk LOAD DATA: {srv}"))
+            }
+            _ => CoreError::QueryFailed(format!("MySQL bulk LOAD DATA: {e}")),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+
+        fn enc1(v: Value, hint: TypeHint) -> Vec<u8> {
+            let bytes = encode_row(&[v], &[hint]).expect("encode_row");
+            // Strip trailing newline so tests assert on field content.
+            assert_eq!(bytes.last().copied(), Some(b'\n'));
+            bytes[..bytes.len() - 1].to_vec()
+        }
+
+        fn enc1_str(v: Value, hint: TypeHint) -> String {
+            String::from_utf8(enc1(v, hint)).expect("UTF-8")
+        }
+
+        #[test]
+        fn encode_null_is_backslash_n() {
+            assert_eq!(enc1_str(Value::Null, TypeHint::Null), "\\N");
+        }
+
+        #[test]
+        fn encode_bool_is_one_or_zero() {
+            assert_eq!(enc1_str(Value::Bool(true), TypeHint::Bool), "1");
+            assert_eq!(enc1_str(Value::Bool(false), TypeHint::Bool), "0");
+        }
+
+        #[test]
+        fn encode_int_and_float() {
+            assert_eq!(enc1_str(Value::Int64(42), TypeHint::Int64), "42");
+            assert_eq!(enc1_str(Value::Int64(-7), TypeHint::Int64), "-7");
+            assert_eq!(enc1_str(Value::Float64(1.5), TypeHint::Float64), "1.5");
+        }
+
+        #[test]
+        fn encode_float_nan_and_inf_become_null() {
+            // MySQL has no NaN/Inf literal for DOUBLE; the bulk path
+            // substitutes NULL to stay consistent with the generic
+            // INSERT path's reject-or-NULL outcome.
+            assert_eq!(enc1_str(Value::Float64(f64::NAN), TypeHint::Float64), "\\N");
+            assert_eq!(
+                enc1_str(Value::Float64(f64::INFINITY), TypeHint::Float64),
+                "\\N"
+            );
+        }
+
+        #[test]
+        fn encode_string_escapes_backslash_first() {
+            // Backslash MUST be the first replacement applied.
+            // Input `\t` (literal two chars `\` and `t`) → `\\t`,
+            // input `\n` → `\\n`, input `\` → `\\`. If any of those
+            // mappings ran before backslash-doubling, the result
+            // would be wrong (`\\` then `\t` → `\\t` instead of
+            // `\\\\t`, etc.).
+            assert_eq!(
+                enc1_str(Value::String("a\\b".into()), TypeHint::String),
+                "a\\\\b"
+            );
+            assert_eq!(
+                enc1_str(Value::String("a\tb".into()), TypeHint::String),
+                "a\\tb"
+            );
+            assert_eq!(
+                enc1_str(Value::String("a\nb".into()), TypeHint::String),
+                "a\\nb"
+            );
+            // H1 regression guard: \r MUST be escaped as `\r` too,
+            // otherwise CRLF source data corrupts VARCHAR round-trips
+            // and may interact badly with LINES TERMINATED BY on some
+            // server configurations.
+            assert_eq!(
+                enc1_str(Value::String("a\rb".into()), TypeHint::String),
+                "a\\rb"
+            );
+            assert_eq!(
+                enc1_str(Value::String("a\r\nb".into()), TypeHint::String),
+                "a\\r\\nb"
+            );
+        }
+
+        #[test]
+        fn encode_string_escapes_nul_byte() {
+            // `\0` is a hard error inside MySQL text columns unless
+            // escaped; the encoder produces `\0` which the receiver
+            // decodes back to a NUL byte. The byte goes into BLOB
+            // columns intact via this path.
+            let out = enc1(Value::String("a\0b".into()), TypeHint::String);
+            assert_eq!(out, b"a\\0b");
+        }
+
+        #[test]
+        fn encode_bytes_preserves_arbitrary_payload() {
+            // BLOB columns: an arbitrary byte sequence (including
+            // non-UTF-8 bytes like 0xFF) must flow through with
+            // escapes applied to the metacharacters only.
+            let raw = vec![0x01u8, b'\t', 0xFF, b'\\', b'\n', 0x00, b'Z'];
+            let out = enc1(Value::Bytes(raw), TypeHint::Bytes);
+            assert_eq!(
+                out,
+                vec![
+                    0x01u8, b'\\', b't', 0xFF, b'\\', b'\\', b'\\', b'n', b'\\', b'0', b'Z'
+                ]
+            );
+        }
+
+        #[test]
+        fn encode_date_time_datetime() {
+            let d = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+            let t = NaiveTime::from_hms_opt(12, 34, 56).unwrap();
+            let dt = NaiveDateTime::new(d, t);
+            assert_eq!(enc1_str(Value::Date(d), TypeHint::Date), "2026-05-14");
+            assert_eq!(enc1_str(Value::Time(t), TypeHint::Time), "12:34:56");
+            assert_eq!(
+                enc1_str(Value::DateTime(dt), TypeHint::DateTime),
+                "2026-05-14 12:34:56"
+            );
+        }
+
+        #[test]
+        fn encode_datetimetz_converts_to_utc_naive() {
+            let dt = Utc.with_ymd_and_hms(2026, 5, 14, 12, 34, 56).unwrap();
+            assert_eq!(
+                enc1_str(Value::DateTimeTz(dt), TypeHint::DateTimeTz),
+                "2026-05-14 12:34:56"
+            );
+        }
+
+        #[test]
+        fn encode_json_is_compact_then_escaped() {
+            let j = serde_json::json!({"role": "admin"});
+            let s = enc1_str(Value::Json(j), TypeHint::Json);
+            // serde_json compact form keeps no spaces between :/, ;
+            // the encoder then escapes nothing in this payload
+            // because there are no metacharacters.
+            assert!(s.contains("\"role\":\"admin\""));
+            assert!(!s.contains(' '));
+        }
+
+        #[test]
+        fn encode_array_is_compact_json() {
+            let a = Value::Array(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]);
+            assert_eq!(enc1_str(a, TypeHint::Array), "[1,2,3]");
+        }
+
+        #[test]
+        fn encode_uuid_passes_through() {
+            assert_eq!(
+                enc1_str(
+                    Value::Uuid("550e8400-e29b-41d4-a716-446655440000".into()),
+                    TypeHint::Uuid
+                ),
+                "550e8400-e29b-41d4-a716-446655440000"
+            );
+        }
+
+        #[test]
+        fn encode_row_with_multiple_cells_uses_tab_separator() {
+            let row = vec![
+                Value::Int64(1),
+                Value::String("Alice".into()),
+                Value::Null,
+                Value::Bool(true),
+            ];
+            let hints = vec![TypeHint::Int64, TypeHint::String, TypeHint::Null, TypeHint::Bool];
+            let bytes = encode_row(&row, &hints).unwrap();
+            assert_eq!(&bytes[..], b"1\tAlice\t\\N\t1\n");
+        }
+
+        #[test]
+        fn backtick_quote_doubles_embedded_backticks() {
+            assert_eq!(backtick_quote("plain"), "`plain`");
+            assert_eq!(backtick_quote("with`tick"), "`with``tick`");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,5 +978,227 @@ mod tests {
             matches!(row[4], Value::Json(_) | Value::String(_)),
             "meta should be Json or String"
         );
+    }
+
+    /// End-to-end: bulk-load a scratch table via LOAD DATA LOCAL
+    /// INFILE and verify the rows round-trip. Includes a row with
+    /// backslash/tab/newline payloads, an all-NULLs row, and a BLOB
+    /// with non-UTF-8 bytes to exercise the binary path.
+    #[tokio::test]
+    async fn test_mysql_bulk_insert_rows_round_trip() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "MySQL test container not available, skipping test_mysql_bulk_insert_rows_round_trip"
+            );
+            return;
+        };
+
+        // The mysql_async client sets `LOCAL_INFILE` on the
+        // connection handshake automatically, but the server-side
+        // toggle `local_infile=ON` is required too. The CLAUDE.md
+        // test container ships with the MySQL 8 default, which is
+        // OFF for `LOAD DATA LOCAL`. Flip it on for the duration of
+        // this test. If the user doesn't have SUPER, the SET fails
+        // and we degrade by skipping the test (rather than the bulk
+        // path silently failing).
+        if conn
+            .execute("SET GLOBAL local_infile = ON")
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "MySQL test container does not allow toggling local_infile; \
+                 skipping test_mysql_bulk_insert_rows_round_trip"
+            );
+            return;
+        }
+
+        let pid = std::process::id();
+        let table = format!("ferrule_bulk_test_{pid}");
+        let _ = conn
+            .execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await;
+        conn.execute(&format!(
+            "CREATE TABLE {table} (\
+               id BIGINT NOT NULL, \
+               name VARCHAR(255) NULL, \
+               active TINYINT(1) NULL, \
+               blob_data BLOB NULL, \
+               meta JSON NULL, \
+               tricky TEXT NULL\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        ))
+        .await
+        .expect("CREATE TABLE");
+
+        let columns = vec![
+            ColumnInfo { name: "id".into(), type_hint: TypeHint::Int64, nullable: false },
+            ColumnInfo { name: "name".into(), type_hint: TypeHint::String, nullable: true },
+            ColumnInfo { name: "active".into(), type_hint: TypeHint::Bool, nullable: true },
+            ColumnInfo { name: "blob_data".into(), type_hint: TypeHint::Bytes, nullable: true },
+            ColumnInfo { name: "meta".into(), type_hint: TypeHint::Json, nullable: true },
+            ColumnInfo { name: "tricky".into(), type_hint: TypeHint::String, nullable: true },
+        ];
+
+        let rows: Vec<Row> = vec![
+            vec![
+                Value::Int64(1),
+                Value::String("Alice".into()),
+                Value::Bool(true),
+                Value::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                Value::Json(serde_json::json!({"role": "admin"})),
+                Value::String("plain".into()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::String("Esc\\\t\nape".into()),
+                Value::Bool(false),
+                Value::Bytes(vec![0x00, 0x09, 0x0A, 0xFF]),
+                Value::Json(serde_json::Value::Null),
+                Value::String("\\.".into()),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ];
+
+        let n = conn
+            .bulk_insert_rows(BulkInsert {
+                table: &table,
+                columns: &columns,
+                rows: &rows,
+            })
+            .await
+            .expect("bulk_insert_rows");
+        assert_eq!(n, 3);
+
+        let result = conn
+            .query(&format!(
+                "SELECT id, name, active, blob_data, tricky FROM {table} ORDER BY id"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 3);
+
+        // Row 2 — verify the tricky escaped payload round-tripped.
+        if let Value::String(s) = &result.rows[1][1] {
+            assert_eq!(s, "Esc\\\t\nape", "row 2 name should preserve backslash/tab/nl");
+        } else {
+            panic!(
+                "row 2 name should be String, got {:?}",
+                result.rows[1][1]
+            );
+        }
+        if let Value::Bytes(b) = &result.rows[1][3] {
+            assert_eq!(b.as_slice(), &[0x00u8, 0x09, 0x0A, 0xFF]);
+        } else {
+            panic!(
+                "row 2 blob_data should be Bytes, got {:?}",
+                result.rows[1][3]
+            );
+        }
+        if let Value::String(s) = &result.rows[1][4] {
+            assert_eq!(s, "\\.", "row 2 tricky should be literal backslash-dot");
+        } else {
+            panic!(
+                "row 2 tricky should be String, got {:?}",
+                result.rows[1][4]
+            );
+        }
+
+        // Row 3 — everything NULL except id.
+        assert!(matches!(&result.rows[2][1], Value::Null));
+        assert!(matches!(&result.rows[2][2], Value::Null));
+        assert!(matches!(&result.rows[2][3], Value::Null));
+
+        // Cleanup.
+        conn.execute(&format!("DROP TABLE {table}"))
+            .await
+            .expect("DROP TABLE");
+    }
+
+    /// Security regression: a user-issued `LOAD DATA LOCAL INFILE`
+    /// outside of `bulk_insert_rows` MUST be rejected — there is no
+    /// global handler installed, and the per-call local handler is
+    /// only present during a bulk_insert_rows call. mysql_async
+    /// raises `LocalInfileError::NoHandler` in that case, which
+    /// `MySqlConnection::execute` surfaces as a `QueryFailed`.
+    #[tokio::test]
+    async fn test_mysql_load_data_without_bulk_in_progress_rejected() {
+        let Some(mut conn) = try_connect().await else {
+            eprintln!(
+                "MySQL test container not available, skipping test_mysql_load_data_without_bulk_in_progress_rejected"
+            );
+            return;
+        };
+
+        // Enable server-side local_infile so the *server* is willing
+        // to ask the client for the file. We need that step to fail
+        // here, not the server config, to prove the client refused.
+        if conn
+            .execute("SET GLOBAL local_infile = ON")
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "MySQL test container does not allow toggling local_infile; \
+                 skipping test_mysql_load_data_without_bulk_in_progress_rejected"
+            );
+            return;
+        }
+
+        let pid = std::process::id();
+        let table = format!("ferrule_bulk_security_test_{pid}");
+        let _ = conn
+            .execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await;
+        conn.execute(&format!(
+            "CREATE TABLE {table} (id INT, line TEXT) ENGINE=InnoDB"
+        ))
+        .await
+        .expect("CREATE TABLE");
+
+        // Try to coerce the client into shipping /etc/passwd.
+        let result = conn
+            .execute(&format!(
+                "LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE {table} \
+                 FIELDS TERMINATED BY ':' (id, line)"
+            ))
+            .await;
+
+        // The client refuses because no infile handler is
+        // installed at this point. mysql_async raises a query
+        // error; ferrule surfaces it as QueryFailed.
+        let err = result.expect_err(
+            "LOAD DATA LOCAL INFILE without bulk_insert_rows in progress must fail",
+        );
+        let msg = err.to_string();
+        // Look for any hint that the failure is handler-related —
+        // exact mysql_async wording may evolve.
+        assert!(
+            msg.to_lowercase().contains("handler")
+                || msg.to_lowercase().contains("local_infile")
+                || msg.to_lowercase().contains("infile"),
+            "expected handler/infile rejection, got: {msg}"
+        );
+
+        // Sanity: confirm nothing landed in the table.
+        let count = conn
+            .query(&format!("SELECT COUNT(*) FROM {table}"))
+            .await
+            .unwrap();
+        match &count.rows[0][0] {
+            Value::Int64(n) => assert_eq!(*n, 0, "no rows should have been inserted"),
+            other => panic!("unexpected count shape: {other:?}"),
+        }
+
+        let _ = conn
+            .execute(&format!("DROP TABLE {table}"))
+            .await;
     }
 }
