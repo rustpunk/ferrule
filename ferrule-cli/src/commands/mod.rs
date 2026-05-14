@@ -428,11 +428,53 @@ pub struct CopyArgs {
     #[command(flatten)]
     pub output: OutputFlags,
 
-    /// Connection flags. Note: in Phase 1 these apply to *both* source
-    /// and destination — independent `--src-*` / `--dst-*` SSH/proxy
-    /// flags are tracked as a backlog enhancement.
+    /// Shared connection flags — apply to both source and destination
+    /// unless overridden by the per-side `--src-*` / `--dst-*` flags
+    /// below. Setting both the unsuffixed and a per-side variant for
+    /// the same flag is a usage error.
     #[command(flatten)]
     pub conn_flags: ConnectionFlags,
+
+    /// Source-side override: open the source through an SSH tunnel.
+    /// Same shape as `--ssh-tunnel`; mutually exclusive with it.
+    #[arg(long = "src-ssh-tunnel", value_name = "USER@HOST[:PORT]")]
+    pub src_ssh_tunnel: Option<String>,
+
+    /// Source-side override: SSH private key for `--src-ssh-tunnel`.
+    /// Mutually exclusive with `--ssh-key`.
+    #[arg(long = "src-ssh-key", value_name = "PATH")]
+    pub src_ssh_key: Option<String>,
+
+    /// Source-side override: HTTP CONNECT proxy URL. Mutually exclusive
+    /// with `--proxy-url`.
+    #[arg(long = "src-proxy-url", value_name = "URL")]
+    pub src_proxy_url: Option<String>,
+
+    /// Source-side override: disable TLS certificate verification for
+    /// the source connection only. Mutually exclusive with `--insecure`.
+    #[arg(long = "src-insecure")]
+    pub src_insecure: bool,
+
+    /// Destination-side override: open the destination through an SSH
+    /// tunnel. Mutually exclusive with `--ssh-tunnel`.
+    #[arg(long = "dst-ssh-tunnel", value_name = "USER@HOST[:PORT]")]
+    pub dst_ssh_tunnel: Option<String>,
+
+    /// Destination-side override: SSH private key for `--dst-ssh-tunnel`.
+    /// Mutually exclusive with `--ssh-key`.
+    #[arg(long = "dst-ssh-key", value_name = "PATH")]
+    pub dst_ssh_key: Option<String>,
+
+    /// Destination-side override: HTTP CONNECT proxy URL. Mutually
+    /// exclusive with `--proxy-url`.
+    #[arg(long = "dst-proxy-url", value_name = "URL")]
+    pub dst_proxy_url: Option<String>,
+
+    /// Destination-side override: disable TLS certificate verification
+    /// for the destination connection only. Mutually exclusive with
+    /// `--insecure`.
+    #[arg(long = "dst-insecure")]
+    pub dst_insecure: bool,
 }
 
 /// Diff command arguments — compare schemas between two connections.
