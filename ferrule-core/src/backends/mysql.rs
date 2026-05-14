@@ -1180,6 +1180,7 @@ mod tests {
                 table: &table,
                 columns: &columns,
                 rows: &rows,
+                copy_format: crate::copy::CopyFormat::Text,
             })
             .await
             .expect("bulk_insert_rows");

@@ -35,11 +35,18 @@ pub enum StatementResult {
 /// `table` is unquoted — each backend is responsible for quoting it
 /// for its own dialect. `columns` is the destination column order;
 /// each row in `rows` must have the same length and match positionally.
+///
+/// `copy_format` is consulted only by the Postgres backend and selects
+/// between `COPY … WITH (FORMAT TEXT)` and `COPY … WITH (FORMAT BINARY)`.
+/// All other backends ignore the field — their bulk paths use a
+/// protocol-native wire format (TDS, MySQL `LOAD DATA`, ODPI-C array
+/// DML).
 #[derive(Debug)]
 pub struct BulkInsert<'a> {
     pub table: &'a str,
     pub columns: &'a [ColumnInfo],
     pub rows: &'a [Row],
+    pub copy_format: crate::copy::CopyFormat,
 }
 
 /// A foreign-key edge in a schema, returned by

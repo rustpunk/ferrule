@@ -26,7 +26,7 @@ pub use watch::WatchArgs;
 
 use clap::{Args, Subcommand, ValueEnum};
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::copy::BulkMode;
+use ferrule_core::copy::{BulkMode, CopyFormat};
 
 /// CLI-side representation of [`BulkMode`]. Derived from
 /// `clap::ValueEnum` so `--help` enumerates the valid values and
@@ -52,6 +52,29 @@ impl From<BulkNativeMode> for BulkMode {
             BulkNativeMode::Off => BulkMode::Off,
             BulkNativeMode::Auto => BulkMode::Auto,
             BulkNativeMode::On => BulkMode::On,
+        }
+    }
+}
+
+/// CLI-side representation of [`CopyFormat`]. Postgres-only; other
+/// destination backends silently ignore the flag.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CopyFormatArg {
+    /// `COPY … WITH (FORMAT TEXT)` — the v1 default. Tab-separated
+    /// wire format; encoded by ferrule's tiny in-crate encoder.
+    Text,
+    /// `COPY … WITH (FORMAT BINARY)` — opt-in. Streamed via
+    /// `tokio_postgres::binary_copy`. Faster on numeric / timestamp /
+    /// UUID-heavy schemas; at-best break-even on TEXT / JSONB / BYTEA-
+    /// heavy ones because typed length prefixes inflate small payloads.
+    Binary,
+}
+
+impl From<CopyFormatArg> for CopyFormat {
+    fn from(arg: CopyFormatArg) -> Self {
+        match arg {
+            CopyFormatArg::Text => CopyFormat::Text,
+            CopyFormatArg::Binary => CopyFormat::Binary,
         }
     }
 }
@@ -362,6 +385,20 @@ pub struct CopyArgs {
         ignore_case = true,
     )]
     pub bulk_native: BulkNativeMode,
+
+    /// Wire format for the Postgres `COPY` bulk path. `text` (default)
+    /// is the v1 path; `binary` opts into
+    /// `tokio_postgres::binary_copy::BinaryCopyInWriter`. PG-only;
+    /// other destination backends silently ignore. Only consulted when
+    /// `--bulk-native=auto|on` selects the bulk path.
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        default_value = "text",
+        value_enum,
+        ignore_case = true,
+    )]
+    pub copy_format: CopyFormatArg,
 
     /// Password for the source connection (overrides credential stack).
     #[arg(long = "password-src")]

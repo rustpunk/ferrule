@@ -161,7 +161,7 @@ bottleneck is fsync, not parse/plan).
 
 | Destination | Native path                                              | Common `BulkUnavailable` triggers                                                          |
 |-------------|----------------------------------------------------------|--------------------------------------------------------------------------------------------|
-| Postgres    | `COPY <tbl> (cols) FROM STDIN WITH (FORMAT TEXT)`        | Target is a VIEW / materialized view / foreign table.                                      |
+| Postgres    | `COPY <tbl> (cols) FROM STDIN WITH (FORMAT TEXT \| BINARY)` | Target is a VIEW / materialized view / foreign table; `--copy-format binary` against a column with `TypeHint::Other` (rare). |
 | MSSQL       | `tiberius::Client::bulk_insert` (TDS bulk-load token)    | Target is not a base table; `Invalid object name`.                                         |
 | MySQL       | `LOAD DATA LOCAL INFILE` via a per-call infile handler   | Server-side `local_infile=OFF` (default in MySQL 8.0+ — set `local_infile=ON` to enable).  |
 | Oracle      | `oracle::Batch` (array DML via ODPI-C)                   | `ORA-01031` insufficient privilege; `ORA-00942` table does not exist; Instant Client missing.|
@@ -169,11 +169,29 @@ bottleneck is fsync, not parse/plan).
 
 ### Format choices
 
-- **Postgres** uses `FORMAT TEXT`, not `BINARY`. Binary payloads can
-  be *larger* than text on int-heavy schemas (4-byte length prefixes
-  inflate small ints), and most of the win over INSERT comes from
-  skipping parse/plan, not from the wire format. Binary COPY is
-  tracked as a follow-up under issue #36.
+- **Postgres** defaults to `FORMAT TEXT`. Pass `--copy-format binary`
+  to opt into `FORMAT BINARY` (Postgres-only flag; ignored elsewhere).
+  Binary streams via
+  [`tokio_postgres::binary_copy::BinaryCopyInWriter`](https://docs.rs/tokio-postgres/latest/tokio_postgres/binary_copy/struct.BinaryCopyInWriter.html);
+  each value is bound through its `ToSql` impl using the destination
+  PG type derived from the source column's `TypeHint`. The mapping
+  matches `--create-table`'s DDL translator, so a binary copy into a
+  table created by ferrule round-trips cleanly.
+
+  When to pick which:
+  - **Binary** wins on `BIGINT` / `TIMESTAMPTZ` / `UUID` / `NUMERIC`-
+    heavy schemas, where text parse cost dominates.
+  - **Text** is faster (or at-worst even) on `TEXT` / `JSONB` /
+    `BYTEA`-heavy schemas, because the typed 4-byte length prefix
+    binary frames each value with inflates small payloads beyond
+    their tab-separated equivalent.
+  - Binary requires `--bulk-native=auto|on`; the generic INSERT path
+    doesn't use COPY at all. Passing `--copy-format binary
+    --bulk-native off` is a usage error.
+  - Source columns whose `TypeHint` is `Other` (rare; arises when a
+    backend driver can't classify a custom type) cannot be bound in
+    binary mode and surface as `BulkUnavailable` so the dispatcher
+    can fall back under `--bulk-native=auto`.
 - **MySQL** ships UTF-8 tab/newline-delimited with backslash escapes
   matching `ESCAPED BY '\\'`. The per-call local infile handler is
   installed only for the duration of one `bulk_insert_rows` call —

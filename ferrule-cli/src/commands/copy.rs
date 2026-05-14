@@ -4,7 +4,8 @@ use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::Backend;
 use ferrule_core::connection::ConnectOptions;
 use ferrule_core::copy::{
-    copy_all_tables, copy_rows, AllTablesOptions, BulkMode, CopyOptions, CopySource, IfExists,
+    copy_all_tables, copy_rows, AllTablesOptions, BulkMode, CopyFormat, CopyOptions, CopySource,
+    IfExists,
 };
 
 // `BulkMode` itself comes from ferrule_core; the CLI wraps it in
@@ -70,6 +71,16 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
     // invalid input with a usage error before we get here, so this
     // conversion is infallible.
     let bulk_mode: BulkMode = args.bulk_native.into();
+    let copy_format: CopyFormat = args.copy_format.into();
+    // --copy-format binary is only meaningful when the bulk path is
+    // selected (the generic INSERT path doesn't use COPY). Surface
+    // the misconfiguration up front rather than silently dropping.
+    if copy_format == CopyFormat::Binary && bulk_mode == BulkMode::Off {
+        return Err(CliError::usage(
+            "--copy-format binary requires --bulk-native auto or on; \
+             the generic INSERT path does not use COPY.",
+        ));
+    }
 
     if if_exists == IfExists::Truncate && !args.yes && std::io::stdin().is_terminal() {
         return Err(CliError::usage(
@@ -147,6 +158,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
             atomic: args.atomic,
             batch_size: args.batch,
             bulk_mode,
+            copy_format,
             verbose: args.output.verbose,
             create_table: args.create_table,
             no_fk_check: args.no_fk_check,
@@ -180,6 +192,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
             atomic: args.atomic,
             batch_size: args.batch,
             bulk_mode,
+            copy_format,
             verbose: args.output.verbose,
             progress,
         };

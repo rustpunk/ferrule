@@ -110,6 +110,42 @@ impl BulkMode {
     }
 }
 
+/// Wire format used by the Postgres `COPY` bulk path.
+///
+/// Defaults to [`Text`] for parity with PR #40 / the Phase-1
+/// dispatcher. Binary is opt-in: it skips PG's text parser, which is
+/// faster on `BIGINT` / `TIMESTAMPTZ` / `UUID` / `NUMERIC`-heavy
+/// schemas, but is at-best break-even on `TEXT` / `JSONB` / `BYTEA`-
+/// heavy ones because typed length prefixes inflate small payloads.
+///
+/// PG-only. Other backends ignore the field — their bulk paths are
+/// already protocol-native (TDS, MySQL `LOAD DATA`, ODPI-C).
+///
+/// [`Text`]: CopyFormat::Text
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyFormat {
+    /// `COPY … WITH (FORMAT TEXT)`. Tab-separated, newline-terminated;
+    /// the only path before this flag existed.
+    #[default]
+    Text,
+    /// `COPY … WITH (FORMAT BINARY)`. Streamed via
+    /// [`tokio_postgres::binary_copy::BinaryCopyInWriter`]; per-row
+    /// values are bound through their `ToSql` impls.
+    Binary,
+}
+
+impl CopyFormat {
+    /// Parse a format name (case-insensitive). Recognised: `text`,
+    /// `binary`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "binary" => Some(Self::Binary),
+            _ => None,
+        }
+    }
+}
+
 /// Source side of a copy: a whole table or an arbitrary SELECT.
 #[derive(Debug, Clone)]
 pub enum CopySource {
@@ -154,6 +190,9 @@ pub struct CopyOptions {
     /// native bulk loader. Default [`BulkMode::Off`] preserves
     /// Phase 1 behaviour.
     pub bulk_mode: BulkMode,
+    /// Wire format for the Postgres `COPY` bulk path. Other backends
+    /// ignore this field. Default [`CopyFormat::Text`].
+    pub copy_format: CopyFormat,
     /// Whether `copy_rows` should emit per-event diagnostics on
     /// stderr (currently: a one-line "using native path" notice when
     /// the bulk path is selected, plus the standard fallback warning
@@ -173,6 +212,7 @@ impl Default for CopyOptions {
             atomic: false,
             batch_size: 1000,
             bulk_mode: BulkMode::Off,
+            copy_format: CopyFormat::Text,
             verbose: false,
             progress: None,
         }
@@ -480,6 +520,7 @@ async fn run_copy(
                 dst_backend,
                 opts.if_exists,
                 opts.bulk_mode,
+                opts.copy_format,
                 opts.verbose,
             )
             .await?;
@@ -526,6 +567,7 @@ async fn run_truncate_and_first_batch(
             dst_backend,
             opts.if_exists,
             opts.bulk_mode,
+            opts.copy_format,
             opts.verbose,
         )
         .await?;
@@ -550,6 +592,7 @@ async fn insert_batch(
     dst_backend: Backend,
     if_exists: IfExists,
     bulk_mode: BulkMode,
+    copy_format: CopyFormat,
     verbose: bool,
 ) -> Result<(), CoreError> {
     if rows.is_empty() {
@@ -565,6 +608,7 @@ async fn insert_batch(
             table: target_table,
             columns,
             rows,
+            copy_format,
         };
         match dst.bulk_insert_rows(target).await {
             Ok(_) => {
@@ -1201,6 +1245,7 @@ pub struct AllTablesOptions {
     pub atomic: bool,
     pub batch_size: usize,
     pub bulk_mode: BulkMode,
+    pub copy_format: CopyFormat,
     pub verbose: bool,
     pub create_table: bool,
     /// If true, ignore cycle errors from `topo_sort` and copy in a
@@ -1218,6 +1263,7 @@ impl Default for AllTablesOptions {
             atomic: false,
             batch_size: 1000,
             bulk_mode: BulkMode::Off,
+            copy_format: CopyFormat::Text,
             verbose: false,
             create_table: false,
             no_fk_check: false,
@@ -1439,6 +1485,7 @@ pub async fn copy_all_tables(
             atomic: opts.atomic,
             batch_size: opts.batch_size,
             bulk_mode: opts.bulk_mode,
+            copy_format: opts.copy_format,
             verbose: opts.verbose,
             progress: None,
         };
@@ -2018,6 +2065,7 @@ mod tests {
             atomic: false,
             batch_size: 2,
             bulk_mode: BulkMode::Off,
+            copy_format: CopyFormat::Text,
             verbose: false,
             progress: None,
         };

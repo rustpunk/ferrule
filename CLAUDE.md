@@ -653,12 +653,28 @@ container, since PG is the only backend that has a `COPY` source
 that ferrule's source-side SELECT already exercises):
 
 ```bash
-# Bulk-on path: Postgres native COPY ... FROM STDIN.
+# Bulk-on path: Postgres native COPY ... FROM STDIN (text frame).
 ferrule copy \
   "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
   "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
   --query "SELECT * FROM test_users" --into bulk_pg_smoke \
   --create-table --bulk-native on
+
+# Same path, but using FORMAT BINARY (faster for numeric / TIMESTAMPTZ
+# / UUID / NUMERIC-heavy schemas; PG-only flag).
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  --query "SELECT * FROM test_users" --into bulk_pg_smoke_bin \
+  --create-table --bulk-native on --copy-format binary
+
+# --copy-format binary without --bulk-native is a usage error: the
+# generic INSERT path doesn't use COPY at all.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  --table test_users --copy-format binary
+# → "--copy-format binary requires --bulk-native auto or on; ..."
 
 # Auto path: chooses native if available, falls back if not.
 ferrule copy \
