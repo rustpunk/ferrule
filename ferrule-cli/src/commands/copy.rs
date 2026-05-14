@@ -161,6 +161,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
             copy_format,
             verbose: args.output.verbose,
             create_table: args.create_table,
+            preserve_pk: args.preserve_pk,
             no_fk_check: args.no_fk_check,
         };
         copy_all_tables(
@@ -188,6 +189,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
         let opts = CopyOptions {
             source: source.expect("source resolved in the non-all-tables branch"),
             create_table: args.create_table,
+            preserve_pk: args.preserve_pk,
             if_exists,
             atomic: args.atomic,
             batch_size: args.batch,

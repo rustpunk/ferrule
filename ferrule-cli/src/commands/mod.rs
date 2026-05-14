@@ -346,6 +346,14 @@ pub struct CopyArgs {
     #[arg(long)]
     pub create_table: bool,
 
+    /// When set with `--create-table`, also lift the source table's
+    /// declared primary key into the emitted DDL. Default off keeps
+    /// the v1 contract that `--create-table` is data-movement, not
+    /// schema migration. Best-effort: source tables with no PK still
+    /// get the column-only DDL. Ignored in `--query` mode.
+    #[arg(long, requires = "create_table")]
+    pub preserve_pk: bool,
+
     /// What to do if the target table already contains rows.
     /// `error` (default, non-destructive), `append`, `truncate`,
     /// `skip` (PK-driven `ON CONFLICT DO NOTHING` / `INSERT IGNORE` /
