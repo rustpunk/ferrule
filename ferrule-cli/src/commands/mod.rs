@@ -346,14 +346,31 @@ pub struct CopyArgs {
     #[arg(long)]
     pub create_table: bool,
 
+    /// When set with `--create-table`, also lift the source table's
+    /// declared primary key into the emitted DDL. Default off keeps
+    /// the v1 contract that `--create-table` is data-movement, not
+    /// schema migration. Best-effort: source tables with no PK still
+    /// get the column-only DDL. Ignored in `--query` mode.
+    #[arg(long, requires = "create_table")]
+    pub preserve_pk: bool,
+
     /// What to do if the target table already contains rows.
     /// `error` (default, non-destructive), `append`, `truncate`,
     /// `skip` (PK-driven `ON CONFLICT DO NOTHING` / `INSERT IGNORE` /
     /// `MERGE … WHEN NOT MATCHED`), or `upsert` (`ON CONFLICT DO UPDATE`
     /// / `ON DUPLICATE KEY UPDATE` / full `MERGE`). `skip` and
-    /// `upsert` require a declared primary key on the destination.
+    /// `upsert` require conflict columns — declared PK on the
+    /// destination, or `--key COL[,COL...]`.
     #[arg(long, value_name = "STRATEGY", default_value = "error")]
     pub if_exists: String,
+
+    /// Override the conflict-key column list for `--if-exists
+    /// skip|upsert`. Repeatable or comma-separated. Useful when the
+    /// destination has no declared primary key or when conflict
+    /// resolution should key on a unique index that isn't the PK.
+    /// Ignored (with a one-line stderr notice) for other strategies.
+    #[arg(long, value_name = "COL", value_delimiter = ',')]
+    pub key: Vec<String>,
 
     /// Required confirmation for destructive `--if-exists truncate`
     /// when stdin is a TTY.
@@ -411,11 +428,53 @@ pub struct CopyArgs {
     #[command(flatten)]
     pub output: OutputFlags,
 
-    /// Connection flags. Note: in Phase 1 these apply to *both* source
-    /// and destination — independent `--src-*` / `--dst-*` SSH/proxy
-    /// flags are tracked as a backlog enhancement.
+    /// Shared connection flags — apply to both source and destination
+    /// unless overridden by the per-side `--src-*` / `--dst-*` flags
+    /// below. Setting both the unsuffixed and a per-side variant for
+    /// the same flag is a usage error.
     #[command(flatten)]
     pub conn_flags: ConnectionFlags,
+
+    /// Source-side override: open the source through an SSH tunnel.
+    /// Same shape as `--ssh-tunnel`; mutually exclusive with it.
+    #[arg(long = "src-ssh-tunnel", value_name = "USER@HOST[:PORT]")]
+    pub src_ssh_tunnel: Option<String>,
+
+    /// Source-side override: SSH private key for `--src-ssh-tunnel`.
+    /// Mutually exclusive with `--ssh-key`.
+    #[arg(long = "src-ssh-key", value_name = "PATH")]
+    pub src_ssh_key: Option<String>,
+
+    /// Source-side override: HTTP CONNECT proxy URL. Mutually exclusive
+    /// with `--proxy-url`.
+    #[arg(long = "src-proxy-url", value_name = "URL")]
+    pub src_proxy_url: Option<String>,
+
+    /// Source-side override: disable TLS certificate verification for
+    /// the source connection only. Mutually exclusive with `--insecure`.
+    #[arg(long = "src-insecure")]
+    pub src_insecure: bool,
+
+    /// Destination-side override: open the destination through an SSH
+    /// tunnel. Mutually exclusive with `--ssh-tunnel`.
+    #[arg(long = "dst-ssh-tunnel", value_name = "USER@HOST[:PORT]")]
+    pub dst_ssh_tunnel: Option<String>,
+
+    /// Destination-side override: SSH private key for `--dst-ssh-tunnel`.
+    /// Mutually exclusive with `--ssh-key`.
+    #[arg(long = "dst-ssh-key", value_name = "PATH")]
+    pub dst_ssh_key: Option<String>,
+
+    /// Destination-side override: HTTP CONNECT proxy URL. Mutually
+    /// exclusive with `--proxy-url`.
+    #[arg(long = "dst-proxy-url", value_name = "URL")]
+    pub dst_proxy_url: Option<String>,
+
+    /// Destination-side override: disable TLS certificate verification
+    /// for the destination connection only. Mutually exclusive with
+    /// `--insecure`.
+    #[arg(long = "dst-insecure")]
+    pub dst_insecure: bool,
 }
 
 /// Diff command arguments — compare schemas between two connections.

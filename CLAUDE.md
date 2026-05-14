@@ -607,14 +607,70 @@ ferrule query \
   "UPDATE test_users SET age = 30 WHERE name = 'Alice'"
 
 rm /tmp/ferrule-copy-smoke.db
+
+# --create-table --preserve-pk: lift the source PK into the destination
+# DDL so a follow-up --if-exists upsert works without --key.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-pp-smoke.db" \
+  --table test_users --create-table --preserve-pk
+ferrule query "sqlite:///tmp/ferrule-pp-smoke.db" \
+  "SELECT sql FROM sqlite_master WHERE name = 'test_users'" --format json
+# → DDL contains `PRIMARY KEY ("id")`.
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-pp-smoke.db" \
+  --table test_users --if-exists upsert
+# → succeeds (PK was preserved on create).
+rm /tmp/ferrule-pp-smoke.db
+
+# --key COL[,COL...]: override the conflict-key column list. Useful
+# for PK-less destinations or unique-index-keyed upsert. Naming a
+# column not present in the source SELECT shape fails fast (exit 4)
+# before any INSERT runs.
+ferrule query "sqlite:///tmp/ferrule-key-smoke.db" \
+  "CREATE TABLE t (id INTEGER, name TEXT, UNIQUE(id))"
+ferrule query "sqlite:///tmp/ferrule-key-smoke.db" \
+  "INSERT INTO t VALUES (1, 'old')"
+ferrule copy \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-key-smoke.db" \
+  --query "SELECT id, name FROM test_users WHERE active = true" --into t \
+  --key id --if-exists upsert
+ferrule query "sqlite:///tmp/ferrule-key-smoke.db" \
+  "SELECT id, name FROM t ORDER BY id" --format json
+# → existing id=1 overwritten via UNIQUE-index-keyed upsert; new rows inserted.
+rm /tmp/ferrule-key-smoke.db
 ```
 
-Skip/Upsert require a declared PK on the destination — `test_users.id`
-in the seeded fixtures. Tables without a PK hard-error before the
-source SELECT runs, with a hint at the future `--key` override (#43).
+Skip/Upsert need conflict columns on the destination — either via a
+declared PK, `--create-table --preserve-pk`, or `--key COL[,COL...]`.
+Tables with none hard-error before the source SELECT runs.
 `--bulk-native auto|on` combined with `--if-exists skip|upsert` is
 silently ignored (the bulk loaders carry no MERGE semantics); ferrule
 prints one stderr line and uses the generic INSERT path.
+
+Per-side `--src-*` / `--dst-*` smoke — uses the seeded
+`ferrule-ssh-test` + `ferrule-pg-test` containers from the SSH section
+above. Source connection goes through the bastion; destination stays
+direct.
+
+```bash
+ferrule copy \
+  --src-ssh-tunnel ferrule@127.0.0.1:12222 --src-ssh-key ~/.ssh/id_ed25519 \
+  "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "sqlite:///tmp/ferrule-side-smoke.db" \
+  --table test_users --create-table --preserve-pk
+ferrule query "sqlite:///tmp/ferrule-side-smoke.db" \
+  "SELECT count(*) FROM test_users" --format json
+rm /tmp/ferrule-side-smoke.db
+
+# Mutual exclusion: setting both unsuffixed and per-side is a usage
+# error (exit 2) — no silent merge.
+ferrule copy --ssh-tunnel a@b --src-ssh-tunnel a@b \
+  "sqlite:///tmp/x.db" "sqlite:///tmp/y.db" --table t 2>&1 | head -3
+# → "Cannot combine --ssh-tunnel and --src-ssh-tunnel: pick one..."
+```
 
 Schema-level (`--all-tables`) smoke — uses the seeded
 `test_users` + `test_orders` FK pair to verify parents load before
