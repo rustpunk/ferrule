@@ -10,6 +10,10 @@ pub struct GlobalConfig {
     pub default: DefaultProfile,
     #[serde(default)]
     pub connection: IndexMap<String, ConnectionProfile>,
+    #[serde(default)]
+    pub history: HistoryConfig,
+    #[serde(default)]
+    pub slow_log: SlowLogConfig,
 }
 
 impl GlobalConfig {
@@ -124,6 +128,131 @@ fn default_timeout() -> u64 {
     30
 }
 
+/// Configuration for the persistent query-history store at
+/// `~/.local/share/ferrule/history.db` (R4 / #4).
+///
+/// Default-on. The `FERRULE_NO_HISTORY` env var kills recording for a
+/// single invocation without touching this config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryConfig {
+    #[serde(default = "default_history_enabled")]
+    pub enabled: bool,
+    /// Open-loop retention: rows older than this many days are pruned
+    /// opportunistically on the next `record()` call. `0` disables age-based
+    /// pruning.
+    #[serde(default = "default_history_max_age_days")]
+    pub max_age_days: u32,
+    /// Open-loop retention: cap on the total row count. `0` disables
+    /// count-based pruning. Pruning, when triggered, deletes the oldest
+    /// rows first.
+    #[serde(default = "default_history_max_rows")]
+    pub max_rows: u64,
+    /// Path to the SQLite store. When `None`, defaults to
+    /// `<XDG_DATA_HOME>/ferrule/history.db` (Linux/macOS) or the platform
+    /// equivalent via `dirs::data_local_dir()`.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_history_enabled(),
+            max_age_days: default_history_max_age_days(),
+            max_rows: default_history_max_rows(),
+            path: None,
+        }
+    }
+}
+
+fn default_history_enabled() -> bool {
+    true
+}
+
+fn default_history_max_age_days() -> u32 {
+    30
+}
+
+fn default_history_max_rows() -> u64 {
+    100_000
+}
+
+/// Slow-query log configuration (P5 / #16). Default off — recording
+/// every slow query to a side file is opinionated enough to warrant an
+/// explicit opt-in. When enabled, the [`HistoryDb::record`] hook also
+/// appends a tab-separated line to `path` for every run whose
+/// `duration_ms >= threshold_ms`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlowLogConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Threshold expressed as `humantime` (e.g. `"1s"`, `"250ms"`,
+    /// `"2m"`). The CLI also accepts a bare integer of milliseconds.
+    #[serde(default = "default_slow_threshold")]
+    pub threshold: String,
+    /// Append target. When `None`, defaults to
+    /// `<XDG_DATA_HOME>/ferrule/slow.log`.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for SlowLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: default_slow_threshold(),
+            path: None,
+        }
+    }
+}
+
+impl SlowLogConfig {
+    /// Resolve `threshold` to a millisecond count. Accepts a bare integer
+    /// (`"500"` → 500ms) or any humantime-style duration string. Returns
+    /// `Err` with a clear message on bad input.
+    pub fn threshold_ms(&self) -> Result<u64, String> {
+        parse_threshold_ms(&self.threshold)
+    }
+}
+
+fn default_slow_threshold() -> String {
+    "1s".to_string()
+}
+
+/// Parse a `humantime`-style duration into milliseconds, or accept a
+/// bare integer of milliseconds. Lives here (not in `humantime` itself)
+/// because pulling in a workspace dep for one parse felt heavier than
+/// the function body. Recognises `s`, `ms`, `m`, `h`, `d`; rejects
+/// anything else.
+fn parse_threshold_ms(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("threshold is empty".into());
+    }
+    if let Ok(ms) = s.parse::<u64>() {
+        return Ok(ms);
+    }
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("threshold '{s}' has no unit suffix"))?;
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("threshold '{s}': invalid number"))?;
+    let unit = unit.trim();
+    let ms = match unit {
+        "ms" => n,
+        "s" | "sec" | "secs" => n.saturating_mul(1_000),
+        "m" | "min" | "mins" => n.saturating_mul(60_000),
+        "h" | "hr" | "hrs" => n.saturating_mul(3_600_000),
+        "d" | "day" | "days" => n.saturating_mul(86_400_000),
+        other => return Err(format!("threshold '{s}': unknown unit '{other}'")),
+    };
+    Ok(ms)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionProfile {
@@ -189,6 +318,31 @@ url = "postgres://user:pass@host/db"
         assert_eq!(config.connection.len(), 1);
         let prod = config.connection.get("production").unwrap();
         assert_eq!(prod.url, "postgres://user:pass@host/db");
+    }
+
+    fn slow(t: &str) -> SlowLogConfig {
+        SlowLogConfig {
+            enabled: true,
+            threshold: t.into(),
+            path: None,
+        }
+    }
+
+    #[test]
+    fn slow_log_threshold_parses_humantime_and_bare_ms() {
+        assert_eq!(SlowLogConfig::default().threshold_ms().unwrap(), 1_000);
+        assert_eq!(slow("250ms").threshold_ms().unwrap(), 250);
+        assert_eq!(slow("500").threshold_ms().unwrap(), 500);
+        assert_eq!(slow("2s").threshold_ms().unwrap(), 2_000);
+        assert_eq!(slow("5m").threshold_ms().unwrap(), 300_000);
+        assert_eq!(slow("1h").threshold_ms().unwrap(), 3_600_000);
+    }
+
+    #[test]
+    fn slow_log_threshold_rejects_bad_input() {
+        assert!(slow("").threshold_ms().is_err());
+        assert!(slow("fast").threshold_ms().is_err());
+        assert!(slow("5x").threshold_ms().is_err());
     }
 
     #[test]

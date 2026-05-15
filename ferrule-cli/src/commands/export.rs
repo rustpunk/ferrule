@@ -41,6 +41,12 @@ pub struct ExportArgs {
 
     #[command(flatten)]
     pub conn_flags: ConnectionFlags,
+
+    /// Exit with code 1 ("notable result", GNU diff convention) when
+    /// the export produces zero rows. Useful for scripted exports
+    /// that should alert when nothing matched.
+    #[arg(long)]
+    pub fail_on_empty: bool,
 }
 
 /// Supported export formats.
@@ -215,6 +221,12 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
 
     if args.output.verbose {
         eprintln!("[export] {} rows written", total_rows);
+    }
+
+    if args.fail_on_empty && total_rows == 0 {
+        return Err(CliError::result_notable(
+            "export produced no rows (--fail-on-empty)",
+        ));
     }
 
     Ok(())

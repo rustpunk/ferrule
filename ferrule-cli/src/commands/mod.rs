@@ -6,6 +6,7 @@ pub mod diff;
 pub mod dump;
 pub mod explain;
 pub mod export;
+pub mod history;
 pub mod load;
 pub mod migrate;
 pub mod query;
@@ -18,6 +19,7 @@ pub use bookmark::BookmarkArgs;
 pub use dump::DumpArgs;
 pub use explain::ExplainArgs;
 pub use export::ExportArgs;
+pub use history::{HistoryArgs, SlowArgs};
 pub use load::LoadArgs;
 pub use migrate::MigrateArgs;
 pub use repl::ReplArgs;
@@ -260,6 +262,32 @@ pub struct QueryArgs {
     /// Watch interval in seconds (default: 5)
     #[arg(long, value_name = "SECS", default_value_t = 5)]
     pub watch_interval: u64,
+
+    /// Benchmark mode: run the query N times, suppress result output,
+    /// print a p50/p95/p99 summary + ASCII histogram. Connect cost is
+    /// taken once outside the loop. Pairs naturally with the connection
+    /// pooling daemon.
+    #[arg(long, value_name = "N")]
+    pub bench: Option<u32>,
+
+    /// Warmup iterations discarded before the timed run starts.
+    /// Ignored unless `--bench` is set.
+    #[arg(long, value_name = "K", default_value_t = 1)]
+    pub bench_warmup: u32,
+
+    /// When set, emit per-iteration timings as CSV to the named file in
+    /// addition to the on-screen histogram. Useful for piping into
+    /// statistical tools. Ignored unless `--bench` is set.
+    #[arg(long, value_name = "PATH")]
+    pub bench_output: Option<String>,
+
+    /// Exit with code 1 ("notable result", GNU diff convention) when
+    /// the query returns zero rows. Pairs with shell pipelines like
+    /// `ferrule query ... --fail-on-empty || alert`. Multi-statement
+    /// batches gate on the first SELECT result; DML-only batches are a
+    /// usage error.
+    #[arg(long)]
+    pub fail_on_empty: bool,
 }
 
 /// Tables command arguments.

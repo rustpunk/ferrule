@@ -773,6 +773,73 @@ backend module's inline tests. Cross-backend integration tests are
 deferred — the existing per-backend test fixtures already cover both
 sides of the type translation in isolation.
 
+### Query telemetry — smoke
+
+The Query Telemetry Foundation sprint (R3 / R4 / P4 / P5; issues #3,
+#4, #15, #16) layers four features on top of one shared SQLite store
+at `~/.local/share/ferrule/history.db`. All four work against SQLite
+alone — no Docker needed.
+
+```bash
+# Use an isolated config + DB path so smoke runs don't touch real state.
+mkdir -p /tmp/ferrule-telemetry
+cat > /tmp/ferrule-telemetry.toml <<'EOF'
+[history]
+enabled = true
+path = "/tmp/ferrule-telemetry/history.db"
+
+[slow_log]
+enabled = true
+threshold = "10ms"
+path = "/tmp/ferrule-telemetry/slow.log"
+EOF
+
+FERRULE="./target/debug/ferrule -c /tmp/ferrule-telemetry.toml"
+
+# 1. R4 history log: every invocation lands in the SQLite store.
+$FERRULE query "sqlite::memory:" "SELECT 1, 2, 3" --format json >/dev/null
+$FERRULE history --last 5 --format table
+
+# 2. P5 slow log: the recursive CTE crosses the 10ms threshold and gets
+# teed to slow.log; the trivial SELECT 1 above does not.
+$FERRULE query "sqlite::memory:" \
+  "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<200000) SELECT count(*) FROM r" \
+  >/dev/null
+$FERRULE slow --format table
+cat /tmp/ferrule-telemetry/slow.log
+
+# 3. P4 bench mode: histogram + one rolled-up history row.
+$FERRULE query "sqlite::memory:" "SELECT 1" --bench 50 --bench-warmup 5
+$FERRULE history --last 1 --format json | grep -F 'bench('
+
+# 4. R3 --fail-on-empty: exit-code gate via the GNU diff convention.
+$FERRULE query "sqlite::memory:" "SELECT 1 WHERE 0=1" --fail-on-empty
+test $? -eq 1 && echo "  exit 1 as expected (notable result)"
+$FERRULE query "sqlite::memory:" "SELECT 1" --fail-on-empty >/dev/null
+test $? -eq 0 && echo "  exit 0 as expected"
+
+# Kill switch — single-invocation override of [history] enabled.
+FERRULE_NO_HISTORY=1 $FERRULE query "sqlite::memory:" "SELECT 'private'" --format json >/dev/null
+$FERRULE history --grep private --format json    # → []
+```
+
+Bonus parity check against the seeded Postgres container (uses the
+test_users table from the Postgres section above):
+
+```bash
+$FERRULE query "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable" \
+  "SELECT * FROM test_users WHERE age > 999" --fail-on-empty
+test $? -eq 1
+$FERRULE history --conn '*15432*' --last 5 --format table
+```
+
+Inline tests cover the store directly (`ferrule-cli/src/history.rs`
+mod tests — 16 cases), the slow-log tee, the bench summary, and the
+`--fail-on-empty` classifier. The recording path itself is exercised
+by the smoke above; the dispatch hook in `main.rs::record_dispatch`
+swallows `record()` failures so a busted store never blocks a user
+command.
+
 ### Backend test status
 
 - **SQLite, Postgres, MySQL, MSSQL, Oracle** — runtime-tested via the Docker

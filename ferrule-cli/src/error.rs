@@ -46,6 +46,15 @@ pub enum CliError {
 
     #[error("invalid usage: {0}")]
     Usage(String),
+
+    /// "Command succeeded, but the result is something the caller likely
+    /// wants to gate on." Maps to [`exit::RESULT_NOTABLE`] (`1`), matching
+    /// the GNU `diff` / `grep` / `kubectl diff` convention. Today the only
+    /// producer is `--fail-on-empty`; future producers include
+    /// `ferrule check` / `lint` / `validate`. Not rendered as an error
+    /// by miette — the stderr line is a plain informational message.
+    #[error("{0}")]
+    ResultNotable(String),
 }
 
 impl CliError {
@@ -65,6 +74,10 @@ impl CliError {
         Self::Usage(msg.into())
     }
 
+    pub fn result_notable<S: Into<String>>(msg: S) -> Self {
+        Self::ResultNotable(msg.into())
+    }
+
     /// Process exit code dictated by the error category.
     pub fn exit_code(&self) -> i32 {
         match self {
@@ -73,6 +86,7 @@ impl CliError {
             Self::Registry(_) => exit::CONNECTION,
             Self::Io(_) => exit::QUERY,
             Self::Usage(_) => exit::USAGE,
+            Self::ResultNotable(_) => exit::RESULT_NOTABLE,
         }
     }
 }
@@ -85,6 +99,7 @@ impl miette::Diagnostic for CliError {
             Self::Registry(_) => "ferrule::registry",
             Self::Io(_) => "ferrule::io",
             Self::Usage(_) => "ferrule::usage",
+            Self::ResultNotable(_) => "ferrule::result_notable",
         }))
     }
 }
