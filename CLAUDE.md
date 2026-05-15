@@ -1028,3 +1028,64 @@ microbenchmarks. Backend SQL emitted: `BEGIN/COMMIT/ROLLBACK` for
 PostgreSQL / MySQL / SQLite, `BEGIN TRANSACTION/...` for MSSQL, and
 COMMIT / ROLLBACK only for Oracle (implicit txn — BEGIN is a noop).
 
+### Result cache — smoke (Phase 5 #5)
+
+`ferrule query --cache <DURATION>` / `--no-cache` and the
+`FERRULE_NO_CACHE` env kill switch route SELECT results through a
+separate SQLite store at `~/.local/share/ferrule/results.db`. The
+cache is opt-out (defaults to enabled with `default_ttl = "5m"`) and
+fails silently — every cache error falls through to the real query.
+SQLite alone exercises every path; the smoke below uses an isolated
+config at `/tmp/ferrule-cache.toml` so it doesn't touch the user's
+data dir.
+
+```bash
+# Setup: isolated cache config + a fresh data DB.
+cat > /tmp/ferrule-cache.toml <<'EOF'
+[cache]
+enabled = true
+default_ttl = "5m"
+path = "/tmp/ferrule-cache.db"
+EOF
+rm -f /tmp/ferrule-cache.db /tmp/ferrule-cache-data.db
+
+# 1. Miss + insert: first run populates the cache.
+ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" "SELECT 1" --verbose 2>&1 \
+  | grep -E "cache miss|cache hit"
+# → stderr: [ferrule] cache miss; inserted (ttl=300s)
+
+# 2. Hit: second identical run skips the database.
+ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" "SELECT 1" --verbose 2>&1 \
+  | grep -E "cache miss|cache hit"
+# → stderr: [ferrule] cache hit (key=..., age=Xs)
+
+# 3. --no-cache bypass: leaves the cache state intact.
+ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" "SELECT 1" --no-cache --verbose 2>&1 \
+  | grep -E "cache miss|cache hit" || echo "no cache event (expected)"
+
+# 4. is_modifying bypass: an INSERT does NOT touch the cache.
+ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" \
+  "CREATE TABLE t(x INT); INSERT INTO t VALUES (1)" 2>&1 || true
+sqlite3 /tmp/ferrule-cache.db \
+  "SELECT count(*) FROM cache WHERE sql_preview LIKE 'INSERT%';"
+# → 0
+
+# 5. Env kill switch: FERRULE_NO_CACHE=1 disables cache wholesale.
+FERRULE_NO_CACHE=1 ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" "SELECT 1" --verbose 2>&1 \
+  | grep -E "cache miss|cache hit" || echo "no cache event (expected)"
+
+# Cleanup.
+rm -f /tmp/ferrule-cache.toml /tmp/ferrule-cache.db /tmp/ferrule-cache-data.db
+```
+
+The cache file lives at `dirs::data_local_dir()/ferrule/results.db`
+by default — set `[cache] path = "..."` (or `--config` to a custom
+TOML, as above) to redirect. Schema migrations gate on `PRAGMA
+user_version`; a downgrade (newer ferrule wrote v2, older binary
+opens it) is a hard usage error rather than a silent re-migration.
+
