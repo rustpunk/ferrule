@@ -30,6 +30,7 @@
 - [Cross-DB Copy](copy.md)
 - [SSH Tunnels](ssh-tunnels.md)
 - [HTTP CONNECT Proxy](proxy.md)
+- [Query Telemetry](telemetry.md)
 
 # Reference
 

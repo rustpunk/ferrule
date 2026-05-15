@@ -14,6 +14,7 @@
 - **Pure Rust** — Native async drivers for Postgres (`tokio-postgres`), MySQL (`mysql_async`), MSSQL (`tiberius`), SQLite (`rusqlite`). No libpq, no libmysqlclient, no Microsoft ODBC drivers.
 - **Beautiful output** — Auto-detect TTY and render formatted tables, or stream JSON/CSV/YAML for piping.
 - **Connection registry** — Save named connections, resolve passwords from env vars, OS keyring, or interactive prompt.
+- **Query telemetry** — Persistent history log of every invocation, opt-in slow-query log, `--bench N` mode with p50/p95/p99 + ASCII histogram, `--fail-on-empty` exit-code gate.
 - **Zero runtime deps (default)** — `cargo install ferrule` produces a ~15–25 MB static binary.
 
 ## Quick Start
