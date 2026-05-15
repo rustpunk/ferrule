@@ -156,8 +156,15 @@ fn main() {
 
     if let Err(err) = result {
         let code = err.exit_code();
-        let report = miette::Report::new(err);
-        eprintln!("{:?}", report);
+        // ResultNotable is "command succeeded with a gate-worthy
+        // result" — not an error. Print a plain stderr line instead of
+        // routing through the miette error renderer.
+        if let CliError::ResultNotable(msg) = &err {
+            eprintln!("ferrule: {msg}");
+        } else {
+            let report = miette::Report::new(err);
+            eprintln!("{:?}", report);
+        }
         std::process::exit(code);
     }
 }
@@ -290,5 +297,6 @@ fn error_class(err: &CliError) -> &'static str {
         CliError::Registry(_) => "registry",
         CliError::Io(_) => "io",
         CliError::Usage(_) => "usage",
+        CliError::ResultNotable(_) => "result_notable",
     }
 }

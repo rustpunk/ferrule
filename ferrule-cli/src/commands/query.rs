@@ -157,6 +157,29 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         ));
     }
 
+    if args.fail_on_empty {
+        if args.explain {
+            return Err(CliError::usage(
+                "--fail-on-empty cannot be combined with --explain.",
+            ));
+        }
+        if args.conn_flags.daemon {
+            return Err(CliError::usage(
+                "--fail-on-empty cannot be combined with --daemon (the daemon path returns a pre-rendered payload).",
+            ));
+        }
+        if args.watch || args.watch_file.is_some() {
+            return Err(CliError::usage(
+                "--fail-on-empty cannot be combined with --watch.",
+            ));
+        }
+        if args.bench.is_some() {
+            return Err(CliError::usage(
+                "--fail-on-empty cannot be combined with --bench.",
+            ));
+        }
+    }
+
     let limit = args.output.resolve_limit(global_config);
     let offset = args.output.offset;
 
@@ -421,5 +444,109 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         );
     }
 
+    if args.fail_on_empty {
+        check_fail_on_empty(&results)?;
+    }
+
     Ok(())
+}
+
+/// `--fail-on-empty`: gate the exit code on row count without aborting
+/// the print path. Returns the `ResultNotable` variant (exit 1) when
+/// no rows came back; multi-statement batches gate on the first SELECT
+/// result. DML-only batches are a usage error.
+fn check_fail_on_empty(results: &[StatementResult]) -> Result<(), CliError> {
+    for r in results {
+        if let StatementResult::Query(qr) = r {
+            return if qr.rows.is_empty() {
+                Err(CliError::result_notable(
+                    "query returned no rows (--fail-on-empty)",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+    }
+    Err(CliError::usage(
+        "--fail-on-empty requires a query that returns rows; got DML/DDL only.",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrule_core::connection::ExecutionSummary;
+    use ferrule_core::value::{ColumnInfo, TypeHint, Value};
+
+    fn col(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            type_hint: TypeHint::Int64,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn fail_on_empty_zero_rows_returns_notable() {
+        let qr = QueryResult {
+            columns: vec![col("c")],
+            rows: vec![],
+        };
+        let err = check_fail_on_empty(&[StatementResult::Query(qr)]).unwrap_err();
+        assert!(matches!(err, CliError::ResultNotable(_)));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn fail_on_empty_with_rows_returns_ok() {
+        let qr = QueryResult {
+            columns: vec![col("c")],
+            rows: vec![vec![Value::Int64(1)]],
+        };
+        assert!(check_fail_on_empty(&[StatementResult::Query(qr)]).is_ok());
+    }
+
+    #[test]
+    fn fail_on_empty_dml_only_is_usage_error() {
+        let err = check_fail_on_empty(&[StatementResult::Summary(ExecutionSummary {
+            rows_affected: Some(5),
+            command_tag: None,
+        })])
+        .unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)));
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn fail_on_empty_multi_statement_gates_on_first_select() {
+        let qr_empty = QueryResult {
+            columns: vec![col("c")],
+            rows: vec![],
+        };
+        let qr_nonempty = QueryResult {
+            columns: vec![col("c")],
+            rows: vec![vec![Value::Int64(1)]],
+        };
+        // First SELECT is empty → notable regardless of later statements.
+        let err = check_fail_on_empty(&[
+            StatementResult::Summary(ExecutionSummary {
+                rows_affected: Some(1),
+                command_tag: None,
+            }),
+            StatementResult::Query(qr_empty),
+            StatementResult::Query(qr_nonempty.clone()),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, CliError::ResultNotable(_)));
+
+        // First SELECT is non-empty → ok.
+        assert!(check_fail_on_empty(&[
+            StatementResult::Query(qr_nonempty),
+            StatementResult::Summary(ExecutionSummary {
+                rows_affected: Some(0),
+                command_tag: None,
+            }),
+        ])
+        .is_ok());
+    }
 }

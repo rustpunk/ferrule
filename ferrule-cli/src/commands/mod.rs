@@ -280,6 +280,14 @@ pub struct QueryArgs {
     /// statistical tools. Ignored unless `--bench` is set.
     #[arg(long, value_name = "PATH")]
     pub bench_output: Option<String>,
+
+    /// Exit with code 1 ("notable result", GNU diff convention) when
+    /// the query returns zero rows. Pairs with shell pipelines like
+    /// `ferrule query ... --fail-on-empty || alert`. Multi-statement
+    /// batches gate on the first SELECT result; DML-only batches are a
+    /// usage error.
+    #[arg(long)]
+    pub fail_on_empty: bool,
 }
 
 /// Tables command arguments.
