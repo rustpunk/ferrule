@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod commands;
 mod daemon;
 mod error;
+mod history;
 mod output;
 mod repl;
 mod ssh_flags;
@@ -11,9 +12,10 @@ mod watch;
 
 use commands::{
     BookmarkArgs, ConnArgs, CopyArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, ExportArgs,
-    LoadArgs, MigrateArgs, QueryArgs, ReplArgs, TablesArgs, WatchArgs,
+    HistoryArgs, LoadArgs, MigrateArgs, QueryArgs, ReplArgs, TablesArgs, WatchArgs,
 };
 use error::CliError;
+use history::{HistoryDb, RunRecord};
 
 /// Ferrule — the collar that joins you to your data.
 #[derive(Parser)]
@@ -77,6 +79,9 @@ enum Commands {
 
     /// Watch a query and re-execute periodically
     Watch(WatchArgs),
+
+    /// Show recent ferrule invocations from the persistent history log
+    History(HistoryArgs),
 }
 
 fn run_daemon_mode() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -119,7 +124,10 @@ fn main() {
         let global_config =
             ferrule_config::GlobalConfig::load(cli.config.as_deref()).unwrap_or_default();
 
-        match cli.command {
+        let snapshot = Snapshot::capture(&cli.command);
+        let start = std::time::Instant::now();
+
+        let outcome = match cli.command {
             Commands::Connection(args) => commands::conn::run(args, &global_config).await,
             Commands::Query(args) => commands::query::run(args, &global_config).await,
             Commands::Bookmark(args) => commands::bookmark::run(args, &global_config).await,
@@ -134,7 +142,11 @@ fn main() {
             Commands::Diff(args) => commands::diff::run(args, &global_config).await,
             Commands::Copy(args) => commands::copy::run(*args, &global_config).await,
             Commands::Migrate(args) => commands::migrate::run(args, &global_config).await,
-        }
+            Commands::History(args) => commands::history::run(args, &global_config).await,
+        };
+
+        record_dispatch(&global_config, snapshot, start.elapsed(), &outcome);
+        outcome
     });
 
     if let Err(err) = result {
@@ -142,5 +154,126 @@ fn main() {
         let report = miette::Report::new(err);
         eprintln!("{:?}", report);
         std::process::exit(code);
+    }
+}
+
+/// Pre-dispatch snapshot. Captured from the parsed `Commands` value so
+/// the dispatch hook can build a `RunRecord` without re-matching after
+/// the per-command `args` is moved into the run function.
+struct Snapshot {
+    command: &'static str,
+    conn: Option<String>,
+    sql: Option<String>,
+    /// Skip recording entirely — used for `ferrule history` itself to
+    /// avoid logging the act of reading the history log.
+    skip: bool,
+}
+
+impl Snapshot {
+    fn capture(cmd: &Commands) -> Self {
+        let (name, conn, sql, skip) = match cmd {
+            Commands::Query(a) => ("query", Some(redact(&a.connection)), a.sql.clone(), false),
+            Commands::Watch(a) => (
+                "watch",
+                Some(redact(&a.connection)),
+                Some(a.sql.clone()),
+                false,
+            ),
+            Commands::Tables(a) => ("tables", Some(redact(&a.connection)), None, false),
+            Commands::Describe(a) => (
+                "describe",
+                Some(redact(&a.connection)),
+                Some(a.table.clone()),
+                false,
+            ),
+            Commands::Explain(a) => (
+                "explain",
+                Some(redact(&a.connection)),
+                Some(a.sql.clone()),
+                false,
+            ),
+            Commands::Dump(a) => ("dump", Some(redact(&a.connection)), None, false),
+            Commands::Load(a) => ("load", Some(redact(&a.connection)), None, false),
+            Commands::Export(a) => (
+                "export",
+                Some(redact(&a.connection)),
+                Some(a.sql.clone()),
+                false,
+            ),
+            Commands::Diff(a) => (
+                "diff",
+                Some(format!("{} | {}", redact(&a.connection_a), redact(&a.connection_b))),
+                None,
+                false,
+            ),
+            Commands::Copy(a) => (
+                "copy",
+                Some(format!("{} | {}", redact(&a.source), redact(&a.dest))),
+                a.query.clone(),
+                false,
+            ),
+            Commands::Migrate(_) => ("migrate", None, None, false),
+            Commands::Bookmark(_) => ("bookmark", None, None, false),
+            Commands::Connection(_) => ("conn", None, None, false),
+            Commands::Repl(a) => ("repl", a.connection.as_deref().map(redact), None, false),
+            // Don't recursively log every `ferrule history` read.
+            Commands::History(_) => ("history", None, None, true),
+        };
+        Self {
+            command: name,
+            conn,
+            sql,
+            skip,
+        }
+    }
+}
+
+/// Redact a connection argument before recording. Raw URLs are parsed and
+/// passed through `DatabaseUrl::redacted()` (which scrubs the password);
+/// registry names and SQLite paths fall through unchanged.
+fn redact(s: &str) -> String {
+    ferrule_core::DatabaseUrl::parse(s)
+        .map(|u| u.redacted())
+        .unwrap_or_else(|_| s.to_string())
+}
+
+fn record_dispatch(
+    global_config: &ferrule_config::GlobalConfig,
+    snapshot: Snapshot,
+    elapsed: std::time::Duration,
+    outcome: &Result<(), CliError>,
+) {
+    if snapshot.skip {
+        return;
+    }
+    let mut db = match HistoryDb::maybe_open(&global_config.history) {
+        Ok(Some(db)) => db,
+        Ok(None) => return,
+        Err(_) => return, // history failures must never block the user's command
+    };
+    let (exit_code, error_class) = match outcome {
+        Ok(()) => (0, None),
+        Err(e) => (e.exit_code(), Some(error_class(e).to_string())),
+    };
+    let record = RunRecord {
+        ts: chrono::Utc::now(),
+        conn: snapshot.conn,
+        command: snapshot.command.to_string(),
+        sql: snapshot.sql,
+        duration_ms: elapsed.as_millis() as u64,
+        rows: None,
+        exit_code,
+        error: error_class,
+    };
+    let _ = db.record(&record, &global_config.history);
+}
+
+fn error_class(err: &CliError) -> &'static str {
+    match err {
+        CliError::Connection(_) => "connection",
+        CliError::Query(_) => "query",
+        CliError::Registry(_) => "registry",
+        CliError::Io(_) => "io",
+        CliError::Usage(_) => "usage",
     }
 }

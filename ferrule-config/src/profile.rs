@@ -10,6 +10,8 @@ pub struct GlobalConfig {
     pub default: DefaultProfile,
     #[serde(default)]
     pub connection: IndexMap<String, ConnectionProfile>,
+    #[serde(default)]
+    pub history: HistoryConfig,
 }
 
 impl GlobalConfig {
@@ -122,6 +124,56 @@ fn default_limit() -> usize {
 
 fn default_timeout() -> u64 {
     30
+}
+
+/// Configuration for the persistent query-history store at
+/// `~/.local/share/ferrule/history.db` (R4 / #4).
+///
+/// Default-on. The `FERRULE_NO_HISTORY` env var kills recording for a
+/// single invocation without touching this config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryConfig {
+    #[serde(default = "default_history_enabled")]
+    pub enabled: bool,
+    /// Open-loop retention: rows older than this many days are pruned
+    /// opportunistically on the next `record()` call. `0` disables age-based
+    /// pruning.
+    #[serde(default = "default_history_max_age_days")]
+    pub max_age_days: u32,
+    /// Open-loop retention: cap on the total row count. `0` disables
+    /// count-based pruning. Pruning, when triggered, deletes the oldest
+    /// rows first.
+    #[serde(default = "default_history_max_rows")]
+    pub max_rows: u64,
+    /// Path to the SQLite store. When `None`, defaults to
+    /// `<XDG_DATA_HOME>/ferrule/history.db` (Linux/macOS) or the platform
+    /// equivalent via `dirs::data_local_dir()`.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_history_enabled(),
+            max_age_days: default_history_max_age_days(),
+            max_rows: default_history_max_rows(),
+            path: None,
+        }
+    }
+}
+
+fn default_history_enabled() -> bool {
+    true
+}
+
+fn default_history_max_age_days() -> u32 {
+    30
+}
+
+fn default_history_max_rows() -> u64 {
+    100_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -41,3 +41,6 @@ dashmap = "6"
 dirs = { workspace = true }
 indexmap = { workspace = true }
 hasp = { path = "../../hasp/crates/hasp", default-features = false, features = ["env", "keyring", "file"] }
+
+# Persistent query history store (R4 / #4).
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
