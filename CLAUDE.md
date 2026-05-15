@@ -908,3 +908,28 @@ ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format ndjson
 ferrule query "sqlite::memory:" "SELECT '<x>' AS c" --format html
 # → contains <table>/<thead>/<tbody>; cell renders as &lt;x&gt;.
 ```
+
+### Dump deterministic — smoke (Phase 2 #20)
+
+Reuses the seeded `ferrule-pg-test` container from the Postgres section
+above. SQLite alternative works too — swap the URL for `sqlite:///tmp/...`
+and seed `test_users` locally.
+
+```bash
+PG="postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable"
+
+# Determinism: two dumps, byte-equal.
+ferrule dump "$PG" test_users --dump-format sql --deterministic > /tmp/dump1.sql
+ferrule dump "$PG" test_users --dump-format sql --deterministic > /tmp/dump2.sql
+diff /tmp/dump1.sql /tmp/dump2.sql && echo "  byte-equal"
+
+# Per-row INSERTs (one statement per data row).
+grep -c '^INSERT INTO' /tmp/dump1.sql   # → equals row count of test_users
+
+# Regression: non-deterministic mode unchanged (batched VALUES).
+ferrule dump "$PG" test_users --dump-format sql > /tmp/dump3.sql
+grep -c '^INSERT INTO' /tmp/dump3.sql   # → 1 (single batched VALUES list)
+
+rm /tmp/dump{1,2,3}.sql
+```
+

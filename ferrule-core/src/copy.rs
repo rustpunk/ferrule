@@ -1114,7 +1114,10 @@ fn per_statement_row_cap(backend: Backend) -> Option<usize> {
 ///   the default).
 /// - MySQL: backticks. The ANSI form requires `ANSI_QUOTES` SQL_MODE
 ///   which ferrule does not assume.
-pub(crate) fn quote_identifier(id: &str, backend: Backend) -> String {
+///
+/// Public so `dump.rs` (and future schema-aware modules) can route
+/// identifier quoting through a single backend-aware implementation.
+pub fn quote_identifier(id: &str, backend: Backend) -> String {
     match backend {
         #[cfg(feature = "mysql")]
         Backend::MySql => format!("`{}`", id.replace('`', "``")),
@@ -1650,6 +1653,41 @@ mod tests {
     fn quote_identifier_mysql_uses_backticks() {
         assert_eq!(quote_identifier("users", Backend::MySql), "`users`");
         assert_eq!(quote_identifier("a`b", Backend::MySql), "`a``b`");
+    }
+
+    // The three tests below were ported verbatim from
+    // `ferrule-core/src/dump.rs::tests` when the local
+    // `quote_identifier(id)` helper was removed in favour of routing
+    // every dump-side identifier through the backend-aware
+    // [`quote_identifier`] in this module.
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn quote_identifier_wraps_in_double_quotes() {
+        assert_eq!(quote_identifier("users", Backend::Sqlite), "\"users\"");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn quote_identifier_escapes_embedded_quotes() {
+        assert_eq!(quote_identifier("a\"b", Backend::Sqlite), "\"a\"\"b\"");
+        assert_eq!(
+            quote_identifier("\"\"", Backend::Sqlite),
+            "\"\"\"\"\"\""
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn quote_identifier_preserves_other_chars() {
+        assert_eq!(
+            quote_identifier("col with space", Backend::Sqlite),
+            "\"col with space\""
+        );
+        assert_eq!(
+            quote_identifier("snake_case_99", Backend::Sqlite),
+            "\"snake_case_99\""
+        );
     }
 
     #[cfg(feature = "postgres")]

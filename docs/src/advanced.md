@@ -118,6 +118,42 @@ ferrule dump demo customers --dump-format csv --file customers.csv
 > `--dump-format` controls the on-disk dump format. They almost
 > never need to match.
 
+#### Deterministic dumps
+
+`--deterministic` (only meaningful with `--dump-format sql`) produces a
+byte-stable, diff-friendly SQL dump:
+
+```bash
+# Two consecutive dumps produce byte-identical output:
+ferrule dump demo customers --dump-format sql --deterministic > a.sql
+ferrule dump demo customers --dump-format sql --deterministic > b.sql
+diff a.sql b.sql                # → no diff
+```
+
+What changes when the flag is set:
+
+- **Stable row order.** Rows are sorted server-side by the table's
+  primary key. Tables without a declared PK emit a `[ferrule] note:`
+  on stderr and fall back to `ORDER BY` every column,
+  lexicographically — correct but slower.
+- **One INSERT per row.** The default dump emits a single
+  `INSERT INTO t (...) VALUES (...), (...), ...;` per batch. With
+  `--deterministic`, each row becomes its own statement, so a single
+  row change diffs as a single-line edit.
+- **Sorted JSON keys.** JSON cells are re-serialised with object keys
+  in lexicographic order so Postgres `JSONB` (hash-ordered) and MySQL
+  `JSON` (insertion-ordered) produce identical output.
+
+For arbitrary `--query` (Wave 2 follow-up), the dump path refuses to
+run with `--deterministic` unless the source SQL contains an
+`ORDER BY` clause — the substring match is intentionally pragmatic
+(it accepts false positives in comments and string literals) to keep
+the check parser-free.
+
+Out of scope (filed as `[P9b]` follow-up): `CREATE TABLE` synthesis —
+`--deterministic` today emits only the `INSERT` stream, so the target
+schema must exist before re-loading.
+
 ### Load
 
 ```bash
