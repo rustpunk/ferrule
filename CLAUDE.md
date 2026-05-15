@@ -933,3 +933,42 @@ grep -c '^INSERT INTO' /tmp/dump3.sql   # → 1 (single batched VALUES list)
 rm /tmp/dump{1,2,3}.sql
 ```
 
+### REPL fill-in — smoke (Phase 3 #11)
+
+Scripted via piped stdin:
+
+```bash
+ferrule repl "sqlite::memory:" <<'EOF'
+SELECT 1;
+\g
+\explain on
+SELECT 1;
+\explain off
+\help
+\q
+EOF
+```
+
+Expected: `SELECT 1` prints `1`; `\g` re-prints `1`; `\explain on`
+prints `Explain mode: on`; the second `SELECT 1` prints
+`EXPLAIN QUERY PLAN` output instead of the raw value; `\explain off`
+prints `Explain mode: off`; `\help` lists the new `\g`,
+`\explain on|off|toggle`, and `\watch <secs>` lines.
+
+Manual `\watch` smoke (interactive — needs a TTY for Ctrl+C):
+
+```bash
+ferrule repl "sqlite::memory:"
+ferrule=> SELECT 1;
+ferrule=> \watch 1
+# wait one iteration, press Ctrl+C to return to the prompt
+ferrule=> \q
+```
+
+`\watch 0` is rejected with
+`\watch interval must be at least 1 second`. Outside a running loop,
+`\watch interval N` and `\watch stop` print polite errors and do
+nothing (mid-loop control is reserved for a future wave). When
+`\explain` mode is on, `\watch` wraps the SQL through EXPLAIN on
+each iteration via `ferrule_core::explain_sql`.
+

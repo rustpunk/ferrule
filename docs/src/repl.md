@@ -49,8 +49,13 @@ Backslash prefix:
 | `\bookmark list` | List saved bookmarks |
 | `\bookmark run <name> [args…]` | Run a bookmark with positional params |
 | `\bookmark delete <name>` | Delete a bookmark |
-| `\explain [<sql>]` | Explain one query, or toggle explain-everything mode |
-| `\watch [<sql>]` | Watch a query (default 5s interval); `\watch interval N` adjusts; `\watch stop` ends |
+| `\g` | Re-run the previous SQL statement |
+| `\explain` | Toggle EXPLAIN-mode (wraps every executed query) |
+| `\explain on\|off\|toggle` | Set EXPLAIN-mode explicitly |
+| `\explain <sql>` | Explain a single query (one-shot) |
+| `\watch` | Re-run previous SQL every 5s until Ctrl+C |
+| `\watch <secs>` | Re-run previous SQL every `<secs>` seconds |
+| `\watch <sql>` | Watch the given SQL (5s default) |
 | `\dump <table>` | Dump a table to stdout |
 | `\load <file> INTO <table>` | Load a CSV/JSON file into a table |
 | `\help` | Show in-REPL help |
@@ -130,12 +135,22 @@ REPL:
 ```text
 ferrule> SELECT COUNT(*) FROM events;
 ferrule> \watch                  # repeats the COUNT(*) every 5s
-ferrule> \watch interval 3       # change interval to 3s
-ferrule> \watch stop             # exit watch loop
+ferrule> \watch 3                # repeats the COUNT(*) every 3s
+ferrule> \watch SELECT now();    # watch a different SQL at 5s default
 ```
 
-Watch prints a header on each iteration. The `--diff` mode (only
-print on change) is also supported in watch loops; see
+Press `Ctrl+C` to exit the watch loop and return to the prompt
+without leaving the REPL. Intervals are integer seconds (u64);
+sub-second intervals are not supported in v1.
+
+If `\explain` mode is on, the watched SQL is wrapped through
+`EXPLAIN` on each iteration so plan changes can be tracked
+visually.
+
+Mid-loop control (`\watch interval N` / `\watch stop`) is reserved
+for a future release; issuing them outside a running loop prints a
+polite error. Watch prints a header on each iteration. The `--diff`
+mode (only print on change) is also supported in watch loops; see
 [Advanced Features](advanced.md#watch-mode).
 
 ## When to leave the REPL

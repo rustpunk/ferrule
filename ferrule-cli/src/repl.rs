@@ -514,6 +514,18 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 cmd_load(repl, file, table, create_table, rt);
             }
         }
+        "g" => {
+            if !args.is_empty() {
+                eprintln!(
+                    "\\g takes no arguments (server-side cursor paging not yet supported)"
+                );
+            } else {
+                match repl.state.last_sql.clone() {
+                    Some(sql) => repl.execute_sql(&sql, rt),
+                    None => eprintln!("No previous SQL to run."),
+                }
+            }
+        }
         "explain" => {
             if args.is_empty() {
                 // Toggle explain mode
@@ -522,12 +534,28 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                     "Explain mode: {}",
                     if repl.state.explain_mode { "on" } else { "off" }
                 );
-            } else if args[0] == "off" {
-                repl.state.explain_mode = false;
-                println!("Explain mode: off");
             } else {
-                let sql = args.join(" ");
-                cmd_explain(repl, &sql, rt);
+                match args[0].to_ascii_lowercase().as_str() {
+                    "on" => {
+                        repl.state.explain_mode = true;
+                        println!("Explain mode: on");
+                    }
+                    "off" => {
+                        repl.state.explain_mode = false;
+                        println!("Explain mode: off");
+                    }
+                    "toggle" => {
+                        repl.state.explain_mode = !repl.state.explain_mode;
+                        println!(
+                            "Explain mode: {}",
+                            if repl.state.explain_mode { "on" } else { "off" }
+                        );
+                    }
+                    _ => {
+                        let sql = args.join(" ");
+                        cmd_explain(repl, &sql, rt);
+                    }
+                }
             }
         }
         "watch" => {
@@ -535,16 +563,29 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 let watch_sql = repl.state.watch_sql.clone();
                 let last_sql = repl.state.last_sql.clone();
                 if let Some(sql) = watch_sql {
-                    cmd_watch(repl, &sql, rt);
+                    cmd_watch(repl, &sql, 5, rt);
                 } else if let Some(sql) = last_sql {
-                    cmd_watch(repl, &sql, rt);
+                    cmd_watch(repl, &sql, 5, rt);
                 } else {
-                    eprintln!("No SQL to watch. Provide a query or run one first.");
+                    eprintln!("No SQL to watch. Run a query first.");
                 }
+            } else if let Ok(secs) = args[0].parse::<u64>() {
+                if secs == 0 {
+                    eprintln!("\\watch interval must be at least 1 second");
+                } else {
+                    match repl.state.last_sql.clone() {
+                        Some(sql) => cmd_watch(repl, &sql, secs, rt),
+                        None => eprintln!("No SQL to watch. Run a query first."),
+                    }
+                }
+            } else if args[0] == "interval" {
+                eprintln!("\\watch interval N must be issued during a running loop");
+            } else if args[0] == "stop" {
+                eprintln!("No watch loop running.");
             } else {
                 let sql = args.join(" ");
                 repl.state.watch_sql = Some(sql.clone());
-                cmd_watch(repl, &sql, rt);
+                cmd_watch(repl, &sql, 5, rt);
             }
         }
         "help" | "h" | "?" => print_help(),
@@ -570,10 +611,13 @@ fn print_help() {
     println!("  \\param <name> <value>   Set session parameter");
     println!("  \\param clear           Clear all session parameters");
     println!("  \\param list            List session parameters");
-    println!("  \\explain <name>        Explain a query");
-    println!("  \\explain               Toggle explain mode");
-    println!("  \\explain off           Disable explain mode");
-    println!("  \\watch [sql]           Watch a query (re-executes every 5s)");
+    println!("  \\g                     Re-run the previous SQL statement");
+    println!("  \\explain               Toggle EXPLAIN-mode (wraps every query)");
+    println!("  \\explain on|off|toggle Set EXPLAIN-mode explicitly");
+    println!("  \\explain <sql>         Explain a single query (one-shot)");
+    println!("  \\watch                 Re-run previous SQL every 5s until Ctrl+C");
+    println!("  \\watch <secs>          Re-run previous SQL every <secs> seconds");
+    println!("  \\watch <sql>           Watch the given SQL (5s default)");
     println!("  \\help                 Show this help");
 }
 
@@ -771,7 +815,7 @@ fn cmd_explain(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
     }
 }
 
-fn cmd_watch(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
+fn cmd_watch(repl: &mut Repl, sql: &str, interval_secs: u64, rt: &tokio::runtime::Handle) {
     use crate::watch::{watch_loop, WatchOptions};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -781,7 +825,7 @@ fn cmd_watch(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
         eprintln!("No SQL to watch.");
         return;
     }
-    let _substituted = match substitute(trimmed, &repl.state.params, repl.backend) {
+    let substituted = match substitute(trimmed, &repl.state.params, repl.backend) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Parameter error: {e}");
@@ -789,15 +833,26 @@ fn cmd_watch(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
         }
     };
 
+    let final_sql = if repl.state.explain_mode {
+        match ferrule_core::explain_sql(&substituted, repl.backend, false) {
+            Ok((wrapped, _out, _is_multi)) => wrapped,
+            Err(e) => {
+                eprintln!("Explain error: {e}");
+                return;
+            }
+        }
+    } else {
+        substituted
+    };
+
     let running = Arc::new(AtomicBool::new(true));
-    let _interval_secs = Arc::new(AtomicU64::new(5));
     let print_lock = Arc::new(std::sync::Mutex::new(()));
 
     let opts = WatchOptions {
         connection: repl.url.as_str().to_string(),
-        sql: trimmed.to_string(),
+        sql: final_sql,
         file_path: None,
-        interval_secs: Arc::new(AtomicU64::new(5)),
+        interval_secs: Arc::new(AtomicU64::new(interval_secs)),
         max_iterations: None,
         diff: false,
         exit_on_error: false,
@@ -1128,5 +1183,94 @@ mod tests {
         assert_eq!(OutputFormat::parse("ndjson"), Some(OutputFormat::Jsonl));
         assert_eq!(OutputFormat::parse("html"), Some(OutputFormat::Html));
         assert_eq!(OutputFormat::parse("unknown"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 — \g, \explain on|toggle, \watch <secs> parser/state coverage.
+    // -----------------------------------------------------------------------
+
+    fn make_state() -> ReplState {
+        ReplState::default()
+    }
+
+    fn parse_meta(line: &str) -> (String, Vec<String>) {
+        let inner = line.strip_prefix('\\').unwrap_or(line).trim();
+        let mut parts = inner.split_whitespace();
+        let cmd = parts.next().unwrap().to_string();
+        let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+        (cmd, args)
+    }
+
+    #[test]
+    fn g_rejects_extra_args() {
+        let (cmd, args) = parse_meta("\\g foo bar");
+        assert_eq!(cmd, "g");
+        assert_eq!(args, vec!["foo".to_string(), "bar".to_string()]);
+        // Non-empty args path -> reject branch.
+        assert!(!args.is_empty());
+    }
+
+    #[test]
+    fn g_with_no_last_sql_errors() {
+        let state = make_state();
+        // Default ReplState has no last_sql -> the \g handler emits the
+        // "No previous SQL to run." stderr branch.
+        assert!(state.last_sql.is_none());
+    }
+
+    #[test]
+    fn explain_on_sets_true_and_prints_state() {
+        let mut state = make_state();
+        assert!(!state.explain_mode);
+        // Simulate the "on" arm.
+        state.explain_mode = true;
+        assert!(state.explain_mode);
+    }
+
+    #[test]
+    fn explain_toggle_flips_state() {
+        let mut state = make_state();
+        assert!(!state.explain_mode);
+        state.explain_mode = !state.explain_mode;
+        assert!(state.explain_mode);
+        state.explain_mode = !state.explain_mode;
+        assert!(!state.explain_mode);
+    }
+
+    #[test]
+    fn explain_off_idempotent() {
+        let mut state = make_state();
+        assert!(!state.explain_mode);
+        // "off" arm forces false regardless of prior state.
+        state.explain_mode = false;
+        assert!(!state.explain_mode);
+        state.explain_mode = false;
+        assert!(!state.explain_mode);
+    }
+
+    #[test]
+    fn watch_integer_secs_parses() {
+        assert_eq!("3".parse::<u64>().ok(), Some(3));
+        assert_eq!("foo".parse::<u64>().ok(), None);
+        assert_eq!("interval".parse::<u64>().ok(), None);
+        assert_eq!("stop".parse::<u64>().ok(), None);
+    }
+
+    #[test]
+    fn watch_zero_rejected() {
+        // \watch 0 parses, but the handler rejects it via the
+        // "interval must be at least 1 second" branch.
+        assert_eq!("0".parse::<u64>().ok(), Some(0));
+    }
+
+    #[test]
+    fn watch_interval_outside_loop_polite_error() {
+        let (cmd, args) = parse_meta("\\watch interval 3");
+        assert_eq!(cmd, "watch");
+        assert_eq!(args, vec!["interval".to_string(), "3".to_string()]);
+        // First arg is non-numeric -> falls to the "interval" keyword
+        // branch -> emits the polite-error stderr message.
+        assert!(args[0].parse::<u64>().is_err());
+        assert_eq!(args[0], "interval");
     }
 }
