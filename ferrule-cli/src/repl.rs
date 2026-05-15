@@ -374,7 +374,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                         println!("Format set to: {:?}", fmt);
                     }
                     None => eprintln!(
-                        "Unknown format '{}'. Use: table, json, csv, yaml, raw.",
+                        "Unknown format '{}'. Use: table, json, csv, yaml, raw, markdown, jsonl, html.",
                         args[0]
                     ),
                 }
@@ -559,7 +559,7 @@ fn print_help() {
     println!("  \\conn [name]         Switch connection (or show current)");
     println!("  \\d [table]           Describe table (or list tables if no table)");
     println!("  \\dt [schema]         List tables");
-    println!("  \\format [fmt]        Set output format: table, json, csv, yaml, raw");
+    println!("  \\format [fmt]        Set output format: table, json, csv, yaml, raw, markdown, jsonl, html");
     println!("  \\limit [N]           Set row limit (0 to clear)");
     println!("  \\timing [on|off]      Toggle timing display");
     println!("  \\verbose [on|off]     Toggle verbose logging");
@@ -1122,6 +1122,11 @@ mod tests {
         assert_eq!(OutputFormat::parse("csv"), Some(OutputFormat::Csv));
         assert_eq!(OutputFormat::parse("yaml"), Some(OutputFormat::Yaml));
         assert_eq!(OutputFormat::parse("raw"), Some(OutputFormat::Raw));
+        assert_eq!(OutputFormat::parse("markdown"), Some(OutputFormat::Markdown));
+        assert_eq!(OutputFormat::parse("md"), Some(OutputFormat::Markdown));
+        assert_eq!(OutputFormat::parse("jsonl"), Some(OutputFormat::Jsonl));
+        assert_eq!(OutputFormat::parse("ndjson"), Some(OutputFormat::Jsonl));
+        assert_eq!(OutputFormat::parse("html"), Some(OutputFormat::Html));
         assert_eq!(OutputFormat::parse("unknown"), None);
     }
 }

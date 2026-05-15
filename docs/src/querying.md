@@ -35,6 +35,9 @@ echo "SELECT 1;" | ferrule query demo --stdin
 | CSV | `--format csv` | Spreadsheets, data pipelines |
 | YAML | `--format yaml` | Human-readable structured data, config-y outputs |
 | Raw | `--format raw` | Tab-delimited; minimal noise for shell scripts |
+| Markdown | `--format markdown` (alias `md`) | GFM pipe tables for docs / PR descriptions / issue comments |
+| JSONL | `--format jsonl` (alias `ndjson`) | Streaming, one JSON object per line, `jq -c` friendly |
+| HTML | `--format html` | Static `<table>` snippets for emails, reports, dashboards |
 
 The default is **JSON**, regardless of whether stdout is a terminal
 or a pipe. To get pretty tables interactively, either pass `--format

@@ -728,5 +728,8 @@ fn format_to_string(format: OutputFormat) -> String {
         OutputFormat::Csv => "csv".into(),
         OutputFormat::Yaml => "yaml".into(),
         OutputFormat::Raw => "raw".into(),
+        OutputFormat::Markdown => "markdown".into(),
+        OutputFormat::Jsonl => "jsonl".into(),
+        OutputFormat::Html => "html".into(),
     }
 }

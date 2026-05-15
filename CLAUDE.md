@@ -887,3 +887,24 @@ The formatter layer never sees driver-specific types.
 ## Stubbing Policy
 
 This scaffold contains many `todo!()` bodies. Each crate root has `#![allow(dead_code, unused_variables, unused_imports)]` so that `cargo clippy` passes. Do not remove these pragmas until Wave 1 is complete.
+
+### Output formats — smoke (Phase 1 #12)
+
+All formats render against in-memory SQLite; no external services required.
+
+```bash
+ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format markdown
+# → pipe-table with header, --- separator, single data row.
+
+ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format md
+# → identical (alias).
+
+ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format jsonl
+# → exactly one JSON object on one line, trailing newline.
+
+ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format ndjson
+# → identical (alias).
+
+ferrule query "sqlite::memory:" "SELECT '<x>' AS c" --format html
+# → contains <table>/<thead>/<tbody>; cell renders as &lt;x&gt;.
+```
