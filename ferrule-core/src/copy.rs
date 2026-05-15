@@ -11,6 +11,7 @@ use crate::backend::Backend;
 use crate::connection::{BulkInsert, Connection, ForeignKey};
 use crate::error::CoreError;
 use crate::params::render_value;
+use crate::transaction::{begin_transaction, commit_transaction, rollback_transaction};
 use crate::value::{ColumnInfo, TypeHint, Value};
 
 /// What to do when the target table already exists and is non-empty.
@@ -1261,47 +1262,6 @@ async fn table_has_rows(
     )?;
     let result = conn.query(&sql).await?;
     Ok(!result.rows.is_empty())
-}
-
-/// Open a target-side transaction. Returns `true` if the BEGIN
-/// succeeded, `false` if the backend rejected the statement (best-
-/// effort: the caller proceeds without a wrapping transaction).
-async fn begin_transaction(conn: &mut dyn Connection, backend: Backend) -> bool {
-    let stmt = match backend {
-        #[cfg(feature = "mssql")]
-        Backend::MsSql => "BEGIN TRANSACTION",
-        // Oracle starts implicit transactions; an explicit BEGIN here
-        // would parse as a PL/SQL block. Skip the statement; the
-        // wrapping COMMIT at the end still terminates the implicit txn.
-        #[cfg(feature = "oracle")]
-        Backend::Oracle => return true,
-        _ => "BEGIN",
-    };
-    conn.execute(stmt).await.is_ok()
-}
-
-async fn commit_transaction(
-    conn: &mut dyn Connection,
-    backend: Backend,
-) -> Result<(), CoreError> {
-    let stmt = match backend {
-        #[cfg(feature = "mssql")]
-        Backend::MsSql => "COMMIT TRANSACTION",
-        _ => "COMMIT",
-    };
-    conn.execute(stmt).await.map(|_| ())
-}
-
-async fn rollback_transaction(
-    conn: &mut dyn Connection,
-    backend: Backend,
-) -> Result<(), CoreError> {
-    let stmt = match backend {
-        #[cfg(feature = "mssql")]
-        Backend::MsSql => "ROLLBACK TRANSACTION",
-        _ => "ROLLBACK",
-    };
-    conn.execute(stmt).await.map(|_| ())
 }
 
 // -------------------------------------------------------------------
