@@ -16,9 +16,12 @@
 //! contract.
 
 use chrono::{DateTime, Duration, Utc};
-use ferrule_config::HistoryConfig;
+use ferrule_config::{HistoryConfig, SlowLogConfig};
 use rusqlite::{params, Connection};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use crate::error::CliError;
 
@@ -67,10 +70,19 @@ pub struct HistoryFilter {
     pub min_duration_ms: Option<u64>,
 }
 
+/// Slow-query log tee. Append-only file handle wrapped in a Mutex so
+/// `HistoryDb::record()` stays `&mut self` without dragging async/Send
+/// constraints onto the rusqlite connection.
+struct SlowSink {
+    file: Mutex<std::fs::File>,
+    threshold_ms: u64,
+}
+
 /// SQLite-backed history store. Owns one connection; not Send because
 /// `rusqlite::Connection` isn't Send by default.
 pub struct HistoryDb {
     conn: Connection,
+    slow: Option<SlowSink>,
 }
 
 impl HistoryDb {
@@ -84,24 +96,54 @@ impl HistoryDb {
             .map_err(|e| CliError::usage(format!("history: failed to open {path:?}: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| CliError::usage(format!("history: migration failed: {e}")))?;
-        Ok(Self { conn })
+        Ok(Self { conn, slow: None })
     }
 
     /// Resolve the store path from config + env, opening if recording is
     /// enabled. Returns `Ok(None)` when recording is disabled (either by
     /// config or by the `FERRULE_NO_HISTORY` env override).
     ///
-    /// Callers should treat `Ok(None)` as "skip silently"; only a real
-    /// I/O / SQLite failure is surfaced as an error.
+    /// When `slow_log.enabled`, also opens the side-channel tee file in
+    /// append mode. Slow-log open failure is fatal because the user
+    /// explicitly opted in — silently skipping would hide a real
+    /// misconfiguration (bad path, no write permission).
     pub fn maybe_open(cfg: &HistoryConfig) -> Result<Option<Self>, CliError> {
+        Self::maybe_open_with_slow(cfg, &SlowLogConfig::default())
+    }
+
+    pub fn maybe_open_with_slow(
+        cfg: &HistoryConfig,
+        slow: &SlowLogConfig,
+    ) -> Result<Option<Self>, CliError> {
         if !cfg.enabled || std::env::var_os("FERRULE_NO_HISTORY").is_some() {
             return Ok(None);
         }
         let path = resolve_path(cfg)?;
-        Ok(Some(Self::open(&path)?))
+        let mut db = Self::open(&path)?;
+        if slow.enabled {
+            let threshold_ms = slow
+                .threshold_ms()
+                .map_err(|e| CliError::usage(format!("slow_log: {e}")))?;
+            let slow_path = resolve_slow_path(slow)?;
+            if let Some(parent) = slow_path.parent() {
+                std::fs::create_dir_all(parent).map_err(CliError::Io)?;
+            }
+            let file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&slow_path)
+                .map_err(CliError::Io)?;
+            db.slow = Some(SlowSink {
+                file: Mutex::new(file),
+                threshold_ms,
+            });
+        }
+        Ok(Some(db))
     }
 
     /// Insert one row, then opportunistically prune per retention config.
+    /// Also tees to the slow-log when configured and the run exceeded
+    /// `slow_log.threshold`.
     pub fn record(&mut self, record: &RunRecord, cfg: &HistoryConfig) -> Result<(), CliError> {
         self.conn
             .execute(
@@ -120,7 +162,39 @@ impl HistoryDb {
                 ],
             )
             .map_err(|e| CliError::usage(format!("history: record failed: {e}")))?;
+        self.tee_slow(record)?;
         self.prune(cfg)?;
+        Ok(())
+    }
+
+    fn tee_slow(&self, record: &RunRecord) -> Result<(), CliError> {
+        let Some(sink) = self.slow.as_ref() else {
+            return Ok(());
+        };
+        if record.duration_ms < sink.threshold_ms {
+            return Ok(());
+        }
+        // Tab-separated: ts conn duration_ms sql_oneline rows
+        let line = format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            record.ts.to_rfc3339(),
+            record.conn.as_deref().unwrap_or(""),
+            record.duration_ms,
+            record
+                .sql
+                .as_deref()
+                .map(oneline_for_log)
+                .unwrap_or_default(),
+            record
+                .rows
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        );
+        let mut file = sink
+            .file
+            .lock()
+            .map_err(|e| CliError::usage(format!("slow_log: lock poisoned: {e}")))?;
+        file.write_all(line.as_bytes()).map_err(CliError::Io)?;
         Ok(())
     }
 
@@ -270,6 +344,20 @@ fn resolve_path(cfg: &HistoryConfig) -> Result<PathBuf, CliError> {
     Ok(base.join("ferrule").join("history.db"))
 }
 
+fn resolve_slow_path(cfg: &SlowLogConfig) -> Result<PathBuf, CliError> {
+    if let Some(p) = cfg.path.as_deref() {
+        return Ok(expand_tilde(p));
+    }
+    let base = dirs::data_local_dir().ok_or_else(|| {
+        CliError::usage("slow_log: could not determine data-local directory for default path")
+    })?;
+    Ok(base.join("ferrule").join("slow.log"))
+}
+
+fn oneline_for_log(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn expand_tilde(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -351,7 +439,7 @@ mod tests {
     fn open_memory() -> HistoryDb {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        HistoryDb { conn }
+        HistoryDb { conn, slow: None }
     }
 
     #[test]
@@ -509,6 +597,54 @@ mod tests {
         assert!(glob_match("???", "abc"));
         assert!(!glob_match("???", "abcd"));
         assert!(glob_match("", "anything"));
+    }
+
+    fn open_memory_with_slow(path: &std::path::Path, threshold_ms: u64) -> HistoryDb {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .unwrap();
+        HistoryDb {
+            conn,
+            slow: Some(SlowSink {
+                file: Mutex::new(file),
+                threshold_ms,
+            }),
+        }
+    }
+
+    #[test]
+    fn slow_log_tees_when_threshold_crossed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("slow.log");
+        let mut db = open_memory_with_slow(&log, 100);
+        let cfg = HistoryConfig::default();
+
+        db.record(&rec("fast", 5), &cfg).unwrap();
+        db.record(&rec("slow-1", 150), &cfg).unwrap();
+        db.record(&rec("slow-2", 250), &cfg).unwrap();
+
+        let body = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "only slow runs should be teed; got {body:?}");
+        assert!(lines[0].contains("slow-1"));
+        assert!(lines[1].contains("slow-2"));
+        // Tab-separated.
+        assert_eq!(lines[0].matches('\t').count(), 4);
+    }
+
+    #[test]
+    fn slow_log_skips_below_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("slow.log");
+        let mut db = open_memory_with_slow(&log, 10_000);
+        let cfg = HistoryConfig::default();
+        db.record(&rec("never-slow", 5), &cfg).unwrap();
+        let body = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(body.is_empty(), "slow.log should be empty, got {body:?}");
     }
 
     #[test]

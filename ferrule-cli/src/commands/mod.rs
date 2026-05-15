@@ -19,7 +19,7 @@ pub use bookmark::BookmarkArgs;
 pub use dump::DumpArgs;
 pub use explain::ExplainArgs;
 pub use export::ExportArgs;
-pub use history::HistoryArgs;
+pub use history::{HistoryArgs, SlowArgs};
 pub use load::LoadArgs;
 pub use migrate::MigrateArgs;
 pub use repl::ReplArgs;

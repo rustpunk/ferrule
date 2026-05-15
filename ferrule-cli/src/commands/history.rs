@@ -41,13 +41,64 @@ pub struct HistoryArgs {
     #[arg(long, value_name = "DURATION")]
     pub since: Option<String>,
 
-    /// Slow-log filter: minimum query duration in milliseconds. Phase 2
-    /// wires `--slow` into this from the `[slow_log] threshold` config.
+    /// Slow-log filter: minimum query duration in milliseconds. Wins
+    /// over `--slow` when both are set.
+    #[arg(long, value_name = "MS")]
+    pub min_duration_ms: Option<u64>,
+
+    /// Restrict to runs that crossed the configured slow-log threshold
+    /// (`[slow_log] threshold`). Disabled when neither this flag nor
+    /// `--min-duration-ms` is set.
+    #[arg(long)]
+    pub slow: bool,
+
+    #[command(flatten)]
+    pub output: OutputFlags,
+}
+
+/// Arguments for `ferrule slow` — a thin alias for `ferrule history
+/// --slow`. Drops the `--slow` flag (implied) and the
+/// `--min-duration-ms` override; otherwise identical to
+/// [`HistoryArgs`].
+#[derive(Args, Clone, Debug)]
+pub struct SlowArgs {
+    #[arg(long, value_name = "N")]
+    pub last: Option<usize>,
+
+    #[arg(long, value_name = "GLOB")]
+    pub conn: Option<String>,
+
+    #[arg(long, value_name = "PATTERN")]
+    pub grep: Option<String>,
+
+    #[arg(long, value_name = "DURATION")]
+    pub since: Option<String>,
+
+    /// Override the configured slow-log threshold (milliseconds).
     #[arg(long, value_name = "MS")]
     pub min_duration_ms: Option<u64>,
 
     #[command(flatten)]
     pub output: OutputFlags,
+}
+
+impl SlowArgs {
+    fn into_history(self) -> HistoryArgs {
+        HistoryArgs {
+            last: self.last,
+            conn: self.conn,
+            slowest: true,
+            grep: self.grep,
+            since: self.since,
+            min_duration_ms: self.min_duration_ms,
+            slow: self.min_duration_ms.is_none(),
+            output: self.output,
+        }
+    }
+}
+
+pub async fn run_slow(args: SlowArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+    run(args.into_history(), global_config).await
 }
 
 pub async fn run(args: HistoryArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
@@ -68,13 +119,24 @@ pub async fn run(args: HistoryArgs, global_config: &GlobalConfig) -> Result<(), 
         None => None,
     };
 
+    let min_duration_ms = match (args.min_duration_ms, args.slow) {
+        (Some(n), _) => Some(n),
+        (None, true) => Some(
+            global_config
+                .slow_log
+                .threshold_ms()
+                .map_err(|e| CliError::usage(format!("slow_log threshold: {e}")))?,
+        ),
+        (None, false) => None,
+    };
+
     let filter = HistoryFilter {
         last: args.last,
         conn: args.conn.clone(),
         since,
         grep: args.grep.clone(),
         slowest: args.slowest,
-        min_duration_ms: args.min_duration_ms,
+        min_duration_ms,
     };
 
     let rows = db.query(&filter)?;

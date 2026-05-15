@@ -12,7 +12,7 @@ mod watch;
 
 use commands::{
     BookmarkArgs, ConnArgs, CopyArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, ExportArgs,
-    HistoryArgs, LoadArgs, MigrateArgs, QueryArgs, ReplArgs, TablesArgs, WatchArgs,
+    HistoryArgs, LoadArgs, MigrateArgs, QueryArgs, ReplArgs, SlowArgs, TablesArgs, WatchArgs,
 };
 use error::CliError;
 use history::{HistoryDb, RunRecord};
@@ -82,6 +82,9 @@ enum Commands {
 
     /// Show recent ferrule invocations from the persistent history log
     History(HistoryArgs),
+
+    /// Show only slow runs (alias for `ferrule history --slow`)
+    Slow(SlowArgs),
 }
 
 fn run_daemon_mode() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -143,6 +146,7 @@ fn main() {
             Commands::Copy(args) => commands::copy::run(*args, &global_config).await,
             Commands::Migrate(args) => commands::migrate::run(args, &global_config).await,
             Commands::History(args) => commands::history::run(args, &global_config).await,
+            Commands::Slow(args) => commands::history::run_slow(args, &global_config).await,
         };
 
         record_dispatch(&global_config, snapshot, start.elapsed(), &outcome);
@@ -218,6 +222,7 @@ impl Snapshot {
             Commands::Repl(a) => ("repl", a.connection.as_deref().map(redact), None, false),
             // Don't recursively log every `ferrule history` read.
             Commands::History(_) => ("history", None, None, true),
+            Commands::Slow(_) => ("slow", None, None, true),
         };
         Self {
             command: name,
@@ -246,11 +251,12 @@ fn record_dispatch(
     if snapshot.skip {
         return;
     }
-    let mut db = match HistoryDb::maybe_open(&global_config.history) {
-        Ok(Some(db)) => db,
-        Ok(None) => return,
-        Err(_) => return, // history failures must never block the user's command
-    };
+    let mut db =
+        match HistoryDb::maybe_open_with_slow(&global_config.history, &global_config.slow_log) {
+            Ok(Some(db)) => db,
+            Ok(None) => return,
+            Err(_) => return, // history failures must never block the user's command
+        };
     let (exit_code, error_class) = match outcome {
         Ok(()) => (0, None),
         Err(e) => (e.exit_code(), Some(error_class(e).to_string())),
