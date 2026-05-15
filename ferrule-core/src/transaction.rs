@@ -15,22 +15,47 @@ use crate::backend::Backend;
 use crate::connection::Connection;
 use crate::error::CoreError;
 
+/// SQL string the [`begin_transaction`] dispatcher will send for a
+/// given backend. `None` means "skip the wire round-trip" — Oracle
+/// uses this because issuing an explicit `BEGIN` would parse as a
+/// PL/SQL block.
+pub(crate) fn begin_sql_for(backend: Backend) -> Option<&'static str> {
+    match backend {
+        #[cfg(feature = "mssql")]
+        Backend::MsSql => Some("BEGIN TRANSACTION"),
+        #[cfg(feature = "oracle")]
+        Backend::Oracle => None,
+        _ => Some("BEGIN"),
+    }
+}
+
+/// SQL string for the [`commit_transaction`] dispatcher.
+pub(crate) fn commit_sql_for(backend: Backend) -> &'static str {
+    match backend {
+        #[cfg(feature = "mssql")]
+        Backend::MsSql => "COMMIT TRANSACTION",
+        _ => "COMMIT",
+    }
+}
+
+/// SQL string for the [`rollback_transaction`] dispatcher.
+pub(crate) fn rollback_sql_for(backend: Backend) -> &'static str {
+    match backend {
+        #[cfg(feature = "mssql")]
+        Backend::MsSql => "ROLLBACK TRANSACTION",
+        _ => "ROLLBACK",
+    }
+}
+
 /// Open a target-side transaction. Returns `true` if the BEGIN
 /// succeeded, `false` if the backend rejected the statement (best-
 /// effort: the caller proceeds without a wrapping transaction).
 #[must_use]
 pub async fn begin_transaction(conn: &mut dyn Connection, backend: Backend) -> bool {
-    let stmt = match backend {
-        #[cfg(feature = "mssql")]
-        Backend::MsSql => "BEGIN TRANSACTION",
-        // Oracle starts implicit transactions; an explicit BEGIN here
-        // would parse as a PL/SQL block. Skip the statement; the
-        // wrapping COMMIT at the end still terminates the implicit txn.
-        #[cfg(feature = "oracle")]
-        Backend::Oracle => return true,
-        _ => "BEGIN",
-    };
-    conn.execute(stmt).await.is_ok()
+    match begin_sql_for(backend) {
+        None => true,
+        Some(stmt) => conn.execute(stmt).await.is_ok(),
+    }
 }
 
 #[must_use = "commit_transaction returns a CoreError on wire failure that the caller must surface"]
@@ -38,12 +63,7 @@ pub async fn commit_transaction(
     conn: &mut dyn Connection,
     backend: Backend,
 ) -> Result<(), CoreError> {
-    let stmt = match backend {
-        #[cfg(feature = "mssql")]
-        Backend::MsSql => "COMMIT TRANSACTION",
-        _ => "COMMIT",
-    };
-    conn.execute(stmt).await.map(|_| ())
+    conn.execute(commit_sql_for(backend)).await.map(|_| ())
 }
 
 #[must_use = "rollback_transaction returns a CoreError on wire failure; best-effort callers should still `let _ =`"]
@@ -51,10 +71,52 @@ pub async fn rollback_transaction(
     conn: &mut dyn Connection,
     backend: Backend,
 ) -> Result<(), CoreError> {
-    let stmt = match backend {
+    conn.execute(rollback_sql_for(backend)).await.map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statements_per_backend() {
+        // Default backends: BEGIN / COMMIT / ROLLBACK.
+        #[cfg(feature = "postgres")]
+        {
+            let b = Backend::Postgres;
+            assert_eq!(begin_sql_for(b), Some("BEGIN"));
+            assert_eq!(commit_sql_for(b), "COMMIT");
+            assert_eq!(rollback_sql_for(b), "ROLLBACK");
+        }
+        #[cfg(feature = "mysql")]
+        {
+            let b = Backend::MySql;
+            assert_eq!(begin_sql_for(b), Some("BEGIN"));
+            assert_eq!(commit_sql_for(b), "COMMIT");
+            assert_eq!(rollback_sql_for(b), "ROLLBACK");
+        }
+        #[cfg(feature = "sqlite")]
+        {
+            let b = Backend::Sqlite;
+            assert_eq!(begin_sql_for(b), Some("BEGIN"));
+            assert_eq!(commit_sql_for(b), "COMMIT");
+            assert_eq!(rollback_sql_for(b), "ROLLBACK");
+        }
+
+        // MSSQL uses the "TRANSACTION" suffix.
         #[cfg(feature = "mssql")]
-        Backend::MsSql => "ROLLBACK TRANSACTION",
-        _ => "ROLLBACK",
-    };
-    conn.execute(stmt).await.map(|_| ())
+        {
+            assert_eq!(begin_sql_for(Backend::MsSql), Some("BEGIN TRANSACTION"));
+            assert_eq!(commit_sql_for(Backend::MsSql), "COMMIT TRANSACTION");
+            assert_eq!(rollback_sql_for(Backend::MsSql), "ROLLBACK TRANSACTION");
+        }
+
+        // Oracle: BEGIN is a noop (None); COMMIT/ROLLBACK still send.
+        #[cfg(feature = "oracle")]
+        {
+            assert_eq!(begin_sql_for(Backend::Oracle), None);
+            assert_eq!(commit_sql_for(Backend::Oracle), "COMMIT");
+            assert_eq!(rollback_sql_for(Backend::Oracle), "ROLLBACK");
+        }
+    }
 }

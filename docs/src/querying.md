@@ -105,6 +105,60 @@ Behavior:
   (`IF … END IF`, `LOOP … END LOOP`, `CASE … END CASE`), and
   mixed DML/DDL. See [Backends](backends.md#multi-statement-support).
 
+## Transactions
+
+Wrap the entire statement batch in a single backend-aware outer
+transaction with `--begin`. The batch (whether one statement or many)
+commits at the end unless `--rollback` is set.
+
+```bash
+# Implicit COMMIT at end (--begin alone implies COMMIT):
+ferrule query demo --begin \
+  "INSERT INTO orders (user_id, total) VALUES (1, 99.50);
+   UPDATE users SET last_order_at = NOW() WHERE id = 1"
+
+# Explicit ROLLBACK — useful for dry-run / read-only snapshot
+# semantics even on statements that would otherwise write.
+ferrule query demo --begin --rollback \
+  "DELETE FROM cache WHERE expires_at < NOW(); SELECT count(*) FROM cache"
+
+# --commit is the explicit, redundant form. It exists for symmetry
+# with --rollback when scripts compose flags dynamically.
+ferrule query demo --begin --commit "INSERT INTO t VALUES (1)"
+```
+
+Semantics:
+
+- The batch runs on a single live connection, so every statement
+  (and the BEGIN / COMMIT / ROLLBACK that bracket it) ride the same
+  TCP round trip.
+- **Inner statement failure**: ferrule best-effort rolls back the
+  wrapping transaction, prints
+  `[ferrule] inner statement failed — rolled back wrapping transaction`
+  on stderr, and surfaces the original SQL error as exit code 4.
+- **`--rollback` on success**: ferrule still rolls back and prints
+  `[ferrule] explicit ROLLBACK (--rollback)` on stderr; exit code 0
+  when SQL + ROLLBACK both succeed.
+- `--commit` requires `--begin` (clap exit 2). `--rollback` requires
+  `--begin`. `--commit` and `--rollback` conflict (clap exit 2).
+- `--begin --daemon` is rejected: the daemon path doesn't guarantee
+  per-tick connection affinity, which would silently dissolve the
+  transaction across pool checkouts.
+- `--begin --watch` is rejected: each watch tick would reopen a
+  separate transaction.
+- `--begin --bench N` wraps the **whole loop** in ONE outer
+  transaction (not N separate ones). Pairs with `--bench --rollback`
+  for side-effect-free microbenchmarks.
+- **Backend SQL emitted**: `BEGIN` / `COMMIT` / `ROLLBACK` for
+  PostgreSQL, MySQL, SQLite. `BEGIN TRANSACTION` /
+  `COMMIT TRANSACTION` / `ROLLBACK TRANSACTION` for MSSQL. Oracle
+  has implicit transactions, so the BEGIN is a no-op and only
+  COMMIT / ROLLBACK are sent.
+
+Read-only `--begin SELECT` is legal — useful for snapshot-isolation
+requirements where the entire read must observe one consistent
+point-in-time view.
+
 ## Parameterized queries
 
 Use `${name}` placeholders and pass values via `--param`:

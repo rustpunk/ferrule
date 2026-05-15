@@ -288,6 +288,25 @@ pub struct QueryArgs {
     /// usage error.
     #[arg(long)]
     pub fail_on_empty: bool,
+
+    /// Wrap the statement batch in a single outer transaction. The
+    /// entire script runs as one BEGIN ... COMMIT (or BEGIN ...
+    /// ROLLBACK with --rollback). Inner statement failure best-effort
+    /// rolls back and surfaces the original error. Cannot be combined
+    /// with --daemon or --watch (transaction affinity would be lost).
+    #[arg(long)]
+    pub begin: bool,
+
+    /// Explicit COMMIT at end of batch. Equivalent to --begin alone
+    /// (the COMMIT is implicit when --begin is set without --rollback).
+    /// Requires --begin; conflicts with --rollback.
+    #[arg(long, requires = "begin", conflicts_with = "rollback")]
+    pub commit: bool,
+
+    /// Force ROLLBACK at end of batch even on success. Useful for
+    /// dry-run / read-only snapshot semantics. Requires --begin.
+    #[arg(long, requires = "begin")]
+    pub rollback: bool,
 }
 
 /// Tables command arguments.

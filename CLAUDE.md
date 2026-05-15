@@ -972,3 +972,59 @@ nothing (mid-loop control is reserved for a future wave). When
 `\explain` mode is on, `\watch` wraps the SQL through EXPLAIN on
 each iteration via `ferrule_core::explain_sql`.
 
+### Transaction flags — smoke (Phase 4 #2)
+
+`ferrule query --begin/--commit/--rollback` wraps the entire
+statement batch in a single outer transaction. SQLite works
+out-of-the-box (no container needed); the same flags exercise the
+Postgres / MySQL / MSSQL / Oracle fixtures from the sections above
+when paired with the seeded `test_users` table.
+
+```bash
+# Setup (SQLite driver runs one statement per query — split DDL out):
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "CREATE TABLE t(a INT)"
+
+# 1. SQLite happy path: --begin INSERT --commit → row persists.
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" \
+  "INSERT INTO t VALUES (1)" --begin --commit
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "SELECT COUNT(*) FROM t"
+# → expect 1
+
+# 2. SQLite rollback: --begin --rollback INSERT → row does NOT persist.
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" \
+  "INSERT INTO t VALUES (2)" --begin --rollback
+# → stderr "explicit ROLLBACK (--rollback)"
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "SELECT COUNT(*) FROM t"
+# → still 1
+
+# 3. SQLite inner-fail: --begin INSERT into nonexistent table
+#    → original error surfaces; exit 4.
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" \
+  "INSERT INTO nonexistent VALUES (3)" --begin
+# → exit 4, stderr contains
+#   "inner statement failed — rolled back wrapping transaction"
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "SELECT COUNT(*) FROM t"
+# → still 1 (best-effort rollback held the line)
+
+# 4. Mutual-exclusion regression: --commit alone → clap exit 2.
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "SELECT 1" --commit
+# → exit 2 (MissingRequiredArgument)
+
+# 5. (Optional) Postgres / MySQL / MSSQL exercise the multi-statement
+# path; rerun the same flags against the seeded test_users table in
+# the per-backend sections above:
+#   ferrule query "postgres://..." "INSERT ...; SELECT ..." --begin --commit
+#   ferrule query "postgres://..." "INSERT ...; SELECT bad" --begin
+# (SQLite driver runs one statement per query — see docs/src/querying.md).
+
+rm /tmp/ferrule-txn-smoke.db
+```
+
+`--begin --daemon` and `--begin --watch` are rejected pre-connect
+as usage errors (no connection affinity per tick).
+`--begin --bench N` wraps the entire bench loop in ONE outer
+transaction; pair with `--rollback` for side-effect-free
+microbenchmarks. Backend SQL emitted: `BEGIN/COMMIT/ROLLBACK` for
+PostgreSQL / MySQL / SQLite, `BEGIN TRANSACTION/...` for MSSQL, and
+COMMIT / ROLLBACK only for Oracle (implicit txn — BEGIN is a noop).
+

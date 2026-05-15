@@ -2,10 +2,23 @@ use super::{QueryArgs, WatchArgs};
 use crate::bench::BenchSummary;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
+use ferrule_core::backend::Backend;
 use ferrule_core::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
 use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::{infer_type, parse_param, substitute, ParameterSet};
+
+/// Hints threaded into `run_bench` so the bench loop runs inside the
+/// same wrapping transaction as the script-mode path. `begin` is the
+/// caller's `outer_tx_opened` (already accounts for `--begin` and the
+/// best-effort BEGIN result); `rollback` mirrors the CLI flag.
+struct BenchTxnHints {
+    /// Caller already issued BEGIN and the txn is open.
+    begin: bool,
+    /// Force ROLLBACK at end of bench instead of COMMIT.
+    rollback: bool,
+    backend: Backend,
+}
 
 /// Apply an optional JMESPath filter to a rendered JSON string.
 ///
@@ -90,6 +103,7 @@ async fn run_bench(
     n: u32,
     warmup: u32,
     csv_output: Option<&str>,
+    txn: BenchTxnHints,
 ) -> Result<(), CliError> {
     if n == 0 {
         return Err(CliError::usage("--bench N requires N >= 1"));
@@ -98,15 +112,25 @@ async fn run_bench(
     for i in 0..(warmup + n) {
         let start = std::time::Instant::now();
         // Mirror the regular dispatch triage so DML and SELECT both work.
-        match conn.query(sql).await {
-            Ok(_) => {}
+        let iter_result: Result<(), CliError> = match conn.query(sql).await {
+            Ok(_) => Ok(()),
             Err(ferrule_core::CoreError::QueryFailed(_)) => match conn.execute(sql).await {
-                Ok(_) => {}
-                Err(_) => {
-                    conn.execute_multi(sql).await.map_err(CliError::query)?;
-                }
+                Ok(_) => Ok(()),
+                Err(_) => conn
+                    .execute_multi(sql)
+                    .await
+                    .map(|_| ())
+                    .map_err(CliError::query),
             },
-            Err(e) => return Err(CliError::query(e)),
+            Err(e) => Err(CliError::query(e)),
+        };
+        if let Err(e) = iter_result {
+            if txn.begin {
+                let _ =
+                    ferrule_core::transaction::rollback_transaction(conn, txn.backend).await;
+                eprintln!("[ferrule] inner statement failed — rolled back wrapping transaction");
+            }
+            return Err(e);
         }
         let elapsed = start.elapsed();
         if i >= warmup {
@@ -131,6 +155,18 @@ async fn run_bench(
     // one record per bench, not N. This avoids threading a return-value
     // channel through every command's signature.
     crate::bench::record_last(summary.history_sql(sql), summary.n() as i64);
+
+    if txn.begin {
+        if txn.rollback {
+            let _ = ferrule_core::transaction::rollback_transaction(conn, txn.backend).await;
+            eprintln!("[ferrule] explicit ROLLBACK (--rollback)");
+        } else {
+            ferrule_core::transaction::commit_transaction(conn, txn.backend)
+                .await
+                .map_err(CliError::query)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -154,6 +190,17 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     if args.filter.is_some() && args.explain {
         return Err(CliError::usage(
             "--filter cannot be combined with --explain.",
+        ));
+    }
+
+    if args.begin && args.conn_flags.daemon {
+        return Err(CliError::usage(
+            "--begin cannot be combined with --daemon (the daemon path does not guarantee transaction affinity).",
+        ));
+    }
+    if args.begin && (args.watch || args.watch_file.is_some()) {
+        return Err(CliError::usage(
+            "--begin cannot be combined with --watch (each tick reopens the transaction).",
         ));
     }
 
@@ -347,6 +394,16 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     let mut conn = super::connect_resolved(resolved, &opts).await?;
     let conn_time = conn_start.elapsed();
 
+    // Wrap the entire statement batch in a single outer transaction when
+    // `--begin` is set. Oracle's begin is a noop (implicit txn) but
+    // still returns `true` so the wrapping COMMIT/ROLLBACK terminates
+    // the implicit transaction.
+    let outer_tx_opened = if args.begin {
+        ferrule_core::transaction::begin_transaction(&mut *conn, backend).await
+    } else {
+        false
+    };
+
     // Inject server-side paging into the SQL
     let sql = ferrule_core::apply_paging(&sql, limit, offset, backend).map_err(CliError::query)?;
 
@@ -365,18 +422,37 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             n,
             args.bench_warmup,
             args.bench_output.as_deref(),
+            BenchTxnHints {
+                begin: outer_tx_opened,
+                rollback: args.rollback,
+                backend,
+            },
         )
         .await;
     }
 
     let query_start = std::time::Instant::now();
-    let results = match conn.query(&sql).await {
-        Ok(qr) => vec![StatementResult::Query(qr)],
+    let dispatch_result: Result<Vec<StatementResult>, CliError> = match conn.query(&sql).await {
+        Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
         Err(ferrule_core::CoreError::QueryFailed(_)) => match conn.execute(&sql).await {
-            Ok(summary) => vec![StatementResult::Summary(summary)],
-            Err(_) => conn.execute_multi(&sql).await.map_err(CliError::query)?,
+            Ok(summary) => Ok(vec![StatementResult::Summary(summary)]),
+            Err(_) => conn.execute_multi(&sql).await.map_err(CliError::query),
         },
-        Err(e) => return Err(CliError::query(e)),
+        Err(e) => Err(CliError::query(e)),
+    };
+
+    // If inner failed AND we opened the wrapping transaction, best-effort
+    // roll back before surfacing the original error.
+    let results = match dispatch_result {
+        Ok(r) => r,
+        Err(e) => {
+            if outer_tx_opened {
+                let _ =
+                    ferrule_core::transaction::rollback_transaction(&mut *conn, backend).await;
+                eprintln!("[ferrule] inner statement failed — rolled back wrapping transaction");
+            }
+            return Err(e);
+        }
     };
     let query_time = query_start.elapsed();
 
@@ -442,6 +518,17 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             format_time.as_secs_f64(),
             total_start.elapsed().as_secs_f64(),
         );
+    }
+
+    if outer_tx_opened {
+        if args.rollback {
+            let _ = ferrule_core::transaction::rollback_transaction(&mut *conn, backend).await;
+            eprintln!("[ferrule] explicit ROLLBACK (--rollback)");
+        } else {
+            ferrule_core::transaction::commit_transaction(&mut *conn, backend)
+                .await
+                .map_err(CliError::query)?;
+        }
     }
 
     if args.fail_on_empty {
@@ -515,6 +602,112 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CliError::Usage(_)));
         assert_eq!(err.exit_code(), 2);
+    }
+
+    /// Parse `["query", ...]` style argv into [`QueryArgs`] for clap
+    /// validation tests. Mirrors how `Commands::Query(QueryArgs)` in
+    /// `main.rs` flattens the subcommand, but stays inside this crate.
+    #[derive(clap::Parser, Debug)]
+    struct TestQueryCli {
+        #[command(flatten)]
+        args: QueryArgs,
+    }
+
+    #[test]
+    fn commit_without_begin_clap_rejects() {
+        use clap::Parser;
+        let err = TestQueryCli::try_parse_from(["query", "sqlite://x", "SELECT 1", "--commit"])
+            .expect_err("--commit alone must require --begin");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "expected MissingRequiredArgument, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn commit_with_rollback_clap_rejects() {
+        use clap::Parser;
+        let err = TestQueryCli::try_parse_from([
+            "query",
+            "sqlite://x",
+            "SELECT 1",
+            "--begin",
+            "--commit",
+            "--rollback",
+        ])
+        .expect_err("--commit and --rollback together must conflict");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "expected ArgumentConflict, got {:?}",
+            err.kind()
+        );
+    }
+
+    fn synth_query_args(connection: &str, sql: &str) -> QueryArgs {
+        QueryArgs {
+            connection: connection.into(),
+            sql: Some(sql.into()),
+            file: None,
+            stdin: false,
+            params: Vec::new(),
+            param_file: None,
+            explain: false,
+            output: super::super::OutputFlags {
+                format: None,
+                output: None,
+                limit: None,
+                offset: None,
+                timing: false,
+                verbose: false,
+            },
+            conn_flags: super::super::ConnectionFlags {
+                insecure: false,
+                daemon: false,
+                ssh_tunnel: None,
+                ssh_key: None,
+                proxy_url: None,
+            },
+            password: None,
+            filter: None,
+            dry_run: false,
+            watch_file: None,
+            watch: false,
+            watch_interval: 5,
+            bench: None,
+            bench_warmup: 1,
+            bench_output: None,
+            fail_on_empty: false,
+            begin: false,
+            commit: false,
+            rollback: false,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn begin_with_daemon_usage_error() {
+        let mut args = synth_query_args("sqlite://x", "SELECT 1");
+        args.begin = true;
+        args.conn_flags.daemon = true;
+        let global = GlobalConfig::default();
+        let err = run(args, &global)
+            .await
+            .expect_err("--begin --daemon should be a usage error");
+        assert!(matches!(err, CliError::Usage(_)), "got: {:?}", err);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn begin_with_watch_usage_error() {
+        let mut args = synth_query_args("sqlite://x", "SELECT 1");
+        args.begin = true;
+        args.watch = true;
+        let global = GlobalConfig::default();
+        let err = run(args, &global)
+            .await
+            .expect_err("--begin --watch should be a usage error");
+        assert!(matches!(err, CliError::Usage(_)), "got: {:?}", err);
     }
 
     #[test]
