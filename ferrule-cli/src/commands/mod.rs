@@ -262,6 +262,24 @@ pub struct QueryArgs {
     /// Watch interval in seconds (default: 5)
     #[arg(long, value_name = "SECS", default_value_t = 5)]
     pub watch_interval: u64,
+
+    /// Benchmark mode: run the query N times, suppress result output,
+    /// print a p50/p95/p99 summary + ASCII histogram. Connect cost is
+    /// taken once outside the loop. Pairs naturally with the connection
+    /// pooling daemon.
+    #[arg(long, value_name = "N")]
+    pub bench: Option<u32>,
+
+    /// Warmup iterations discarded before the timed run starts.
+    /// Ignored unless `--bench` is set.
+    #[arg(long, value_name = "K", default_value_t = 1)]
+    pub bench_warmup: u32,
+
+    /// When set, emit per-iteration timings as CSV to the named file in
+    /// addition to the on-screen histogram. Useful for piping into
+    /// statistical tools. Ignored unless `--bench` is set.
+    #[arg(long, value_name = "PATH")]
+    pub bench_output: Option<String>,
 }
 
 /// Tables command arguments.

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod bench;
 mod commands;
 mod daemon;
 mod error;
@@ -261,13 +262,21 @@ fn record_dispatch(
         Ok(()) => (0, None),
         Err(e) => (e.exit_code(), Some(error_class(e).to_string())),
     };
+    // Bench mode (Phase 3) stashes a one-row rollup in a thread-local
+    // before returning; fold it into the RunRecord so the history table
+    // shows one record per bench run, not N. The dispatch hook is the
+    // only consumer.
+    let (sql, rows) = match bench::take_last() {
+        Some((rollup_sql, samples)) => (Some(rollup_sql), Some(samples)),
+        None => (snapshot.sql, None),
+    };
     let record = RunRecord {
         ts: chrono::Utc::now(),
         conn: snapshot.conn,
         command: snapshot.command.to_string(),
-        sql: snapshot.sql,
+        sql,
         duration_ms: elapsed.as_millis() as u64,
-        rows: None,
+        rows,
         exit_code,
         error: error_class,
     };
