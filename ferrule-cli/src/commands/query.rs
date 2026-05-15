@@ -1,5 +1,6 @@
 use super::{QueryArgs, WatchArgs};
 use crate::bench::BenchSummary;
+use crate::cache::{self, CacheDb, CacheKey};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_core::backend::Backend;
@@ -7,6 +8,7 @@ use ferrule_core::connection::{ConnectOptions, Connection, QueryResult, Statemen
 use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::{infer_type, parse_param, substitute, ParameterSet};
+use std::time::Duration;
 
 /// Hints threaded into `run_bench` so the bench loop runs inside the
 /// same wrapping transaction as the script-mode path. `begin` is the
@@ -309,6 +311,95 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         return Ok(());
     }
 
+    // ----- Result cache (R5 / #5) -----
+    //
+    // Lookup BEFORE `connect_resolved` so a cached hit can serve users
+    // even when the database itself is unavailable. Bypass rules cover
+    // every CLI flag that conflicts with the cache contract (bench,
+    // explain, watch, dry_run, daemon, modifying SQL, --no-cache, or
+    // `default_ttl = "0"` / empty). Failures here NEVER block the
+    // user's query — every error is swallowed at the dispatch
+    // boundary and surfaced only under `--verbose`.
+    let cache_bypass = args.no_cache
+        || args.bench.is_some()
+        || args.explain
+        || args.watch
+        || args.watch_file.is_some()
+        || args.dry_run
+        || args.conn_flags.daemon
+        || is_modifying(&sql)
+        || (args.cache.is_none()
+            && (global_config.cache.default_ttl == "0"
+                || global_config.cache.default_ttl.is_empty()));
+    // Split into two `Option`s rather than a single tuple because
+    // lookup needs `&CacheDb` and insert needs `&mut CacheDb`; threading
+    // a tuple would force a borrow split at every call site.
+    let (mut cache_db, cache_key): (Option<CacheDb>, Option<CacheKey>) = if cache_bypass {
+        (None, None)
+    } else {
+        match CacheDb::maybe_open(&global_config.cache) {
+            Ok(Some(db)) => (
+                Some(db),
+                Some(cache::cache_key(&args.connection, &sql, &param_set)),
+            ),
+            // Cache disabled (env kill switch or config), OR open
+            // failed — either way, fall through to the real query.
+            Ok(None) => (None, None),
+            Err(_) => {
+                if args.output.verbose {
+                    eprintln!("[ferrule] cache: open error (continuing without cache)");
+                }
+                (None, None)
+            }
+        }
+    };
+    if let (Some(db), Some(key)) = (cache_db.as_ref(), cache_key.as_ref()) {
+        let t = std::time::Instant::now();
+        match db.lookup(key) {
+            Ok(Some(cached)) => {
+                let lookup_micros = t.elapsed().as_micros() as u64;
+                let rendered =
+                    render_query_result(&cached.result, format, limit, offset)?;
+                let filtered = maybe_apply_filter(rendered, args.filter.as_deref())?;
+                println!("{}", filtered);
+                if let Some(path) = args.output.output.as_deref() {
+                    let again =
+                        render_query_result(&cached.result, format, limit, offset)?;
+                    tokio::fs::write(path, again).await.map_err(CliError::Io)?;
+                    eprintln!("Wrote to {}", path);
+                }
+                cache::record_last(cache::CacheHitInfo {
+                    hit: true,
+                    key: key.0.clone(),
+                    lookup_micros,
+                });
+                if args.output.verbose {
+                    eprintln!(
+                        "[ferrule] cache hit (key={}\u{2026}, age={}s)",
+                        &key.0[..8.min(key.0.len())],
+                        cached.age_secs
+                    );
+                }
+                if args.fail_on_empty {
+                    let synthetic =
+                        StatementResult::Query(cached.result.clone());
+                    check_fail_on_empty(&[synthetic])?;
+                }
+                return Ok(());
+            }
+            Ok(None) => {
+                if args.output.verbose {
+                    eprintln!("[ferrule] cache miss");
+                }
+            }
+            Err(_) => {
+                if args.output.verbose {
+                    eprintln!("[ferrule] cache: lookup error (continuing)");
+                }
+            }
+        }
+    }
+
     let resolved = super::resolve_connection(
         &args.connection,
         args.password,
@@ -501,6 +592,61 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
 
     let format_time = format_start.elapsed();
 
+    // Cache insert: only for successful, single-statement SELECT
+    // results. Multi-statement batches, DML, and modifying SQL are
+    // already filtered out by the bypass rules + the `results.len()`
+    // / variant checks. Errors here are swallowed.
+    if let (Some(db), Some(key)) = (cache_db.as_mut(), cache_key.as_ref()) {
+        if results.len() == 1 {
+            if let StatementResult::Query(ref qr) = results[0] {
+                if !is_modifying(&sql) {
+                    let ttl_secs = match args.cache.as_deref() {
+                        Some(d) => cache::parse_duration_secs(d)?,
+                        None => cache::parse_duration_secs(&global_config.cache.default_ttl)
+                            .unwrap_or(300),
+                    };
+                    if ttl_secs > 0 {
+                        let preview_end = sql.len().min(200);
+                        let redacted = ferrule_core::DatabaseUrl::parse(&args.connection)
+                            .map(|u| u.redacted())
+                            .unwrap_or_else(|_| args.connection.clone());
+                        let meta = cache::CacheMeta {
+                            conn_redacted: &redacted,
+                            sql_preview: &sql[..preview_end],
+                        };
+                        let insert_res =
+                            db.insert(key, qr, Duration::from_secs(ttl_secs), &meta);
+                        match insert_res {
+                            Ok(()) => {
+                                // Open-loop prune (mirrors history.rs::record).
+                                // Failures here are non-fatal.
+                                let _ = db.prune(&global_config.cache);
+                                cache::record_last(cache::CacheHitInfo {
+                                    hit: false,
+                                    key: key.0.clone(),
+                                    lookup_micros: 0,
+                                });
+                                if args.output.verbose {
+                                    eprintln!(
+                                        "[ferrule] cache miss; inserted (ttl={}s)",
+                                        ttl_secs
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                if args.output.verbose {
+                                    eprintln!(
+                                        "[ferrule] cache: insert error (continuing)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(path) = args.output.output {
         eprintln!("Warning: file output with multi-statement uses first result only.");
         let rendered = render_single_result(&results[0], format, limit, offset)?;
@@ -683,6 +829,8 @@ mod tests {
             begin: false,
             commit: false,
             rollback: false,
+            cache: None,
+            no_cache: false,
         }
     }
 
@@ -741,5 +889,89 @@ mod tests {
             }),
         ])
         .is_ok());
+    }
+
+    /// Build a GlobalConfig with `[cache] path` pointed at an isolated
+    /// tempdir so the per-test cache file doesn't bleed into the user
+    /// data dir or other tests. Returns the config + the directory
+    /// guard so the caller controls lifetime.
+    fn cache_test_config(tmp: &tempfile::TempDir) -> GlobalConfig {
+        let cache_path = tmp.path().join("results.db");
+        GlobalConfig {
+            cache: ferrule_config::CacheConfig {
+                enabled: true,
+                default_ttl: "5m".into(),
+                max_age_days: 0,
+                max_rows: 0,
+                path: Some(cache_path.to_string_lossy().into_owned()),
+            },
+            ..GlobalConfig::default()
+        }
+    }
+
+    fn cache_count(cache_path: &std::path::Path) -> i64 {
+        if !cache_path.exists() {
+            return 0;
+        }
+        let conn = rusqlite::Connection::open(cache_path).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM cache", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+    }
+
+    // 18. --bench bypasses the cache: no record_last should fire, no
+    // row should land in the cache db.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bench_bypasses_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("data.db");
+        let url = format!("sqlite://{}", db_path.display());
+        let global = cache_test_config(&tmp);
+        let cache_path = tmp.path().join("results.db");
+        // Drain any stale state from prior tests.
+        let _ = cache::take_last();
+
+        let mut args = synth_query_args(&url, "SELECT 1");
+        args.bench = Some(1);
+        args.bench_warmup = 0;
+        // Run; the synth args target an on-disk sqlite that connect
+        // will create automatically.
+        run(args, &global).await.expect("bench run must succeed");
+        assert!(
+            cache::take_last().is_none(),
+            "--bench must not record a cache hit/miss event"
+        );
+        assert_eq!(
+            cache_count(&cache_path),
+            0,
+            "--bench must not insert into the cache"
+        );
+    }
+
+    // 19. is_modifying SQL bypasses insert: cache row count stays 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn is_modifying_bypasses_insert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("data.db");
+        let url = format!("sqlite://{}", db_path.display());
+        let global = cache_test_config(&tmp);
+        let cache_path = tmp.path().join("results.db");
+        // Seed table.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        let _ = cache::take_last();
+
+        let mut args = synth_query_args(&url, "INSERT INTO t VALUES (2)");
+        args.cache = Some("5m".into());
+        run(args, &global)
+            .await
+            .expect("insert run must succeed");
+        assert_eq!(
+            cache_count(&cache_path),
+            0,
+            "is_modifying SQL must NOT insert into the cache"
+        );
     }
 }

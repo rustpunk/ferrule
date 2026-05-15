@@ -307,6 +307,19 @@ pub struct QueryArgs {
     /// dry-run / read-only snapshot semantics. Requires --begin.
     #[arg(long, requires = "begin")]
     pub rollback: bool,
+
+    /// Result-cache opt-in. `DURATION` (e.g. `5m`, `2h`, `30s`, `7d`)
+    /// overrides `[cache] default_ttl` for this invocation. Pass
+    /// `--cache 0` to bypass the cache once without disabling it
+    /// globally. The cache is keyed off the redacted connection URL,
+    /// normalized SQL, and named parameters — see `docs/src/cache.md`.
+    #[arg(long, value_name = "DURATION")]
+    pub cache: Option<String>,
+
+    /// Bypass cache lookup AND insert for this invocation. Equivalent
+    /// to running with `FERRULE_NO_CACHE=1` for one command.
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 /// Tables command arguments.

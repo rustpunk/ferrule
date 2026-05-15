@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod bench;
+mod cache;
 mod commands;
 mod daemon;
 mod error;
@@ -272,17 +273,39 @@ fn record_dispatch(
     // Bench mode (Phase 3) stashes a one-row rollup in a thread-local
     // before returning; fold it into the RunRecord so the history table
     // shows one record per bench run, not N. The dispatch hook is the
-    // only consumer.
-    let (sql, rows) = match bench::take_last() {
-        Some((rollup_sql, samples)) => (Some(rollup_sql), Some(samples)),
-        None => (snapshot.sql, None),
+    // only consumer. Cache (Phase 5) stashes a hit/miss event in a
+    // sibling thread-local; bench wins if both fire because `--bench`
+    // implicitly disables the cache.
+    let bench_taken;
+    let (mut sql, rows, mut duration_ms) = match bench::take_last() {
+        Some((rollup_sql, samples)) => {
+            bench_taken = true;
+            (Some(rollup_sql), Some(samples), elapsed.as_millis() as u64)
+        }
+        None => {
+            bench_taken = false;
+            (snapshot.sql, None, elapsed.as_millis() as u64)
+        }
     };
+    if !bench_taken {
+        if let Some(info) = cache::take_last() {
+            if info.hit {
+                sql = Some(format!("cache_hit: {}", sql.unwrap_or_default()));
+                // Ceiling division so a sub-millisecond cache lookup
+                // doesn't round down to 0 ms and look like a phantom
+                // zero-duration row in the history table.
+                duration_ms = info.lookup_micros.div_ceil(1_000);
+            }
+            // miss: snapshot untouched. The recorded duration is the
+            // real elapsed query time, which is what we want.
+        }
+    }
     let record = RunRecord {
         ts: chrono::Utc::now(),
         conn: snapshot.conn,
         command: snapshot.command.to_string(),
         sql,
-        duration_ms: elapsed.as_millis() as u64,
+        duration_ms,
         rows,
         exit_code,
         error: error_class,
