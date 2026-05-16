@@ -19,7 +19,7 @@ use crate::error::CoreError;
 /// given backend. `None` means "skip the wire round-trip" — Oracle
 /// uses this because issuing an explicit `BEGIN` would parse as a
 /// PL/SQL block.
-pub(crate) fn begin_sql_for(backend: Backend) -> Option<&'static str> {
+fn begin_sql_for(backend: Backend) -> Option<&'static str> {
     match backend {
         #[cfg(feature = "mssql")]
         Backend::MsSql => Some("BEGIN TRANSACTION"),
@@ -30,7 +30,7 @@ pub(crate) fn begin_sql_for(backend: Backend) -> Option<&'static str> {
 }
 
 /// SQL string for the [`commit_transaction`] dispatcher.
-pub(crate) fn commit_sql_for(backend: Backend) -> &'static str {
+fn commit_sql_for(backend: Backend) -> &'static str {
     match backend {
         #[cfg(feature = "mssql")]
         Backend::MsSql => "COMMIT TRANSACTION",
@@ -39,7 +39,7 @@ pub(crate) fn commit_sql_for(backend: Backend) -> &'static str {
 }
 
 /// SQL string for the [`rollback_transaction`] dispatcher.
-pub(crate) fn rollback_sql_for(backend: Backend) -> &'static str {
+fn rollback_sql_for(backend: Backend) -> &'static str {
     match backend {
         #[cfg(feature = "mssql")]
         Backend::MsSql => "ROLLBACK TRANSACTION",

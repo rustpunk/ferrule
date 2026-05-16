@@ -360,17 +360,14 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
                 let lookup_micros = t.elapsed().as_micros() as u64;
                 let rendered =
                     render_query_result(&cached.result, format, limit, offset)?;
-                let filtered = maybe_apply_filter(rendered, args.filter.as_deref())?;
-                println!("{}", filtered);
                 if let Some(path) = args.output.output.as_deref() {
-                    let again =
-                        render_query_result(&cached.result, format, limit, offset)?;
-                    tokio::fs::write(path, again).await.map_err(CliError::Io)?;
+                    tokio::fs::write(path, &rendered).await.map_err(CliError::Io)?;
                     eprintln!("Wrote to {}", path);
                 }
+                let filtered = maybe_apply_filter(rendered, args.filter.as_deref())?;
+                println!("{}", filtered);
                 cache::record_last(cache::CacheHitInfo {
                     hit: true,
-                    key: key.0.clone(),
                     lookup_micros,
                 });
                 if args.output.verbose {
@@ -593,55 +590,47 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     let format_time = format_start.elapsed();
 
     // Cache insert: only for successful, single-statement SELECT
-    // results. Multi-statement batches, DML, and modifying SQL are
-    // already filtered out by the bypass rules + the `results.len()`
-    // / variant checks. Errors here are swallowed.
-    if let (Some(db), Some(key)) = (cache_db.as_mut(), cache_key.as_ref()) {
-        if results.len() == 1 {
-            if let StatementResult::Query(ref qr) = results[0] {
-                if !is_modifying(&sql) {
-                    let ttl_secs = match args.cache.as_deref() {
-                        Some(d) => cache::parse_duration_secs(d)?,
-                        None => cache::parse_duration_secs(&global_config.cache.default_ttl)
-                            .unwrap_or(300),
-                    };
-                    if ttl_secs > 0 {
-                        let preview_end = sql.len().min(200);
-                        let redacted = ferrule_core::DatabaseUrl::parse(&args.connection)
-                            .map(|u| u.redacted())
-                            .unwrap_or_else(|_| args.connection.clone());
-                        let meta = cache::CacheMeta {
-                            conn_redacted: &redacted,
-                            sql_preview: &sql[..preview_end],
-                        };
-                        let insert_res =
-                            db.insert(key, qr, Duration::from_secs(ttl_secs), &meta);
-                        match insert_res {
-                            Ok(()) => {
-                                // Open-loop prune (mirrors history.rs::record).
-                                // Failures here are non-fatal.
-                                let _ = db.prune(&global_config.cache);
-                                cache::record_last(cache::CacheHitInfo {
-                                    hit: false,
-                                    key: key.0.clone(),
-                                    lookup_micros: 0,
-                                });
-                                if args.output.verbose {
-                                    eprintln!(
-                                        "[ferrule] cache miss; inserted (ttl={}s)",
-                                        ttl_secs
-                                    );
-                                }
-                            }
-                            Err(_) => {
-                                if args.output.verbose {
-                                    eprintln!(
-                                        "[ferrule] cache: insert error (continuing)"
-                                    );
-                                }
-                            }
-                        }
-                    }
+    // results. Modifying SQL is already filtered upstream by
+    // `cache_bypass` (so `cache_db` is None for it); we still gate on
+    // `len() == 1` and `Query(_)` here because the bypass doesn't see
+    // the result shape. Errors here are swallowed.
+    'cache_insert: {
+        let (Some(db), Some(key)) = (cache_db.as_mut(), cache_key.as_ref()) else {
+            break 'cache_insert;
+        };
+        let [StatementResult::Query(qr)] = results.as_slice() else {
+            break 'cache_insert;
+        };
+        let ttl_secs = match args.cache.as_deref() {
+            Some(d) => cache::parse_duration_secs(d)?,
+            None => cache::parse_duration_secs(&global_config.cache.default_ttl).unwrap_or(300),
+        };
+        if ttl_secs == 0 {
+            break 'cache_insert;
+        }
+        let preview_end = sql.len().min(200);
+        let redacted = ferrule_core::DatabaseUrl::parse(&args.connection)
+            .map(|u| u.redacted())
+            .unwrap_or_else(|_| args.connection.clone());
+        let meta = cache::CacheMeta {
+            conn_redacted: &redacted,
+            sql_preview: &sql[..preview_end],
+        };
+        match db.insert(key, qr, Duration::from_secs(ttl_secs), &meta) {
+            Ok(()) => {
+                // Open-loop prune (mirrors history.rs::record). Non-fatal.
+                let _ = db.prune(&global_config.cache);
+                cache::record_last(cache::CacheHitInfo {
+                    hit: false,
+                    lookup_micros: 0,
+                });
+                if args.output.verbose {
+                    eprintln!("[ferrule] cache miss; inserted (ttl={}s)", ttl_secs);
+                }
+            }
+            Err(_) => {
+                if args.output.verbose {
+                    eprintln!("[ferrule] cache: insert error (continuing)");
                 }
             }
         }
@@ -910,10 +899,12 @@ mod tests {
     }
 
     fn cache_count(cache_path: &std::path::Path) -> i64 {
-        if !cache_path.exists() {
+        // Open-then-query; rusqlite::Connection::open creates the file
+        // if absent, and the SELECT then either returns 0 (no cache
+        // table yet) or the actual count via unwrap_or(0).
+        let Ok(conn) = rusqlite::Connection::open(cache_path) else {
             return 0;
-        }
-        let conn = rusqlite::Connection::open(cache_path).unwrap();
+        };
         conn.query_row("SELECT COUNT(*) FROM cache", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0)
     }

@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::CliError;
+use crate::path_util::expand_tilde;
 
 /// Hex-encoded SHA-256 of `(redacted_conn, normalized_sql, params_canonical)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,17 +62,14 @@ pub struct CachedResult {
 #[derive(Debug, Clone)]
 pub struct CacheHitInfo {
     pub hit: bool,
-    /// The full hex SHA-256 key. Kept on the struct so the dispatch
-    /// hook and a future `ferrule cache list` can surface the entry
-    /// without re-deriving from the SQL — but `record_dispatch` itself
-    /// only consumes the truncated form via `verbose` logging in
-    /// `commands/query.rs`. Marked `#[allow(dead_code)]` to keep
-    /// default-features clippy clean while still documenting the
-    /// downstream consumer contract.
-    #[allow(dead_code)]
-    pub key: String,
     pub lookup_micros: u64,
 }
+
+/// Prefix attached to a `RunRecord`'s `sql` field when a cache hit
+/// folds into the dispatch hook. Downstream readers (history queries,
+/// future `ferrule cache list`) detect cache-served runs by matching
+/// this prefix.
+pub const CACHE_HIT_PREFIX: &str = "cache_hit: ";
 
 thread_local! {
     /// Set by `commands::query::run` to communicate cache hit/miss to
@@ -294,11 +292,11 @@ pub fn cache_key(conn: &str, sql: &str, params: &ParameterSet) -> CacheKey {
     CacheKey(s)
 }
 
-/// Build the pre-hash input string used by `cache_key`. Exposed for
+/// Build the pre-hash input string used by `cache_key`. Used by
 /// the `cache_key_never_contains_password_bytes` test so it can
 /// substring-assert the absence of password bytes without reaching
 /// into `Sha256::update` itself.
-pub(crate) fn cache_key_input(conn: &str, sql: &str, params: &ParameterSet) -> String {
+fn cache_key_input(conn: &str, sql: &str, params: &ParameterSet) -> String {
     let redacted = DatabaseUrl::parse(conn)
         .map(|u| u.redacted())
         .unwrap_or_else(|_| conn.to_string());
@@ -486,15 +484,6 @@ fn resolve_path(cfg: &CacheConfig) -> Result<PathBuf, CliError> {
         CliError::usage("cache: could not determine data-local directory for default path")
     })?;
     Ok(base.join("ferrule").join("results.db"))
-}
-
-fn expand_tilde(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(s)
 }
 
 fn now_unix() -> i64 {

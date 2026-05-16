@@ -3,6 +3,7 @@ use crate::connection::Connection;
 use crate::error::CoreError;
 use crate::params::render_value;
 use crate::value::{ColumnInfo, Value};
+use std::fmt::Write as _;
 
 /// Supported dump formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,16 +254,18 @@ pub async fn dump_query(
                 if opts.deterministic {
                     // One INSERT statement per row — eliminates batch-
                     // boundary noise in diffs and keeps each row
-                    // independently re-orderable / re-loadable.
+                    // independently re-orderable / re-loadable. Stream
+                    // straight into `out` to avoid a per-row Vec<String>
+                    // and an intermediate format!() temp.
                     for row in &page.rows {
-                        let cells: Vec<String> = row
-                            .iter()
-                            .map(|v| render_value_deterministic(v, backend))
-                            .collect();
-                        out.push_str(&format!(
-                            "INSERT INTO {quoted_table} ({cols}) VALUES ({});\n",
-                            cells.join(", ")
-                        ));
+                        let _ = write!(&mut out, "INSERT INTO {quoted_table} ({cols}) VALUES (");
+                        for (i, v) in row.iter().enumerate() {
+                            if i > 0 {
+                                out.push_str(", ");
+                            }
+                            out.push_str(&render_value_deterministic(v, backend));
+                        }
+                        out.push_str(");\n");
                     }
                 } else {
                     let values: Vec<String> = page
