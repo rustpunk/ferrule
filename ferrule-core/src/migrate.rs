@@ -276,7 +276,27 @@ END;"#
                 )
             }
         };
-        let result = self.conn.query(&sql).await?;
+        self.query_applied(&sql).await
+    }
+
+    /// Read **every** applied migration from the tracking table, ordered
+    /// most-recent first (`applied_at DESC, version DESC`).
+    ///
+    /// Unlike [`MigrationEngine::last_applied`] this applies no row cap, so
+    /// `migrate history` and `migrate verify` see the full set rather than a
+    /// silently truncated window. The ordering is identical to
+    /// `last_applied` and needs no dialect-specific limit clause, so the
+    /// same query runs on all backends.
+    pub async fn all_applied(&mut self) -> Result<Vec<AppliedMigration>, CoreError> {
+        let sql =
+            "SELECT version, checksum FROM __ferrule_migrations ORDER BY applied_at DESC, version DESC";
+        self.query_applied(sql).await
+    }
+
+    /// Run a `SELECT version, checksum FROM __ferrule_migrations ...` query
+    /// and collect the rows into [`AppliedMigration`]s.
+    async fn query_applied(&mut self, sql: &str) -> Result<Vec<AppliedMigration>, CoreError> {
+        let result = self.conn.query(sql).await?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in result.rows {
             let version = row[0].to_string();
