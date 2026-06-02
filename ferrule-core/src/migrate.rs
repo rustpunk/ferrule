@@ -149,6 +149,15 @@ END;"#
     }
 
     /// Apply a single migration (`.up.sql`).
+    ///
+    /// The migration script and the `__ferrule_migrations` tracking-row
+    /// `INSERT` are committed as a single unit on backends with
+    /// transactional DDL (SQLite, Postgres, MSSQL): both succeed or both
+    /// roll back, so a mid-script failure can never leave the migration
+    /// recorded-but-partial or applied-but-untracked. On MySQL and Oracle,
+    /// DDL implicitly commits, so the two steps run best-effort and a
+    /// failure in the middle can leave the schema partially applied — see
+    /// [`MigrationEngine::apply_atomic`] for the per-dialect details.
     pub async fn apply_up(&mut self, file: &MigrationFile) -> Result<(), CoreError> {
         let sql = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
             CoreError::QueryFailed(format!(
@@ -159,21 +168,23 @@ END;"#
         })?;
         let checksum = hex_digest(&sql);
 
-        // Execute inside a transaction when possible (SQLite/Postgres/MySQL).
-        // For MSSQL/Oracle we still execute the script; rollback semantics
-        // vary by backend DDL behaviour.
-        self.conn.execute_multi(&sql).await?;
-
-        let insert = format!(
+        let track = format!(
             "INSERT INTO __ferrule_migrations (version, checksum) VALUES ('{}', '{}')",
             escape_sql_literal(&file.version),
             escape_sql_literal(&checksum)
         );
-        self.conn.execute(&insert).await?;
-        Ok(())
+        self.apply_atomic(&sql, &track).await
     }
 
     /// Rollback a single migration (`.down.sql`).
+    ///
+    /// The rollback script and the `__ferrule_migrations` tracking-row
+    /// `DELETE` are committed together on backends with transactional DDL
+    /// (SQLite, Postgres, MSSQL): the row is removed only if the entire
+    /// down script succeeds, so a mid-script failure can never leave the
+    /// schema half-rolled-back while the row still marks the migration
+    /// applied. On MySQL and Oracle, DDL implicitly commits, so the two
+    /// steps run best-effort — see [`MigrationEngine::apply_atomic`].
     pub async fn apply_down(&mut self, file: &MigrationFile) -> Result<(), CoreError> {
         let sql = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
             CoreError::QueryFailed(format!(
@@ -183,14 +194,59 @@ END;"#
             ))
         })?;
 
-        self.conn.execute_multi(&sql).await?;
-
-        let delete = format!(
+        let track = format!(
             "DELETE FROM __ferrule_migrations WHERE version = '{}'",
             escape_sql_literal(&file.version)
         );
-        self.conn.execute(&delete).await?;
-        Ok(())
+        self.apply_atomic(&sql, &track).await
+    }
+
+    /// Run a migration `script` and its tracking-table statement `track`
+    /// (the `INSERT` for an up, the `DELETE` for a down) as a single unit.
+    ///
+    /// Atomicity depends on whether the backend supports transactional DDL:
+    ///
+    /// - **SQLite / Postgres / MSSQL** — DDL participates in transactions,
+    ///   so the script and the tracking statement are wrapped in one
+    ///   `BEGIN`/`COMMIT` batch. If any statement fails, an explicit
+    ///   `ROLLBACK` discards every change (schema and tracking row) so the
+    ///   migration is left exactly as it was before the attempt. MSSQL
+    ///   additionally sets `XACT_ABORT ON`, which makes a runtime error
+    ///   abort the whole batch (T-SQL does not roll back on error by
+    ///   default).
+    /// - **MySQL / Oracle** — DDL implicitly commits, so wrapping it in a
+    ///   transaction would not protect it. The script and the tracking
+    ///   statement run as two separate autocommitted operations
+    ///   (best-effort). A failure partway through the script can therefore
+    ///   leave the schema partially changed and the tracking row out of
+    ///   sync; this is an inherent limitation of these engines, not a bug
+    ///   in the runner.
+    async fn apply_atomic(&mut self, script: &str, track: &str) -> Result<(), CoreError> {
+        match self.dialect {
+            Dialect::Sqlite | Dialect::Postgres | Dialect::MsSql => {
+                let (begin, prelude) = match self.dialect {
+                    Dialect::MsSql => ("BEGIN TRANSACTION;", "SET XACT_ABORT ON;\n"),
+                    _ => ("BEGIN;", ""),
+                };
+                let batch = format!("{prelude}{begin}\n{script}\n;\n{track};\nCOMMIT;");
+                match self.conn.execute_multi(&batch).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        // Discard any partial work and return the original
+                        // error. The rollback is best-effort: if it also
+                        // fails (e.g. the connection is gone) the caller
+                        // still sees the underlying migration failure.
+                        let _ = self.conn.execute("ROLLBACK;").await;
+                        Err(e)
+                    }
+                }
+            }
+            Dialect::MySql | Dialect::Oracle => {
+                self.conn.execute_multi(script).await?;
+                self.conn.execute(track).await?;
+                Ok(())
+            }
+        }
     }
 
     /// Read the last N applied versions from the tracking table,
