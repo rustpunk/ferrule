@@ -155,7 +155,20 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 .count();
             let pending_count = up_files.len() - applied_count;
 
-            for f in up_files {
+            // Drift: versions recorded in __ferrule_migrations that have no
+            // matching `.up.sql` on disk — a deleted or renamed migration the
+            // database still believes is applied. Without this the command
+            // would report a clean status and mask exactly that divergence.
+            let on_disk: std::collections::HashSet<&str> =
+                up_files.iter().map(|f| f.version.as_str()).collect();
+            let mut drift: Vec<&str> = applied
+                .iter()
+                .map(String::as_str)
+                .filter(|v| !on_disk.contains(v))
+                .collect();
+            drift.sort_unstable();
+
+            for f in &up_files {
                 let marker = if applied.contains(&f.version) {
                     "✔"
                 } else {
@@ -163,8 +176,16 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 };
                 println!("{} {}", marker, f.version);
             }
+            for v in &drift {
+                println!("✗ {} (applied, missing on disk)", v);
+            }
             println!();
-            println!("{} applied, {} pending", applied_count, pending_count);
+            println!(
+                "{} applied, {} pending, {} drift",
+                applied_count,
+                pending_count,
+                drift.len()
+            );
         }
 
         MigrateCmd::History => {

@@ -8,6 +8,7 @@
 
 use crate::connection::Connection;
 use crate::error::CoreError;
+use crate::params::quote_string;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -168,10 +169,11 @@ END;"#
         })?;
         let checksum = hex_digest(&sql);
 
+        validate_version(&file.version)?;
         let track = format!(
-            "INSERT INTO __ferrule_migrations (version, checksum) VALUES ('{}', '{}')",
-            escape_sql_literal(&file.version),
-            escape_sql_literal(&checksum)
+            "INSERT INTO __ferrule_migrations (version, checksum) VALUES ({}, {})",
+            quote_string(&file.version),
+            quote_string(&checksum)
         );
         self.apply_atomic(&sql, &track).await
     }
@@ -194,9 +196,10 @@ END;"#
             ))
         })?;
 
+        validate_version(&file.version)?;
         let track = format!(
-            "DELETE FROM __ferrule_migrations WHERE version = '{}'",
-            escape_sql_literal(&file.version)
+            "DELETE FROM __ferrule_migrations WHERE version = {}",
+            quote_string(&file.version)
         );
         self.apply_atomic(&sql, &track).await
     }
@@ -317,9 +320,10 @@ END;"#
     /// wrong file (e.g. version `2026` matching `20260602_x.up.sql`),
     /// reporting spurious drift or masking real drift.
     pub async fn verify_checksum(&mut self, version: &str) -> Result<(), CoreError> {
+        validate_version(version)?;
         let sql = format!(
-            "SELECT checksum FROM __ferrule_migrations WHERE version = '{}'",
-            escape_sql_literal(version)
+            "SELECT checksum FROM __ferrule_migrations WHERE version = {}",
+            quote_string(version)
         );
         let result = self.conn.query(&sql).await?;
         let db_checksum = result
@@ -529,8 +533,25 @@ fn hex_digest(input: &str) -> String {
     hex::encode(result)
 }
 
-/// Escape a string for safe use inside a SQL single-quoted literal.
-/// Replaces `'` with `''`.
-fn escape_sql_literal(s: &str) -> String {
-    s.replace('\'', "''")
+/// Reject a migration version that cannot be safely interpolated into a
+/// single-quoted SQL literal.
+///
+/// Versions are interpolated into the tracking-table `INSERT`/`DELETE`/`SELECT`
+/// statements and quoted with [`crate::params::quote_string`], which doubles
+/// embedded `'`. That alone is enough for SQLite, Postgres, MSSQL, and Oracle,
+/// but MySQL interprets `\` as an escape inside string literals by default, so
+/// a backslash in a version could still break out of the literal. The version
+/// originates from a filename stem (the text before the first `_`), which the
+/// naming convention defines as timestamp digits, so any `'` or `\` indicates a
+/// malformed name rather than a legitimate version; reject it before building
+/// the statement.
+fn validate_version(version: &str) -> Result<(), CoreError> {
+    if version.contains('\'') || version.contains('\\') {
+        return Err(CoreError::QueryFailed(format!(
+            "migration version '{version}' contains a quote or backslash; \
+             rename the file so the version (the text before the first '_') \
+             has no ' or \\ characters"
+        )));
+    }
+    Ok(())
 }
