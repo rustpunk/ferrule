@@ -4,8 +4,8 @@ use super::{
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::ConnectOptions;
-use ferrule_core::Backend;
+use ferrule_sql::connection::ConnectOptions;
+use ferrule_sql::Backend;
 use std::io::Write;
 
 #[derive(Args, Clone, Debug)]
@@ -123,7 +123,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
     let mut json_started = false;
 
     loop {
-        let paged = ferrule_core::apply_paging(sql, Some(args.page_size), Some(offset), backend)
+        let paged = ferrule_sql::apply_paging(sql, Some(args.page_size), Some(offset), backend)
             .map_err(|e| CliError::usage(e.to_string()))?;
 
         let result = conn.query(&paged).await.map_err(CliError::query)?;
@@ -186,7 +186,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
                 for row in &result.rows {
                     let values: Vec<String> = row
                         .iter()
-                        .map(|v| ferrule_core::params::render_value(v, backend))
+                        .map(|v| ferrule_sql::render_value(v, backend))
                         .collect();
                     batch.push(format!("({})", values.join(", ")));
                     if batch.len() >= args.page_size {
@@ -254,17 +254,17 @@ fn csv_line(fields: &[impl AsRef<str>]) -> String {
     line
 }
 
-fn value_to_csv_cell(v: &ferrule_core::value::Value) -> String {
+fn value_to_csv_cell(v: &ferrule_sql::value::Value) -> String {
     match v {
-        ferrule_core::value::Value::Null => String::new(),
-        ferrule_core::value::Value::String(s) => s.clone(),
+        ferrule_sql::value::Value::Null => String::new(),
+        ferrule_sql::value::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
 }
 
 fn row_to_json_object(
-    columns: &[ferrule_core::value::ColumnInfo],
-    row: &ferrule_core::value::Row,
+    columns: &[ferrule_sql::value::ColumnInfo],
+    row: &ferrule_sql::value::Row,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut obj = serde_json::Map::new();
     for (col, val) in columns.iter().zip(row.iter()) {
@@ -273,8 +273,8 @@ fn row_to_json_object(
     obj
 }
 
-fn value_to_json(v: &ferrule_core::value::Value) -> serde_json::Value {
-    use ferrule_core::value::Value;
+fn value_to_json(v: &ferrule_sql::value::Value) -> serde_json::Value {
+    use ferrule_sql::value::Value;
     match v {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),

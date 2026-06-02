@@ -216,7 +216,11 @@ impl Snapshot {
             ),
             Commands::Diff(a) => (
                 "diff",
-                Some(format!("{} | {}", redact(&a.connection_a), redact(&a.connection_b))),
+                Some(format!(
+                    "{} | {}",
+                    redact(&a.connection_a),
+                    redact(&a.connection_b)
+                )),
                 None,
                 false,
             ),
@@ -247,7 +251,7 @@ impl Snapshot {
 /// passed through `DatabaseUrl::redacted()` (which scrubs the password);
 /// registry names and SQLite paths fall through unchanged.
 fn redact(s: &str) -> String {
-    ferrule_core::DatabaseUrl::parse(s)
+    ferrule_sql::DatabaseUrl::parse(s)
         .map(|u| u.redacted())
         .unwrap_or_else(|_| s.to_string())
 }
@@ -291,7 +295,11 @@ fn record_dispatch(
     if !bench_taken {
         if let Some(info) = cache::take_last() {
             if info.hit {
-                sql = Some(format!("{}{}", cache::CACHE_HIT_PREFIX, sql.unwrap_or_default()));
+                sql = Some(format!(
+                    "{}{}",
+                    cache::CACHE_HIT_PREFIX,
+                    sql.unwrap_or_default()
+                ));
                 // Ceiling division so a sub-millisecond cache lookup
                 // doesn't round down to 0 ms and look like a phantom
                 // zero-duration row in the history table.

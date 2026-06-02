@@ -13,7 +13,7 @@
 
 use crate::backend::Backend;
 use crate::connection::Connection;
-use crate::error::CoreError;
+use crate::error::SqlError;
 
 /// SQL string the [`begin_transaction`] dispatcher will send for a
 /// given backend. `None` means "skip the wire round-trip" — Oracle
@@ -58,19 +58,19 @@ pub async fn begin_transaction(conn: &mut dyn Connection, backend: Backend) -> b
     }
 }
 
-#[must_use = "commit_transaction returns a CoreError on wire failure that the caller must surface"]
+#[must_use = "commit_transaction returns a SqlError on wire failure that the caller must surface"]
 pub async fn commit_transaction(
     conn: &mut dyn Connection,
     backend: Backend,
-) -> Result<(), CoreError> {
+) -> Result<(), SqlError> {
     conn.execute(commit_sql_for(backend)).await.map(|_| ())
 }
 
-#[must_use = "rollback_transaction returns a CoreError on wire failure; best-effort callers should still `let _ =`"]
+#[must_use = "rollback_transaction returns a SqlError on wire failure; best-effort callers should still `let _ =`"]
 pub async fn rollback_transaction(
     conn: &mut dyn Connection,
     backend: Backend,
-) -> Result<(), CoreError> {
+) -> Result<(), SqlError> {
     conn.execute(rollback_sql_for(backend)).await.map(|_| ())
 }
 

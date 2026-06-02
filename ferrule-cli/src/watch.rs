@@ -3,8 +3,8 @@ use crate::commands::{
 };
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::{ConnectOptions, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
+use ferrule_sql::connection::{ConnectOptions, StatementResult};
 use is_terminal::IsTerminal;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::io::Write;
@@ -153,7 +153,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] connection error: {e}");
                 if opts.exit_on_error {
-                    return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                    return Err(CliError::query(ferrule_sql::SqlError::QueryFailed(
                         format!("watch connection error: {e}"),
                     )));
                 }
@@ -165,7 +165,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             let _guard = opts.print_lock.lock();
             eprintln!("[watch] {e}");
             if opts.exit_on_error {
-                return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                return Err(CliError::query(ferrule_sql::SqlError::QueryFailed(
                     format!("watch daemon/ssh compatibility: {e}"),
                 )));
             }
@@ -173,7 +173,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             continue;
         }
 
-        let backend = match ferrule_core::Backend::from_scheme(resolved.url.scheme()) {
+        let backend = match ferrule_sql::Backend::from_scheme(resolved.url.scheme()) {
             Some(b) => b,
             None => {
                 let _guard = opts.print_lock.lock();
@@ -189,13 +189,13 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             }
         };
 
-        let sql = match ferrule_core::apply_paging(&sql, opts.limit, opts.offset, backend) {
+        let sql = match ferrule_sql::apply_paging(&sql, opts.limit, opts.offset, backend) {
             Ok(s) => s,
             Err(e) => {
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] paging error: {e}");
                 if opts.exit_on_error {
-                    return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                    return Err(CliError::query(ferrule_sql::SqlError::QueryFailed(
                         format!("watch paging error: {e}"),
                     )));
                 }
@@ -223,7 +223,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] connection failed: {e}");
                 if opts.exit_on_error {
-                    return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                    return Err(CliError::query(ferrule_sql::SqlError::QueryFailed(
                         format!("watch connection failed: {e}"),
                     )));
                 }
@@ -236,7 +236,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
         let query_start = Instant::now();
         let results = match conn.query(&sql).await {
             Ok(qr) => vec![StatementResult::Query(qr)],
-            Err(ferrule_core::CoreError::QueryFailed(_)) => match conn.execute(&sql).await {
+            Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql).await {
                 Ok(summary) => vec![StatementResult::Summary(summary)],
                 Err(_) => match conn.execute_multi(&sql).await {
                     Ok(r) => r,
@@ -244,7 +244,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                         let _guard = opts.print_lock.lock();
                         eprintln!("[watch] query error: {e}");
                         if opts.exit_on_error {
-                            return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                            return Err(CliError::query(ferrule_sql::SqlError::QueryFailed(
                                 format!("watch query error: {e}"),
                             )));
                         }
@@ -257,7 +257,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                 let _guard = opts.print_lock.lock();
                 eprintln!("[watch] query error: {e}");
                 if opts.exit_on_error {
-                    return Err(CliError::query(ferrule_core::CoreError::QueryFailed(
+                    return Err(CliError::query(ferrule_sql::SqlError::QueryFailed(
                         format!("watch query error: {e}"),
                     )));
                 }

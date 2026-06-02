@@ -1,9 +1,9 @@
 use super::TablesArgs;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::{ConnectOptions, QueryResult};
 use ferrule_core::formatter::format_result;
-use ferrule_core::value::{ColumnInfo, TypeHint, Value};
+use ferrule_sql::connection::{ConnectOptions, QueryResult};
+use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
 
 pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);

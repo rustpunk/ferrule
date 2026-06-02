@@ -2,7 +2,7 @@ use crate::connection::{
     BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
     StatementResult,
 };
-use crate::error::CoreError;
+use crate::error::SqlError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
@@ -18,24 +18,24 @@ pub struct PostgresConnection {
 
 #[async_trait]
 impl Connection for PostgresConnection {
-    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError> {
+    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
         let rows_affected = self
             .client
             .execute(sql, &[])
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         Ok(ExecutionSummary {
             rows_affected: Some(rows_affected),
             command_tag: None,
         })
     }
 
-    async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError> {
+    async fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
         let rows = self
             .client
             .query(sql, &[])
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         if rows.is_empty() {
             return Ok(QueryResult {
                 columns: Vec::new(),
@@ -68,12 +68,12 @@ impl Connection for PostgresConnection {
         })
     }
 
-    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, CoreError> {
+    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
         let msgs = self
             .client
             .simple_query(sql)
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         let mut results = Vec::new();
         let mut current_columns: Vec<ColumnInfo> = Vec::new();
@@ -129,15 +129,15 @@ impl Connection for PostgresConnection {
         Ok(results)
     }
 
-    async fn ping(&mut self) -> Result<(), CoreError> {
+    async fn ping(&mut self) -> Result<(), SqlError> {
         self.client
             .execute("SELECT 1", &[])
             .await
-            .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
         Ok(())
     }
 
-    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError> {
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
         let schema = schema.unwrap_or("public");
         let rows = self
             .client
@@ -147,7 +147,7 @@ impl Connection for PostgresConnection {
                 ],
             )
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         let names = rows
             .into_iter()
             .map(|row| row.get::<_, String>(0))
@@ -159,7 +159,7 @@ impl Connection for PostgresConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<QueryResult, CoreError> {
+    ) -> Result<QueryResult, SqlError> {
         let schema = schema.unwrap_or("public");
         let rows = self
             .client
@@ -170,7 +170,7 @@ impl Connection for PostgresConnection {
                 ],
             )
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         let columns = vec![
             ColumnInfo {
@@ -247,7 +247,7 @@ impl Connection for PostgresConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<Vec<String>, CoreError> {
+    ) -> Result<Vec<String>, SqlError> {
         let schema = schema.unwrap_or("public");
         // `pg_index.indkey` is a smallint[] of attribute numbers in
         // key order; unnest preserves order with WITH ORDINALITY.
@@ -263,14 +263,14 @@ impl Connection for PostgresConnection {
             .client
             .query(sql, &[&schema, &table])
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
     async fn list_foreign_keys(
         &mut self,
         schema: Option<&str>,
-    ) -> Result<Vec<ForeignKey>, CoreError> {
+    ) -> Result<Vec<ForeignKey>, SqlError> {
         let schema = schema.unwrap_or("public");
         // One row per (FK, position) pair; aggregate in Rust to keep
         // the SQL portable.
@@ -296,7 +296,7 @@ impl Connection for PostgresConnection {
             .client
             .query(sql, &[&schema])
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         let mut map: indexmap::IndexMap<String, ForeignKey> = indexmap::IndexMap::new();
         for row in rows {
             let conname: String = row.get(0);
@@ -319,10 +319,7 @@ impl Connection for PostgresConnection {
         Ok(map.into_values().collect())
     }
 
-    async fn bulk_insert_rows(
-        &mut self,
-        target: BulkInsert<'_>,
-    ) -> Result<usize, CoreError> {
+    async fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError> {
         if target.rows.is_empty() {
             return Ok(0);
         }
@@ -351,20 +348,19 @@ impl Connection for PostgresConnection {
                 // into the sink one row at a time. Buffering inside Bytes
                 // is small (one row per allocation); CopyInSink will batch
                 // these into network frames internally.
-                let hints: Vec<TypeHint> =
-                    target.columns.iter().map(|c| c.type_hint).collect();
+                let hints: Vec<TypeHint> = target.columns.iter().map(|c| c.type_hint).collect();
                 for row in target.rows {
                     let buf = pg_text_copy::encode_row(row, &hints)?;
                     sink.send(buf)
                         .await
-                        .map_err(|e| CoreError::QueryFailed(format!("COPY send: {e}")))?;
+                        .map_err(|e| SqlError::QueryFailed(format!("COPY send: {e}")))?;
                 }
 
                 let rows = sink
                     .as_mut()
                     .finish()
                     .await
-                    .map_err(|e| CoreError::QueryFailed(format!("COPY finish: {e}")))?;
+                    .map_err(|e| SqlError::QueryFailed(format!("COPY finish: {e}")))?;
                 Ok(rows as usize)
             }
             crate::copy::CopyFormat::Binary => {
@@ -391,7 +387,7 @@ impl Connection for PostgresConnection {
 ///   - JSON/JSONB receives the compact `serde_json::to_string` form,
 ///     then the same text escapes.
 mod pg_text_copy {
-    use crate::error::CoreError;
+    use crate::error::SqlError;
     use crate::value::{TypeHint, Value};
     use bytes::Bytes;
 
@@ -400,7 +396,7 @@ mod pg_text_copy {
     /// currently only used to route `Value::Json` through compact
     /// JSON serialization, but kept in the signature so binary COPY
     /// (a future opt-in) can swap encoders without changing callers.
-    pub fn encode_row(row: &[Value], hints: &[TypeHint]) -> Result<Bytes, CoreError> {
+    pub fn encode_row(row: &[Value], hints: &[TypeHint]) -> Result<Bytes, SqlError> {
         // Pre-size: average ~8 bytes/cell + tabs/newline. Will grow.
         let mut buf = String::with_capacity(row.len() * 12 + 1);
         for (i, value) in row.iter().enumerate() {
@@ -414,7 +410,7 @@ mod pg_text_copy {
         Ok(Bytes::from(buf.into_bytes()))
     }
 
-    fn encode_value(out: &mut String, v: &Value, hint: TypeHint) -> Result<(), CoreError> {
+    fn encode_value(out: &mut String, v: &Value, hint: TypeHint) -> Result<(), SqlError> {
         match v {
             Value::Null => out.push_str("\\N"),
             Value::Bool(b) => out.push(if *b { 't' } else { 'f' }),
@@ -461,9 +457,8 @@ mod pg_text_copy {
                 out.push_str(&dt.to_rfc3339());
             }
             Value::Json(j) => {
-                let rendered = serde_json::to_string(j).map_err(|e| {
-                    CoreError::QueryFailed(format!("PG bulk: JSON serialize: {e}"))
-                })?;
+                let rendered = serde_json::to_string(j)
+                    .map_err(|e| SqlError::QueryFailed(format!("PG bulk: JSON serialize: {e}")))?;
                 push_escaped(out, &rendered);
             }
             Value::Uuid(s) => push_escaped(out, s),
@@ -473,9 +468,8 @@ mod pg_text_copy {
                 // are out of scope until DDL translation grows a real
                 // array type — file separately if needed.
                 let _ = hint; // reserved for future binary-COPY routing
-                let rendered = serde_json::to_string(a).map_err(|e| {
-                    CoreError::QueryFailed(format!("PG bulk: array serialize: {e}"))
-                })?;
+                let rendered = serde_json::to_string(a)
+                    .map_err(|e| SqlError::QueryFailed(format!("PG bulk: array serialize: {e}")))?;
                 push_escaped(out, &rendered);
             }
         }
@@ -503,7 +497,7 @@ mod pg_text_copy {
     }
 
     /// Classify a `tokio_postgres::Error` raised by `copy_in`.
-    /// Returns [`CoreError::BulkUnavailable`] only when the error
+    /// Returns [`SqlError::BulkUnavailable`] only when the error
     /// names a *recoverable* condition (target is a non-table
     /// relation that COPY refuses but a generic INSERT with rules
     /// or INSTEAD OF triggers can target), so the Auto dispatcher
@@ -517,14 +511,14 @@ mod pg_text_copy {
     /// matching on the English error message (`"cannot copy
     /// to/from"`) was previously used but is fragile across server
     /// locales and minor version wording changes.
-    pub fn classify_copy_error(e: &tokio_postgres::Error) -> CoreError {
+    pub fn classify_copy_error(e: &tokio_postgres::Error) -> SqlError {
         use tokio_postgres::error::SqlState;
         if let Some(code) = e.code() {
             if *code == SqlState::WRONG_OBJECT_TYPE {
-                return CoreError::BulkUnavailable(format!("PG rejected COPY: {e}"));
+                return SqlError::BulkUnavailable(format!("PG rejected COPY: {e}"));
             }
         }
-        CoreError::QueryFailed(format!("COPY setup: {e}"))
+        SqlError::QueryFailed(format!("COPY setup: {e}"))
     }
 
     #[cfg(test)]
@@ -577,7 +571,10 @@ mod pg_text_copy {
             // would otherwise be parsed as the end-of-data sentinel.
             // Backslash escaped first means input `\.` → `\\.`, which
             // PG decodes back to `\.` as a normal value.
-            assert_eq!(enc1(Value::String("\\.\n".into()), TypeHint::String), "\\\\.\\n");
+            assert_eq!(
+                enc1(Value::String("\\.\n".into()), TypeHint::String),
+                "\\\\.\\n"
+            );
         }
 
         #[test]
@@ -626,7 +623,10 @@ mod pg_text_copy {
             let dt = NaiveDateTime::new(d, t);
             assert_eq!(enc1(Value::Date(d), TypeHint::Date), "2026-05-14");
             assert_eq!(enc1(Value::Time(t), TypeHint::Time), "12:34:56");
-            assert_eq!(enc1(Value::DateTime(dt), TypeHint::DateTime), "2026-05-14 12:34:56");
+            assert_eq!(
+                enc1(Value::DateTime(dt), TypeHint::DateTime),
+                "2026-05-14 12:34:56"
+            );
         }
 
         #[test]
@@ -683,12 +683,14 @@ mod pg_text_copy {
                 Value::Null,
                 Value::Bool(true),
             ];
-            let hints = vec![TypeHint::Int64, TypeHint::String, TypeHint::Null, TypeHint::Bool];
+            let hints = vec![
+                TypeHint::Int64,
+                TypeHint::String,
+                TypeHint::Null,
+                TypeHint::Bool,
+            ];
             let bytes = encode_row(&row, &hints).unwrap();
-            assert_eq!(
-                std::str::from_utf8(&bytes).unwrap(),
-                "1\tAlice\t\\N\tt\n"
-            );
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), "1\tAlice\t\\N\tt\n");
         }
 
         #[test]
@@ -717,11 +719,11 @@ mod pg_text_copy {
 /// binary writer can target without coercion errors. Sources whose
 /// column shape uses [`TypeHint::Other`] cannot be expressed in a
 /// statically-typed `&[Type]` and surface as
-/// [`CoreError::BulkUnavailable`] so the dispatcher can fall back.
+/// [`SqlError::BulkUnavailable`] so the dispatcher can fall back.
 mod pg_binary_copy {
     use super::pg_text_copy;
     use crate::connection::BulkInsert;
-    use crate::error::CoreError;
+    use crate::error::SqlError;
     use crate::value::{TypeHint, Value};
     use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
     use rust_decimal::Decimal;
@@ -739,7 +741,7 @@ mod pg_binary_copy {
         table: &str,
         cols: &str,
         target: &BulkInsert<'_>,
-    ) -> Result<usize, CoreError> {
+    ) -> Result<usize, SqlError> {
         let types: Vec<Type> = target
             .columns
             .iter()
@@ -764,26 +766,27 @@ mod pg_binary_copy {
                 .zip(hints.iter())
                 .map(|(v, h)| value_to_pg_binary_bind(v, *h))
                 .collect::<Result<_, _>>()?;
-            let refs: Vec<&(dyn ToSql + Sync)> = cells.iter().map(PgBinaryBind::as_to_sql).collect();
+            let refs: Vec<&(dyn ToSql + Sync)> =
+                cells.iter().map(PgBinaryBind::as_to_sql).collect();
             writer
                 .as_mut()
                 .write(&refs)
                 .await
-                .map_err(|e| CoreError::QueryFailed(format!("BINARY COPY write: {e}")))?;
+                .map_err(|e| SqlError::QueryFailed(format!("BINARY COPY write: {e}")))?;
         }
 
         let rows = writer
             .as_mut()
             .finish()
             .await
-            .map_err(|e| CoreError::QueryFailed(format!("BINARY COPY finish: {e}")))?;
+            .map_err(|e| SqlError::QueryFailed(format!("BINARY COPY finish: {e}")))?;
         Ok(rows as usize)
     }
 
     /// PG `Type` chosen for each `TypeHint`. Mirrors
     /// [`crate::copy::translate_type`] so a `--create-table` PG
     /// destination matches the binder's expectations.
-    pub(super) fn pg_type_for_hint(hint: TypeHint) -> Result<Type, CoreError> {
+    pub(super) fn pg_type_for_hint(hint: TypeHint) -> Result<Type, SqlError> {
         Ok(match hint {
             TypeHint::Bool => Type::BOOL,
             TypeHint::Int64 => Type::INT8,
@@ -799,7 +802,7 @@ mod pg_binary_copy {
             TypeHint::Uuid => Type::UUID,
             TypeHint::Array => Type::JSONB,
             TypeHint::Null | TypeHint::Other => {
-                return Err(CoreError::BulkUnavailable(format!(
+                return Err(SqlError::BulkUnavailable(format!(
                     "PG binary COPY: cannot bind a column with TypeHint::{hint:?} \
                      (no concrete PG type to declare). Re-run with \
                      --copy-format text or --bulk-native off."
@@ -853,7 +856,7 @@ mod pg_binary_copy {
     pub(super) fn value_to_pg_binary_bind(
         v: &Value,
         hint: TypeHint,
-    ) -> Result<PgBinaryBind, CoreError> {
+    ) -> Result<PgBinaryBind, SqlError> {
         Ok(match (v, hint) {
             (Value::Null, _) => null_bind_for_hint(hint)?,
             (Value::Bool(b), _) => PgBinaryBind::Bool(Some(*b)),
@@ -862,7 +865,7 @@ mod pg_binary_copy {
             (Value::Decimal(s), _) => PgBinaryBind::Numeric(Some(parse_decimal(s)?)),
             (Value::String(s), TypeHint::Uuid) => {
                 PgBinaryBind::Uuid(Some(Uuid::parse_str(s).map_err(|e| {
-                    CoreError::QueryFailed(format!("PG binary COPY: bad UUID '{s}': {e}"))
+                    SqlError::QueryFailed(format!("PG binary COPY: bad UUID '{s}': {e}"))
                 })?))
             }
             (Value::String(s), _) => PgBinaryBind::Text(Some(s.clone())),
@@ -878,21 +881,17 @@ mod pg_binary_copy {
                 // through serde_json::Value so the binder can use the
                 // existing JSONB ToSql impl.
                 let json = serde_json::to_value(arr).map_err(|e| {
-                    CoreError::QueryFailed(format!(
-                        "PG binary COPY: array serialize: {e}"
-                    ))
+                    SqlError::QueryFailed(format!("PG binary COPY: array serialize: {e}"))
                 })?;
                 PgBinaryBind::Json(Some(json))
             }
-            (Value::Uuid(s), _) => {
-                PgBinaryBind::Uuid(Some(Uuid::parse_str(s).map_err(|e| {
-                    CoreError::QueryFailed(format!("PG binary COPY: bad UUID '{s}': {e}"))
-                })?))
-            }
+            (Value::Uuid(s), _) => PgBinaryBind::Uuid(Some(Uuid::parse_str(s).map_err(|e| {
+                SqlError::QueryFailed(format!("PG binary COPY: bad UUID '{s}': {e}"))
+            })?)),
         })
     }
 
-    fn null_bind_for_hint(hint: TypeHint) -> Result<PgBinaryBind, CoreError> {
+    fn null_bind_for_hint(hint: TypeHint) -> Result<PgBinaryBind, SqlError> {
         Ok(match hint {
             TypeHint::Bool => PgBinaryBind::Bool(None),
             TypeHint::Int64 => PgBinaryBind::Int8(None),
@@ -907,16 +906,16 @@ mod pg_binary_copy {
             TypeHint::Json | TypeHint::Array => PgBinaryBind::Json(None),
             TypeHint::Uuid => PgBinaryBind::Uuid(None),
             TypeHint::Null | TypeHint::Other => {
-                return Err(CoreError::BulkUnavailable(format!(
+                return Err(SqlError::BulkUnavailable(format!(
                     "PG binary COPY: cannot type-encode NULL for TypeHint::{hint:?}"
                 )));
             }
         })
     }
 
-    fn parse_decimal(s: &str) -> Result<Decimal, CoreError> {
+    fn parse_decimal(s: &str) -> Result<Decimal, SqlError> {
         Decimal::from_str(s).map_err(|e| {
-            CoreError::QueryFailed(format!("PG binary COPY: invalid NUMERIC '{s}': {e}"))
+            SqlError::QueryFailed(format!("PG binary COPY: invalid NUMERIC '{s}': {e}"))
         })
     }
 
@@ -934,7 +933,10 @@ mod pg_binary_copy {
             assert_eq!(pg_type_for_hint(TypeHint::Bytes).unwrap(), Type::BYTEA);
             assert_eq!(pg_type_for_hint(TypeHint::Date).unwrap(), Type::DATE);
             assert_eq!(pg_type_for_hint(TypeHint::Time).unwrap(), Type::TIME);
-            assert_eq!(pg_type_for_hint(TypeHint::DateTime).unwrap(), Type::TIMESTAMP);
+            assert_eq!(
+                pg_type_for_hint(TypeHint::DateTime).unwrap(),
+                Type::TIMESTAMP
+            );
             assert_eq!(
                 pg_type_for_hint(TypeHint::DateTimeTz).unwrap(),
                 Type::TIMESTAMPTZ
@@ -947,9 +949,9 @@ mod pg_binary_copy {
         #[test]
         fn pg_type_for_hint_other_falls_back_via_bulk_unavailable() {
             let err = pg_type_for_hint(TypeHint::Other).unwrap_err();
-            assert!(matches!(err, CoreError::BulkUnavailable(_)));
+            assert!(matches!(err, SqlError::BulkUnavailable(_)));
             let err = pg_type_for_hint(TypeHint::Null).unwrap_err();
-            assert!(matches!(err, CoreError::BulkUnavailable(_)));
+            assert!(matches!(err, SqlError::BulkUnavailable(_)));
         }
 
         #[test]
@@ -1012,9 +1014,10 @@ mod pg_binary_copy {
             // Garbage input surfaces as QueryFailed (not BulkUnavailable
             // — once the dispatcher commits to binary, malformed
             // numerics aren't recoverable by falling back).
-            let err = value_to_pg_binary_bind(&Value::Decimal("not-a-number".into()), TypeHint::Decimal)
-                .unwrap_err();
-            assert!(matches!(err, CoreError::QueryFailed(_)));
+            let err =
+                value_to_pg_binary_bind(&Value::Decimal("not-a-number".into()), TypeHint::Decimal)
+                    .unwrap_err();
+            assert!(matches!(err, SqlError::QueryFailed(_)));
         }
 
         #[test]
@@ -1025,20 +1028,16 @@ mod pg_binary_copy {
             )
             .unwrap();
             match bind {
-                PgBinaryBind::Uuid(Some(u)) => assert_eq!(
-                    u.to_string(),
-                    "00112233-4455-6677-8899-aabbccddeeff"
-                ),
+                PgBinaryBind::Uuid(Some(u)) => {
+                    assert_eq!(u.to_string(), "00112233-4455-6677-8899-aabbccddeeff")
+                }
                 _ => panic!("expected Uuid"),
             }
         }
 
         #[test]
         fn value_to_bind_array_collapses_to_json() {
-            let arr = vec![
-                Value::String("a".into()),
-                Value::String("b".into()),
-            ];
+            let arr = vec![Value::String("a".into()), Value::String("b".into())];
             let bind = value_to_pg_binary_bind(&Value::Array(arr), TypeHint::Array).unwrap();
             match bind {
                 PgBinaryBind::Json(Some(v)) => {
@@ -1053,7 +1052,7 @@ mod pg_binary_copy {
 pub async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
-) -> Result<PostgresConnection, CoreError> {
+) -> Result<PostgresConnection, SqlError> {
     let config = match url.raw().parse::<tokio_postgres::Config>() {
         Ok(cfg) => cfg,
         Err(_) => build_config_from_url(url)?,
@@ -1061,12 +1060,12 @@ pub async fn connect(
 
     let tls_connector = build_tls_connector(opts)
         .await
-        .map_err(CoreError::TlsError)?;
+        .map_err(SqlError::TlsError)?;
 
     let (client, connection) = config
         .connect(tls_connector)
         .await
-        .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+        .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -1090,7 +1089,7 @@ pub async fn connect_with_stream<S>(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
     stream: S,
-) -> Result<PostgresConnection, CoreError>
+) -> Result<PostgresConnection, SqlError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1103,18 +1102,18 @@ where
 
     let mut make_tls = build_tls_connector(opts)
         .await
-        .map_err(CoreError::TlsError)?;
+        .map_err(SqlError::TlsError)?;
     let hostname = url.host().unwrap_or("localhost");
     let tls = <tokio_postgres_rustls::MakeRustlsConnect as MakeTlsConnect<S>>::make_tls_connect(
         &mut make_tls,
         hostname,
     )
-    .map_err(|e| CoreError::TlsError(format!("make_tls_connect failed: {e:?}")))?;
+    .map_err(|e| SqlError::TlsError(format!("make_tls_connect failed: {e:?}")))?;
 
     let (client, connection) = config
         .connect_raw(stream, tls)
         .await
-        .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+        .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -1125,7 +1124,7 @@ where
     Ok(PostgresConnection { client })
 }
 
-fn build_config_from_url(url: &DatabaseUrl) -> Result<tokio_postgres::Config, CoreError> {
+fn build_config_from_url(url: &DatabaseUrl) -> Result<tokio_postgres::Config, SqlError> {
     let mut config = tokio_postgres::Config::new();
     if let Some(host) = url.host() {
         config.host(host);
@@ -1505,9 +1504,7 @@ mod tests {
 
         let pid = std::process::id();
         let table = format!("ferrule_bulk_test_{pid}");
-        let _ = conn
-            .execute(&format!("DROP TABLE IF EXISTS {table}"))
-            .await;
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}")).await;
         conn.execute(&format!(
             "CREATE TABLE {table} (\
                id BIGINT, \
@@ -1522,12 +1519,36 @@ mod tests {
         .expect("CREATE TABLE");
 
         let columns = vec![
-            ColumnInfo { name: "id".into(), type_hint: TypeHint::Int64, nullable: false },
-            ColumnInfo { name: "name".into(), type_hint: TypeHint::String, nullable: true },
-            ColumnInfo { name: "active".into(), type_hint: TypeHint::Bool, nullable: true },
-            ColumnInfo { name: "score".into(), type_hint: TypeHint::Float64, nullable: true },
-            ColumnInfo { name: "meta".into(), type_hint: TypeHint::Json, nullable: true },
-            ColumnInfo { name: "tricky".into(), type_hint: TypeHint::String, nullable: true },
+            ColumnInfo {
+                name: "id".into(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "name".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "active".into(),
+                type_hint: TypeHint::Bool,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "score".into(),
+                type_hint: TypeHint::Float64,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "meta".into(),
+                type_hint: TypeHint::Json,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "tricky".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
         ];
 
         // Five rows. Row 3 hits the backslash/tab/newline escape
@@ -1595,19 +1616,23 @@ mod tests {
         assert!(matches!(count.rows[0][0], Value::Int64(5)));
 
         let r3 = conn
-            .query(&format!(
-                "SELECT name, tricky FROM {table} WHERE id = 3"
-            ))
+            .query(&format!("SELECT name, tricky FROM {table} WHERE id = 3"))
             .await
             .unwrap();
         assert_eq!(r3.rows.len(), 1);
         if let Value::String(name) = &r3.rows[0][0] {
-            assert_eq!(name, "Esc\\\t\nape", "row 3 name should round-trip with raw bytes");
+            assert_eq!(
+                name, "Esc\\\t\nape",
+                "row 3 name should round-trip with raw bytes"
+            );
         } else {
             panic!("row 3 name should be String, got {:?}", r3.rows[0][0]);
         }
         if let Value::String(tricky) = &r3.rows[0][1] {
-            assert_eq!(tricky, "\\.", "row 3 tricky should be literal backslash-dot");
+            assert_eq!(
+                tricky, "\\.",
+                "row 3 tricky should be literal backslash-dot"
+            );
         } else {
             panic!("row 3 tricky should be String, got {:?}", r3.rows[0][1]);
         }
@@ -1695,8 +1720,12 @@ mod tests {
         let pid = std::process::id();
         let src_table = format!("ferrule_pg_skip_src_{pid}");
         let dst_table = format!("ferrule_pg_skip_dst_{pid}");
-        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}")).await;
+        let _ = src
+            .execute(&format!("DROP TABLE IF EXISTS {src_table}"))
+            .await;
+        let _ = dst
+            .execute(&format!("DROP TABLE IF EXISTS {dst_table}"))
+            .await;
         src.execute(&format!(
             "CREATE TABLE {src_table} (id INT PRIMARY KEY, name TEXT, val INT)"
         ))
@@ -1725,9 +1754,15 @@ mod tests {
             if_exists: IfExists::Skip,
             ..Default::default()
         };
-        copy_rows(&mut src, Backend::Postgres, &mut dst, Backend::Postgres, &opts)
-            .await
-            .expect("copy_rows skip");
+        copy_rows(
+            &mut src,
+            Backend::Postgres,
+            &mut dst,
+            Backend::Postgres,
+            &opts,
+        )
+        .await
+        .expect("copy_rows skip");
 
         let out = dst
             .query(&format!(
@@ -1748,9 +1783,15 @@ mod tests {
             if_exists: IfExists::Upsert,
             ..Default::default()
         };
-        copy_rows(&mut src, Backend::Postgres, &mut dst, Backend::Postgres, &opts)
-            .await
-            .expect("copy_rows upsert");
+        copy_rows(
+            &mut src,
+            Backend::Postgres,
+            &mut dst,
+            Backend::Postgres,
+            &opts,
+        )
+        .await
+        .expect("copy_rows upsert");
 
         let out = dst
             .query(&format!(
@@ -1815,8 +1856,7 @@ mod tests {
         .expect("seed child");
 
         // Fresh on-disk SQLite destination.
-        let dst_path = std::env::temp_dir()
-            .join(format!("ferrule-pg-all-tables-{pid}.db"));
+        let dst_path = std::env::temp_dir().join(format!("ferrule-pg-all-tables-{pid}.db"));
         let _ = std::fs::remove_file(&dst_path);
         let dst_url = DatabaseUrl::parse(&format!("sqlite://{}", dst_path.display())).unwrap();
         let mut dst = sqlite_connect(&dst_url, &ConnectOptions::default())
@@ -1829,9 +1869,15 @@ mod tests {
             create_table: true,
             ..Default::default()
         };
-        let copied = copy_all_tables(&mut src, Backend::Postgres, &mut dst, Backend::Sqlite, &opts)
-            .await
-            .expect("copy_all_tables PG -> SQLite");
+        let copied = copy_all_tables(
+            &mut src,
+            Backend::Postgres,
+            &mut dst,
+            Backend::Sqlite,
+            &opts,
+        )
+        .await
+        .expect("copy_all_tables PG -> SQLite");
         assert_eq!(copied, 4, "2 parent rows + 2 child rows expected");
 
         let p = dst
@@ -1872,8 +1918,12 @@ mod tests {
         let pid = std::process::id();
         let src_table = format!("ferrule_pg_bin_src_{pid}");
         let dst_table = format!("ferrule_pg_bin_dst_{pid}");
-        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}")).await;
+        let _ = src
+            .execute(&format!("DROP TABLE IF EXISTS {src_table}"))
+            .await;
+        let _ = dst
+            .execute(&format!("DROP TABLE IF EXISTS {dst_table}"))
+            .await;
         // One column per TypeHint that maps to a concrete PG type in
         // pg_type_for_hint. Order matches the binary writer's expected
         // shape: any mismatch surfaces as a wire error during write().
@@ -1926,9 +1976,15 @@ mod tests {
             copy_format: CopyFormat::Binary,
             ..Default::default()
         };
-        let copied = copy_rows(&mut src, Backend::Postgres, &mut dst, Backend::Postgres, &opts)
-            .await
-            .expect("copy_rows binary COPY");
+        let copied = copy_rows(
+            &mut src,
+            Backend::Postgres,
+            &mut dst,
+            Backend::Postgres,
+            &opts,
+        )
+        .await
+        .expect("copy_rows binary COPY");
         assert_eq!(copied, 2);
 
         // Read back and assert byte-equivalence per column.

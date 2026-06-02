@@ -26,17 +26,17 @@ pub mod exit {
 /// CLI-level error type.
 ///
 /// Every variant carries a semantic category that maps to a stable exit code.
-/// Library errors (`CoreError`, `ConfigError`) are *not* given blanket `From`
-/// impls because the same `CoreError` can mean "connection" in one command and
+/// Library errors (`SqlError`, `ConfigError`) are *not* given blanket `From`
+/// impls because the same `SqlError` can mean "connection" in one command and
 /// "query" in another.  Each call site must explicitly choose its category via
 /// the constructors below so that exit-code classification is never implicit.
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("connection failed: {0}")]
-    Connection(ferrule_core::CoreError),
+    Connection(ferrule_sql::SqlError),
 
     #[error("query failed: {0}")]
-    Query(ferrule_core::CoreError),
+    Query(ferrule_sql::SqlError),
 
     #[error("registry error: {0}")]
     Registry(ferrule_config::error::ConfigError),
@@ -58,11 +58,11 @@ pub enum CliError {
 }
 
 impl CliError {
-    pub fn connection(e: ferrule_core::CoreError) -> Self {
+    pub fn connection(e: ferrule_sql::SqlError) -> Self {
         Self::Connection(e)
     }
 
-    pub fn query(e: ferrule_core::CoreError) -> Self {
+    pub fn query(e: ferrule_sql::SqlError) -> Self {
         Self::Query(e)
     }
 

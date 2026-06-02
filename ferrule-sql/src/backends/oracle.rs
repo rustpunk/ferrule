@@ -2,7 +2,7 @@ use crate::connection::{
     BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
     StatementResult,
 };
-use crate::error::CoreError;
+use crate::error::SqlError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, TypeHint, Value};
 use async_trait::async_trait;
@@ -18,32 +18,32 @@ pub struct OracleConnection {
 
 #[async_trait]
 impl Connection for OracleConnection {
-    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError> {
+    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
         let sql = sql.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let stmt = conn
                 .execute(&sql, &[])
-                .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
             let row_count = stmt
                 .row_count()
-                .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
             Ok(ExecutionSummary {
                 rows_affected: Some(row_count),
                 command_tag: None,
             })
         })
         .await
-        .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+        .map_err(|e| SqlError::QueryFailed(e.to_string()))?
     }
 
-    async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError> {
+    async fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
         let sql = sql.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let result_set = conn
                 .query(&sql, &[])
-                .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
             let col_info: Vec<ColumnInfo> = result_set
                 .column_info()
@@ -57,7 +57,7 @@ impl Connection for OracleConnection {
 
             let mut rows = Vec::new();
             for row_result in result_set {
-                let row = row_result.map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                let row = row_result.map_err(|e| SqlError::QueryFailed(e.to_string()))?;
                 let values: Vec<Value> = row
                     .sql_values()
                     .iter()
@@ -75,12 +75,12 @@ impl Connection for OracleConnection {
             })
         })
         .await
-        .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+        .map_err(|e| SqlError::QueryFailed(e.to_string()))?
     }
 
-    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, CoreError> {
+    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
         let statements =
-            split_oracle_statements(sql).map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            split_oracle_statements(sql).map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         let mut results = Vec::with_capacity(statements.len());
         for stmt in statements {
             let stmt = stmt.trim();
@@ -89,7 +89,7 @@ impl Connection for OracleConnection {
             }
             match self.query(stmt).await {
                 Ok(result) => results.push(StatementResult::Query(result)),
-                Err(CoreError::QueryFailed(_)) => {
+                Err(SqlError::QueryFailed(_)) => {
                     let summary = self.execute(stmt).await?;
                     results.push(StatementResult::Summary(summary));
                 }
@@ -99,17 +99,17 @@ impl Connection for OracleConnection {
         Ok(results)
     }
 
-    async fn ping(&mut self) -> Result<(), CoreError> {
+    async fn ping(&mut self) -> Result<(), SqlError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             conn.ping()
-                .map_err(|e| CoreError::ConnectionFailed(e.to_string()))
+                .map_err(|e| SqlError::ConnectionFailed(e.to_string()))
         })
         .await
-        .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?
+        .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?
     }
 
-    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError> {
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
         let sql = match schema {
             Some(s) => format!(
                 "SELECT table_name FROM all_tables WHERE owner = '{}' ORDER BY table_name",
@@ -135,7 +135,7 @@ impl Connection for OracleConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<QueryResult, CoreError> {
+    ) -> Result<QueryResult, SqlError> {
         let sql = match schema {
             Some(s) => format!(
                 "SELECT column_name, data_type, nullable, data_default, data_precision, data_scale \
@@ -160,7 +160,7 @@ impl Connection for OracleConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<Vec<String>, CoreError> {
+    ) -> Result<Vec<String>, SqlError> {
         // `all_constraints.constraint_type = 'P'` is the PK; join
         // `all_cons_columns` for key positions.
         let sql = match schema {
@@ -200,7 +200,7 @@ impl Connection for OracleConnection {
     async fn list_foreign_keys(
         &mut self,
         schema: Option<&str>,
-    ) -> Result<Vec<ForeignKey>, CoreError> {
+    ) -> Result<Vec<ForeignKey>, SqlError> {
         // FK rows live in `all_constraints` with constraint_type 'R'.
         // The referenced PK is on the parent's constraint, joined
         // via `r_constraint_name`. `delete_rule` is on the FK itself.
@@ -275,10 +275,7 @@ impl Connection for OracleConnection {
         Ok(map.into_values().collect())
     }
 
-    async fn bulk_insert_rows(
-        &mut self,
-        target: BulkInsert<'_>,
-    ) -> Result<usize, CoreError> {
+    async fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError> {
         if target.rows.is_empty() {
             return Ok(0);
         }
@@ -287,8 +284,7 @@ impl Connection for OracleConnection {
         // Build the parameterized INSERT once: `:1, :2, ...`. Bind
         // by position, not by name — matches our positional `Row`
         // shape and avoids per-column name negotiation.
-        let qtable =
-            crate::copy::quote_identifier(target.table, crate::backend::Backend::Oracle);
+        let qtable = crate::copy::quote_identifier(target.table, crate::backend::Backend::Oracle);
         let cols = target
             .columns
             .iter()
@@ -328,19 +324,17 @@ impl Connection for OracleConnection {
                 .map_err(map_oracle_bulk_error)?;
             for row in &owned_rows {
                 let binds: Vec<&dyn ToSql> = row.iter().map(|b| b.as_to_sql()).collect();
-                batch
-                    .append_row(&binds)
-                    .map_err(map_oracle_bulk_error)?;
+                batch.append_row(&binds).map_err(map_oracle_bulk_error)?;
             }
             // Always flush at the end. `append_row` auto-executes
             // when `batch_index == batch_size`, but a leading
             // execute() is a no-op on an empty batch, so this is
             // idempotent and safer than relying on auto-execute.
             batch.execute().map_err(map_oracle_bulk_error)?;
-            Ok::<usize, CoreError>(row_count)
+            Ok::<usize, SqlError>(row_count)
         })
         .await
-        .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+        .map_err(|e| SqlError::QueryFailed(e.to_string()))?
     }
 }
 
@@ -360,7 +354,7 @@ impl Connection for OracleConnection {
 /// ORA-26026 / ORA-12838 from direct-path inserts are reserved for
 /// the future `--oracle-direct-path` opt-in (#37), where falling
 /// back to safe array-DML is the right behaviour.
-fn map_oracle_bulk_error(e: oracle::Error) -> CoreError {
+fn map_oracle_bulk_error(e: oracle::Error) -> SqlError {
     let msg = e.to_string();
     // dpi_code is typed `Option<i32>`. ODPI-C 1047 is the
     // Instant-Client-not-loaded structural error (see the connect
@@ -368,12 +362,10 @@ fn map_oracle_bulk_error(e: oracle::Error) -> CoreError {
     // because we'd have failed at connect time, but defend in depth.
     if let Some(code) = e.dpi_code() {
         if code == 1047 || msg.contains("libclntsh") {
-            return CoreError::ConnectionFailed(format!(
-                "Oracle Instant Client not loaded: {msg}"
-            ));
+            return SqlError::ConnectionFailed(format!("Oracle Instant Client not loaded: {msg}"));
         }
     }
-    CoreError::QueryFailed(format!("Oracle bulk: {msg}"))
+    SqlError::QueryFailed(format!("Oracle bulk: {msg}"))
 }
 
 /// Owned, typed binding for a single column slot in one row of an
@@ -430,7 +422,7 @@ impl OwnedBind {
 /// the typed-NULL variant so per-column bind metadata stays stable
 /// across rows) and for [`Value::Time`] (Oracle has no TIME type;
 /// we pair the time with an epoch date for TIMESTAMP coercion).
-fn value_to_oracle_bind(v: &Value, hint: TypeHint) -> Result<OwnedBind, CoreError> {
+fn value_to_oracle_bind(v: &Value, hint: TypeHint) -> Result<OwnedBind, SqlError> {
     Ok(match v {
         Value::Null => null_bind_for_hint(hint),
         Value::Bool(b) => OwnedBind::I64(Some(if *b { 1 } else { 0 })),
@@ -462,9 +454,8 @@ fn value_to_oracle_bind(v: &Value, hint: TypeHint) -> Result<OwnedBind, CoreErro
         Value::DateTime(dt) => OwnedBind::DateTime(Some(*dt)),
         Value::DateTimeTz(dt) => OwnedBind::DateTimeTz(Some(*dt)),
         Value::Json(j) => {
-            let rendered = serde_json::to_string(j).map_err(|e| {
-                CoreError::QueryFailed(format!("Oracle bulk: JSON serialize: {e}"))
-            })?;
+            let rendered = serde_json::to_string(j)
+                .map_err(|e| SqlError::QueryFailed(format!("Oracle bulk: JSON serialize: {e}")))?;
             OwnedBind::Text(Some(rendered))
         }
         Value::Uuid(s) => {
@@ -472,16 +463,14 @@ fn value_to_oracle_bind(v: &Value, hint: TypeHint) -> Result<OwnedBind, CoreErro
             // hex form into 16 bytes; reject malformed input as a
             // hard error (QueryFailed) — same outcome as the
             // generic INSERT path would have hit.
-            let parsed = parse_uuid_hex(s).map_err(|e| {
-                CoreError::QueryFailed(format!("Oracle bulk: UUID {s:?}: {e}"))
-            })?;
+            let parsed = parse_uuid_hex(s)
+                .map_err(|e| SqlError::QueryFailed(format!("Oracle bulk: UUID {s:?}: {e}")))?;
             OwnedBind::Bytes(Some(parsed))
         }
         Value::Array(a) => {
             // Oracle DDL maps Array → CLOB; serialize compact JSON.
-            let rendered = serde_json::to_string(a).map_err(|e| {
-                CoreError::QueryFailed(format!("Oracle bulk: array serialize: {e}"))
-            })?;
+            let rendered = serde_json::to_string(a)
+                .map_err(|e| SqlError::QueryFailed(format!("Oracle bulk: array serialize: {e}")))?;
             OwnedBind::Text(Some(rendered))
         }
     })
@@ -563,7 +552,7 @@ fn parse_uuid_hex(s: &str) -> Result<Vec<u8>, String> {
 pub async fn connect(
     url: &DatabaseUrl,
     _opts: &ConnectOptions,
-) -> Result<OracleConnection, CoreError> {
+) -> Result<OracleConnection, SqlError> {
     let host = url.host().unwrap_or("localhost").to_string();
     let port = url.port().unwrap_or(1521);
     let username = url.username().to_string();
@@ -587,7 +576,7 @@ pub async fn connect(
         })
     })
     .await
-    .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?
+    .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?
 }
 
 /// Split a SQL string into individual statements by `;`.
@@ -755,10 +744,10 @@ fn end_suffix(bytes: &[u8], end_pos: usize) -> Option<&'static str> {
         .find(|kw| matches_keyword(bytes, j, kw))
 }
 
-fn map_oracle_error(e: oracle::Error) -> CoreError {
+fn map_oracle_error(e: oracle::Error) -> SqlError {
     let msg = e.to_string();
     if e.dpi_code() == Some(1047) || msg.contains("libclntsh") {
-        CoreError::ConnectionFailed(format!(
+        SqlError::ConnectionFailed(format!(
             "Oracle Instant Client not found. Install it from \
              https://www.oracle.com/database/technologies/instant-client/downloads.html \
              and ensure it is on your LD_LIBRARY_PATH (Linux), DYLD_LIBRARY_PATH (macOS), \
@@ -766,7 +755,7 @@ fn map_oracle_error(e: oracle::Error) -> CoreError {
             msg
         ))
     } else {
-        CoreError::ConnectionFailed(msg)
+        SqlError::ConnectionFailed(msg)
     }
 }
 
@@ -1162,21 +1151,19 @@ mod tests {
 
     #[test]
     fn parse_uuid_with_dashes_round_trips() {
-        let bytes =
-            parse_uuid_hex("550e8400-e29b-41d4-a716-446655440000").expect("parse");
+        let bytes = parse_uuid_hex("550e8400-e29b-41d4-a716-446655440000").expect("parse");
         assert_eq!(
             bytes,
             vec![
-                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66,
-                0x55, 0x44, 0x00, 0x00
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00
             ]
         );
     }
 
     #[test]
     fn parse_uuid_without_dashes_works() {
-        let bytes =
-            parse_uuid_hex("550e8400e29b41d4a716446655440000").expect("parse");
+        let bytes = parse_uuid_hex("550e8400e29b41d4a716446655440000").expect("parse");
         assert_eq!(bytes.len(), 16);
     }
 
@@ -1205,8 +1192,8 @@ mod tests {
             "urn:UUID:",
         ] {
             let s = format!("{prefix}550e8400-e29b-41d4-a716-446655440000");
-            let parsed =
-                parse_uuid_hex(&s).unwrap_or_else(|e| panic!("prefix {prefix:?} should parse: {e}"));
+            let parsed = parse_uuid_hex(&s)
+                .unwrap_or_else(|e| panic!("prefix {prefix:?} should parse: {e}"));
             assert_eq!(parsed, canonical, "prefix {prefix:?} mismatch");
         }
     }
@@ -1214,8 +1201,7 @@ mod tests {
     #[test]
     fn parse_uuid_accepts_curly_brace_form() {
         // Microsoft / .NET registry form: `{550e8400-...}`.
-        let bytes =
-            parse_uuid_hex("{550e8400-e29b-41d4-a716-446655440000}").expect("parse");
+        let bytes = parse_uuid_hex("{550e8400-e29b-41d4-a716-446655440000}").expect("parse");
         assert_eq!(bytes.len(), 16);
         // Also accepts braces around the no-dash form.
         let bytes2 = parse_uuid_hex("{550e8400e29b41d4a716446655440000}").expect("parse");
@@ -1224,17 +1210,14 @@ mod tests {
 
     #[test]
     fn parse_uuid_accepts_uppercase_hex() {
-        let bytes =
-            parse_uuid_hex("550E8400-E29B-41D4-A716-446655440000").expect("parse");
-        let lower =
-            parse_uuid_hex("550e8400-e29b-41d4-a716-446655440000").expect("parse");
+        let bytes = parse_uuid_hex("550E8400-E29B-41D4-A716-446655440000").expect("parse");
+        let lower = parse_uuid_hex("550e8400-e29b-41d4-a716-446655440000").expect("parse");
         assert_eq!(bytes, lower);
     }
 
     #[test]
     fn parse_uuid_trims_surrounding_whitespace() {
-        let bytes =
-            parse_uuid_hex("  550e8400-e29b-41d4-a716-446655440000\t\n").expect("parse");
+        let bytes = parse_uuid_hex("  550e8400-e29b-41d4-a716-446655440000\t\n").expect("parse");
         assert_eq!(bytes.len(), 16);
     }
 
@@ -1255,8 +1238,7 @@ mod tests {
             "URN:UUID:  550e8400-e29b-41d4-a716-446655440000",
             "Urn:Uuid:\t550e8400-e29b-41d4-a716-446655440000",
         ] {
-            let parsed =
-                parse_uuid_hex(shape).unwrap_or_else(|e| panic!("shape {shape:?}: {e}"));
+            let parsed = parse_uuid_hex(shape).unwrap_or_else(|e| panic!("shape {shape:?}: {e}"));
             assert_eq!(parsed, canonical, "shape {shape:?} should round-trip");
         }
     }
@@ -1297,15 +1279,18 @@ mod tests {
         ));
         match value_to_oracle_bind(&Value::Decimal("99.5".into()), TypeHint::Decimal).unwrap() {
             OwnedBind::Text(Some(s)) => assert_eq!(s, "99.5"),
-            other => panic!("expected Text, got {other:?}", other = match other {
-                OwnedBind::I64(_) => "I64",
-                OwnedBind::F64(_) => "F64",
-                OwnedBind::Text(_) => "Text",
-                OwnedBind::Bytes(_) => "Bytes",
-                OwnedBind::Date(_) => "Date",
-                OwnedBind::DateTime(_) => "DateTime",
-                OwnedBind::DateTimeTz(_) => "DateTimeTz",
-            }),
+            other => panic!(
+                "expected Text, got {other:?}",
+                other = match other {
+                    OwnedBind::I64(_) => "I64",
+                    OwnedBind::F64(_) => "F64",
+                    OwnedBind::Text(_) => "Text",
+                    OwnedBind::Bytes(_) => "Bytes",
+                    OwnedBind::Date(_) => "Date",
+                    OwnedBind::DateTime(_) => "DateTime",
+                    OwnedBind::DateTimeTz(_) => "DateTimeTz",
+                }
+            ),
         }
         match value_to_oracle_bind(
             &Value::Json(serde_json::json!({"role": "admin"})),
@@ -1429,9 +1414,7 @@ mod tests {
 
         let pid = std::process::id();
         let table = format!("ferrule_bulk_test_{pid}");
-        let _ = conn
-            .execute(&format!("DROP TABLE {table}"))
-            .await;
+        let _ = conn.execute(&format!("DROP TABLE {table}")).await;
         conn.execute(&format!(
             "CREATE TABLE {table} (\
                id NUMBER(19) NOT NULL, \
@@ -1446,12 +1429,36 @@ mod tests {
         .expect("CREATE TABLE");
 
         let columns = vec![
-            ColumnInfo { name: "id".into(), type_hint: TypeHint::Int64, nullable: false },
-            ColumnInfo { name: "name".into(), type_hint: TypeHint::String, nullable: true },
-            ColumnInfo { name: "active".into(), type_hint: TypeHint::Bool, nullable: true },
-            ColumnInfo { name: "score".into(), type_hint: TypeHint::Decimal, nullable: true },
-            ColumnInfo { name: "meta".into(), type_hint: TypeHint::Json, nullable: true },
-            ColumnInfo { name: "guid".into(), type_hint: TypeHint::Uuid, nullable: true },
+            ColumnInfo {
+                name: "id".into(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "name".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "active".into(),
+                type_hint: TypeHint::Bool,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "score".into(),
+                type_hint: TypeHint::Decimal,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "meta".into(),
+                type_hint: TypeHint::Json,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "guid".into(),
+                type_hint: TypeHint::Uuid,
+                nullable: true,
+            },
         ];
 
         let rows: Vec<crate::value::Row> = vec![
@@ -1523,9 +1530,7 @@ mod tests {
         assert!(matches!(&result.rows[2][3], Value::Null));
         assert!(matches!(&result.rows[2][4], Value::Null));
 
-        let _ = conn
-            .execute(&format!("DROP TABLE {table}"))
-            .await;
+        let _ = conn.execute(&format!("DROP TABLE {table}")).await;
     }
 
     #[tokio::test]
@@ -1570,8 +1575,15 @@ mod tests {
             .await
             .expect("list_foreign_keys");
         let child_upper = child.to_uppercase();
-        let matching: Vec<_> = fks.iter().filter(|fk| fk.child_table == child_upper).collect();
-        assert_eq!(matching.len(), 1, "expected 1 FK from {child_upper}, got {fks:?}");
+        let matching: Vec<_> = fks
+            .iter()
+            .filter(|fk| fk.child_table == child_upper)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected 1 FK from {child_upper}, got {fks:?}"
+        );
         let fk = matching[0];
         assert_eq!(fk.child_columns, vec!["USER_ID".to_string()]);
         assert_eq!(fk.parent_table, "TEST_USERS");
@@ -1612,21 +1624,15 @@ mod tests {
         ))
         .await
         .expect("CREATE dst");
-        src.execute(&format!(
-            "INSERT INTO {src_table} VALUES (1, 'new-1', 10)"
-        ))
-        .await
-        .expect("seed src 1");
-        src.execute(&format!(
-            "INSERT INTO {src_table} VALUES (2, 'new-2', 20)"
-        ))
-        .await
-        .expect("seed src 2");
-        dst.execute(&format!(
-            "INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"
-        ))
-        .await
-        .expect("seed dst");
+        src.execute(&format!("INSERT INTO {src_table} VALUES (1, 'new-1', 10)"))
+            .await
+            .expect("seed src 1");
+        src.execute(&format!("INSERT INTO {src_table} VALUES (2, 'new-2', 20)"))
+            .await
+            .expect("seed src 2");
+        dst.execute(&format!("INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"))
+            .await
+            .expect("seed dst");
         // Oracle has no autocommit on `execute`; flush both connections.
         src.execute("COMMIT").await.expect("commit src");
         dst.execute("COMMIT").await.expect("commit dst");

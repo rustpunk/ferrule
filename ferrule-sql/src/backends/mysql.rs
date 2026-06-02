@@ -2,7 +2,7 @@ use crate::connection::{
     BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
     StatementResult,
 };
-use crate::error::CoreError;
+use crate::error::SqlError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
@@ -18,11 +18,11 @@ pub struct MySqlConnection {
 
 #[async_trait]
 impl Connection for MySqlConnection {
-    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError> {
+    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
         self.conn
             .query_drop(sql)
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         let affected = self.conn.affected_rows();
         Ok(ExecutionSummary {
             rows_affected: Some(affected),
@@ -30,12 +30,12 @@ impl Connection for MySqlConnection {
         })
     }
 
-    async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError> {
+    async fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
         let mut result = self
             .conn
             .query_iter(sql)
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         let columns_ref = result.columns_ref();
         let columns: Vec<ColumnInfo> = columns_ref
@@ -50,13 +50,13 @@ impl Connection for MySqlConnection {
         let mysql_rows = result
             .collect::<mysql_async::Row>()
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         // Discard any remaining result sets so the connection stays clean.
         result
             .drop_result()
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         let rows: Vec<Row> = mysql_rows
             .into_iter()
@@ -77,12 +77,12 @@ impl Connection for MySqlConnection {
         Ok(QueryResult { columns, rows })
     }
 
-    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, CoreError> {
+    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
         let mut result = self
             .conn
             .query_iter(sql)
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         let mut results = Vec::new();
 
@@ -93,7 +93,7 @@ impl Connection for MySqlConnection {
                 result
                     .collect::<mysql_async::Row>()
                     .await
-                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
                 results.push(StatementResult::Summary(ExecutionSummary {
                     rows_affected: Some(affected),
                     command_tag: None,
@@ -111,7 +111,7 @@ impl Connection for MySqlConnection {
                 let mysql_rows = result
                     .collect::<mysql_async::Row>()
                     .await
-                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
                 let rows: Vec<Row> = mysql_rows
                     .into_iter()
@@ -140,15 +140,15 @@ impl Connection for MySqlConnection {
         Ok(results)
     }
 
-    async fn ping(&mut self) -> Result<(), CoreError> {
+    async fn ping(&mut self) -> Result<(), SqlError> {
         self.conn
             .ping()
             .await
-            .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
         Ok(())
     }
 
-    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError> {
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
         let sql = match schema {
             Some(s) => format!("SHOW TABLES FROM `{}`", escape_mysql_identifier(s)),
             None => "SHOW TABLES".to_string(),
@@ -171,7 +171,7 @@ impl Connection for MySqlConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<QueryResult, CoreError> {
+    ) -> Result<QueryResult, SqlError> {
         let schema = match schema {
             Some(s) => s.to_string(),
             None => {
@@ -209,7 +209,7 @@ impl Connection for MySqlConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<Vec<String>, CoreError> {
+    ) -> Result<Vec<String>, SqlError> {
         let schema = match schema {
             Some(s) => s.to_string(),
             None => current_database(self).await?,
@@ -238,7 +238,7 @@ impl Connection for MySqlConnection {
     async fn list_foreign_keys(
         &mut self,
         schema: Option<&str>,
-    ) -> Result<Vec<ForeignKey>, CoreError> {
+    ) -> Result<Vec<ForeignKey>, SqlError> {
         let schema = match schema {
             Some(s) => s.to_string(),
             None => current_database(self).await?,
@@ -298,10 +298,7 @@ impl Connection for MySqlConnection {
         Ok(map.into_values().collect())
     }
 
-    async fn bulk_insert_rows(
-        &mut self,
-        target: BulkInsert<'_>,
-    ) -> Result<usize, CoreError> {
+    async fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError> {
         if target.rows.is_empty() {
             return Ok(0);
         }
@@ -409,7 +406,7 @@ impl Connection for MySqlConnection {
 pub async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
-) -> Result<MySqlConnection, CoreError> {
+) -> Result<MySqlConnection, SqlError> {
     let mut builder = mysql_async::OptsBuilder::default()
         .ip_or_hostname(url.host().unwrap_or("localhost"))
         .tcp_port(url.port().unwrap_or(3306));
@@ -460,7 +457,7 @@ pub async fn connect(
     let conn_opts: mysql_async::Opts = builder.into();
     let conn = mysql_async::Conn::new(conn_opts)
         .await
-        .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+        .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
 
     Ok(MySqlConnection { conn })
 }
@@ -596,7 +593,7 @@ fn parse_naive_datetime(s: &str) -> Option<NaiveDateTime> {
         .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
 }
 
-async fn current_database(conn: &mut MySqlConnection) -> Result<String, CoreError> {
+async fn current_database(conn: &mut MySqlConnection) -> Result<String, SqlError> {
     let result = conn.query("SELECT DATABASE()").await?;
     Ok(result
         .rows
@@ -637,12 +634,12 @@ fn escape_mysql_string(s: &str) -> String {
 /// — which may contain arbitrary non-UTF-8 bytes — can flow into a
 /// BLOB column without lossy conversion.
 mod my_load_data {
-    use crate::error::CoreError;
+    use crate::error::SqlError;
     use crate::value::{TypeHint, Value};
     use bytes::Bytes;
 
     /// Encode one row.
-    pub fn encode_row(row: &[Value], hints: &[TypeHint]) -> Result<Bytes, CoreError> {
+    pub fn encode_row(row: &[Value], hints: &[TypeHint]) -> Result<Bytes, SqlError> {
         let mut buf: Vec<u8> = Vec::with_capacity(row.len() * 16 + 1);
         for (i, value) in row.iter().enumerate() {
             if i > 0 {
@@ -655,7 +652,7 @@ mod my_load_data {
         Ok(Bytes::from(buf))
     }
 
-    fn encode_value(out: &mut Vec<u8>, v: &Value, hint: TypeHint) -> Result<(), CoreError> {
+    fn encode_value(out: &mut Vec<u8>, v: &Value, hint: TypeHint) -> Result<(), SqlError> {
         match v {
             Value::Null => out.extend_from_slice(b"\\N"),
             Value::Bool(b) => out.push(if *b { b'1' } else { b'0' }),
@@ -692,7 +689,7 @@ mod my_load_data {
             }
             Value::Json(j) => {
                 let rendered = serde_json::to_string(j).map_err(|e| {
-                    CoreError::QueryFailed(format!("MySQL bulk: JSON serialize: {e}"))
+                    SqlError::QueryFailed(format!("MySQL bulk: JSON serialize: {e}"))
                 })?;
                 push_escaped(out, rendered.as_bytes());
             }
@@ -701,7 +698,7 @@ mod my_load_data {
                 // DDL translator maps Array → JSON on MySQL.
                 let _ = hint;
                 let rendered = serde_json::to_string(a).map_err(|e| {
-                    CoreError::QueryFailed(format!("MySQL bulk: array serialize: {e}"))
+                    SqlError::QueryFailed(format!("MySQL bulk: array serialize: {e}"))
                 })?;
                 push_escaped(out, rendered.as_bytes());
             }
@@ -740,9 +737,9 @@ mod my_load_data {
     /// Classify a `mysql_async::Error` raised by `LOAD DATA LOCAL
     /// INFILE`. Server error codes for "loading local data is
     /// disabled" / "command not allowed" return
-    /// [`CoreError::BulkUnavailable`] so the Auto dispatcher can
+    /// [`SqlError::BulkUnavailable`] so the Auto dispatcher can
     /// fall back. Anything else stays `QueryFailed`.
-    pub fn classify_load_error(e: mysql_async::Error) -> CoreError {
+    pub fn classify_load_error(e: mysql_async::Error) -> SqlError {
         match &e {
             mysql_async::Error::Server(srv) => {
                 // 1148 ER_NOT_ALLOWED_COMMAND, 3948
@@ -751,16 +748,16 @@ mod my_load_data {
                 // LOCAL being disabled. 3950 ER_LOAD_DATA_INFILE_
                 // _DISABLED appears in some MySQL builds; include it.
                 if matches!(srv.code, 1148 | 3948 | 3950) {
-                    return CoreError::BulkUnavailable(format!(
+                    return SqlError::BulkUnavailable(format!(
                         "MySQL server rejected LOAD DATA LOCAL INFILE \
                          (error {}: {}). Enable `local_infile=ON` server-side, \
                          or pass `--bulk-native=off` to use the generic path.",
                         srv.code, srv.message
                     ));
                 }
-                CoreError::QueryFailed(format!("MySQL bulk LOAD DATA: {srv}"))
+                SqlError::QueryFailed(format!("MySQL bulk LOAD DATA: {srv}"))
             }
-            _ => CoreError::QueryFailed(format!("MySQL bulk LOAD DATA: {e}")),
+            _ => SqlError::QueryFailed(format!("MySQL bulk LOAD DATA: {e}")),
         }
     }
 
@@ -863,9 +860,7 @@ mod my_load_data {
             let out = enc1(Value::Bytes(raw), TypeHint::Bytes);
             assert_eq!(
                 out,
-                vec![
-                    0x01u8, b'\\', b't', 0xFF, b'\\', b'\\', b'\\', b'n', b'\\', b'0', b'Z'
-                ]
+                vec![0x01u8, b'\\', b't', 0xFF, b'\\', b'\\', b'\\', b'n', b'\\', b'0', b'Z']
             );
         }
 
@@ -927,7 +922,12 @@ mod my_load_data {
                 Value::Null,
                 Value::Bool(true),
             ];
-            let hints = vec![TypeHint::Int64, TypeHint::String, TypeHint::Null, TypeHint::Bool];
+            let hints = vec![
+                TypeHint::Int64,
+                TypeHint::String,
+                TypeHint::Null,
+                TypeHint::Bool,
+            ];
             let bytes = encode_row(&row, &hints).unwrap();
             assert_eq!(&bytes[..], b"1\tAlice\t\\N\t1\n");
         }
@@ -1109,11 +1109,7 @@ mod tests {
         // this test. If the user doesn't have SUPER, the SET fails
         // and we degrade by skipping the test (rather than the bulk
         // path silently failing).
-        if conn
-            .execute("SET GLOBAL local_infile = ON")
-            .await
-            .is_err()
-        {
+        if conn.execute("SET GLOBAL local_infile = ON").await.is_err() {
             eprintln!(
                 "MySQL test container does not allow toggling local_infile; \
                  skipping test_mysql_bulk_insert_rows_round_trip"
@@ -1123,9 +1119,7 @@ mod tests {
 
         let pid = std::process::id();
         let table = format!("ferrule_bulk_test_{pid}");
-        let _ = conn
-            .execute(&format!("DROP TABLE IF EXISTS {table}"))
-            .await;
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}")).await;
         conn.execute(&format!(
             "CREATE TABLE {table} (\
                id BIGINT NOT NULL, \
@@ -1140,12 +1134,36 @@ mod tests {
         .expect("CREATE TABLE");
 
         let columns = vec![
-            ColumnInfo { name: "id".into(), type_hint: TypeHint::Int64, nullable: false },
-            ColumnInfo { name: "name".into(), type_hint: TypeHint::String, nullable: true },
-            ColumnInfo { name: "active".into(), type_hint: TypeHint::Bool, nullable: true },
-            ColumnInfo { name: "blob_data".into(), type_hint: TypeHint::Bytes, nullable: true },
-            ColumnInfo { name: "meta".into(), type_hint: TypeHint::Json, nullable: true },
-            ColumnInfo { name: "tricky".into(), type_hint: TypeHint::String, nullable: true },
+            ColumnInfo {
+                name: "id".into(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "name".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "active".into(),
+                type_hint: TypeHint::Bool,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "blob_data".into(),
+                type_hint: TypeHint::Bytes,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "meta".into(),
+                type_hint: TypeHint::Json,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "tricky".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
         ];
 
         let rows: Vec<Row> = vec![
@@ -1196,12 +1214,12 @@ mod tests {
 
         // Row 2 — verify the tricky escaped payload round-tripped.
         if let Value::String(s) = &result.rows[1][1] {
-            assert_eq!(s, "Esc\\\t\nape", "row 2 name should preserve backslash/tab/nl");
-        } else {
-            panic!(
-                "row 2 name should be String, got {:?}",
-                result.rows[1][1]
+            assert_eq!(
+                s, "Esc\\\t\nape",
+                "row 2 name should preserve backslash/tab/nl"
             );
+        } else {
+            panic!("row 2 name should be String, got {:?}", result.rows[1][1]);
         }
         if let Value::Bytes(b) = &result.rows[1][3] {
             assert_eq!(b.as_slice(), &[0x00u8, 0x09, 0x0A, 0xFF]);
@@ -1214,10 +1232,7 @@ mod tests {
         if let Value::String(s) = &result.rows[1][4] {
             assert_eq!(s, "\\.", "row 2 tricky should be literal backslash-dot");
         } else {
-            panic!(
-                "row 2 tricky should be String, got {:?}",
-                result.rows[1][4]
-            );
+            panic!("row 2 tricky should be String, got {:?}", result.rows[1][4]);
         }
 
         // Row 3 — everything NULL except id.
@@ -1249,11 +1264,7 @@ mod tests {
         // Enable server-side local_infile so the *server* is willing
         // to ask the client for the file. We need that step to fail
         // here, not the server config, to prove the client refused.
-        if conn
-            .execute("SET GLOBAL local_infile = ON")
-            .await
-            .is_err()
-        {
+        if conn.execute("SET GLOBAL local_infile = ON").await.is_err() {
             eprintln!(
                 "MySQL test container does not allow toggling local_infile; \
                  skipping test_mysql_load_data_without_bulk_in_progress_rejected"
@@ -1263,9 +1274,7 @@ mod tests {
 
         let pid = std::process::id();
         let table = format!("ferrule_bulk_security_test_{pid}");
-        let _ = conn
-            .execute(&format!("DROP TABLE IF EXISTS {table}"))
-            .await;
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}")).await;
         conn.execute(&format!(
             "CREATE TABLE {table} (id INT, line TEXT) ENGINE=InnoDB"
         ))
@@ -1283,9 +1292,8 @@ mod tests {
         // The client refuses because no infile handler is
         // installed at this point. mysql_async raises a query
         // error; ferrule surfaces it as QueryFailed.
-        let err = result.expect_err(
-            "LOAD DATA LOCAL INFILE without bulk_insert_rows in progress must fail",
-        );
+        let err = result
+            .expect_err("LOAD DATA LOCAL INFILE without bulk_insert_rows in progress must fail");
         let msg = err.to_string();
         // Look for any hint that the failure is handler-related —
         // exact mysql_async wording may evolve.
@@ -1306,9 +1314,7 @@ mod tests {
             other => panic!("unexpected count shape: {other:?}"),
         }
 
-        let _ = conn
-            .execute(&format!("DROP TABLE {table}"))
-            .await;
+        let _ = conn.execute(&format!("DROP TABLE {table}")).await;
     }
 
     #[tokio::test]
@@ -1327,9 +1333,7 @@ mod tests {
     #[tokio::test]
     async fn test_mysql_list_foreign_keys() {
         let Some(mut conn) = try_connect().await else {
-            eprintln!(
-                "MySQL test container not available, skipping test_mysql_list_foreign_keys"
-            );
+            eprintln!("MySQL test container not available, skipping test_mysql_list_foreign_keys");
             return;
         };
         let pid = std::process::id();
@@ -1377,8 +1381,12 @@ mod tests {
         let pid = std::process::id();
         let src_table = format!("ferrule_my_skip_src_{pid}");
         let dst_table = format!("ferrule_my_skip_dst_{pid}");
-        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}")).await;
+        let _ = src
+            .execute(&format!("DROP TABLE IF EXISTS {src_table}"))
+            .await;
+        let _ = dst
+            .execute(&format!("DROP TABLE IF EXISTS {dst_table}"))
+            .await;
         src.execute(&format!(
             "CREATE TABLE {src_table} (id INT PRIMARY KEY, name VARCHAR(64), val INT)"
         ))
@@ -1412,7 +1420,9 @@ mod tests {
             .expect("copy_rows skip");
 
         let out = dst
-            .query(&format!("SELECT id, name, val FROM {dst_table} ORDER BY id"))
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
             .await
             .expect("verify skip");
         assert_eq!(out.rows.len(), 2);
@@ -1433,7 +1443,9 @@ mod tests {
             .expect("copy_rows upsert");
 
         let out = dst
-            .query(&format!("SELECT id, name, val FROM {dst_table} ORDER BY id"))
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
             .await
             .expect("verify upsert");
         assert_eq!(out.rows.len(), 2);

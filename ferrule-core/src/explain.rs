@@ -1,5 +1,4 @@
-use crate::backend::Backend;
-use crate::error::CoreError;
+use ferrule_sql::{Backend, SqlError};
 
 /// Tag indicating the expected output format of an EXPLAIN plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,10 +18,10 @@ pub fn explain_sql(
     sql: &str,
     backend: Backend,
     analyze: bool,
-) -> Result<(String, ExplainOutput, bool), CoreError> {
+) -> Result<(String, ExplainOutput, bool), SqlError> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
-        return Err(CoreError::QueryFailed("Empty SQL for EXPLAIN".into()));
+        return Err(SqlError::QueryFailed("Empty SQL for EXPLAIN".into()));
     }
 
     let modifying = is_modifying(trimmed);

@@ -34,11 +34,11 @@ pub enum KeySource {
 /// always compiled while the core-side enum is gated behind the
 /// `ssh` feature.
 #[cfg(feature = "ssh")]
-impl From<KeySource> for ferrule_core::KeySource {
-    fn from(src: KeySource) -> ferrule_core::KeySource {
+impl From<KeySource> for ferrule_sql::KeySource {
+    fn from(src: KeySource) -> ferrule_sql::KeySource {
         match src {
-            KeySource::File(p) => ferrule_core::KeySource::File(p, None),
-            KeySource::Agent(p) => ferrule_core::KeySource::Agent(p),
+            KeySource::File(p) => ferrule_sql::KeySource::File(p, None),
+            KeySource::Agent(p) => ferrule_sql::KeySource::Agent(p),
         }
     }
 }

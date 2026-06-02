@@ -28,7 +28,7 @@ pub use watch::WatchArgs;
 
 use clap::{Args, Subcommand, ValueEnum};
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::copy::{BulkMode, CopyFormat};
+use ferrule_sql::copy::{BulkMode, CopyFormat};
 
 /// CLI-side representation of [`BulkMode`]. Derived from
 /// `clap::ValueEnum` so `--help` enumerates the valid values and
@@ -367,7 +367,12 @@ pub struct CopyArgs {
 
     /// Query mode: run this SELECT against the source. Requires
     /// `--into NAME` for the target table.
-    #[arg(long, value_name = "SQL", requires = "into", conflicts_with = "all_tables")]
+    #[arg(
+        long,
+        value_name = "SQL",
+        requires = "into",
+        conflicts_with = "all_tables"
+    )]
     pub query: Option<String>,
 
     /// Target table name when using `--query`.
@@ -459,7 +464,7 @@ pub struct CopyArgs {
         value_name = "MODE",
         default_value = "off",
         value_enum,
-        ignore_case = true,
+        ignore_case = true
     )]
     pub bulk_native: BulkNativeMode,
 
@@ -473,7 +478,7 @@ pub struct CopyArgs {
         value_name = "FORMAT",
         default_value = "text",
         value_enum,
-        ignore_case = true,
+        ignore_case = true
     )]
     pub copy_format: CopyFormatArg,
 

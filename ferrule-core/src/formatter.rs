@@ -1,6 +1,5 @@
-use crate::connection::QueryResult;
-use crate::error::CoreError;
-use crate::value::Value;
+use ferrule_sql::value::Value;
+use ferrule_sql::{QueryResult, SqlError};
 use std::borrow::Cow;
 use tabled::builder::Builder;
 use tabled::settings::Style;
@@ -49,7 +48,7 @@ pub struct FormatOptions {
 
 /// Render a `QueryResult` into the requested output format using default options.
 #[must_use = "the formatted output is the function's only product"]
-pub fn format_result(result: &QueryResult, format: OutputFormat) -> Result<String, CoreError> {
+pub fn format_result(result: &QueryResult, format: OutputFormat) -> Result<String, SqlError> {
     format_result_with(result, format, &FormatOptions::default())
 }
 
@@ -61,7 +60,7 @@ pub fn format_result_with(
     result: &QueryResult,
     format: OutputFormat,
     _opts: &FormatOptions,
-) -> Result<String, CoreError> {
+) -> Result<String, SqlError> {
     match format {
         OutputFormat::Table => format_table(result),
         OutputFormat::Json => format_json(result),
@@ -74,7 +73,7 @@ pub fn format_result_with(
     }
 }
 
-fn format_table(result: &QueryResult) -> Result<String, CoreError> {
+fn format_table(result: &QueryResult) -> Result<String, SqlError> {
     let mut builder = Builder::default();
     let headers: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
     builder.push_record(headers);
@@ -87,7 +86,7 @@ fn format_table(result: &QueryResult) -> Result<String, CoreError> {
     Ok(table.to_string())
 }
 
-fn format_json(result: &QueryResult) -> Result<String, CoreError> {
+fn format_json(result: &QueryResult) -> Result<String, SqlError> {
     let mut out = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
         let mut obj = serde_json::Map::new();
@@ -96,25 +95,25 @@ fn format_json(result: &QueryResult) -> Result<String, CoreError> {
         }
         out.push(serde_json::Value::Object(obj));
     }
-    serde_json::to_string_pretty(&out).map_err(|e| CoreError::QueryFailed(e.to_string()))
+    serde_json::to_string_pretty(&out).map_err(|e| SqlError::QueryFailed(e.to_string()))
 }
 
-fn format_csv(result: &QueryResult) -> Result<String, CoreError> {
+fn format_csv(result: &QueryResult) -> Result<String, SqlError> {
     let mut wtr = csv::Writer::from_writer(Vec::new());
     let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     wtr.write_record(&headers)
-        .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+        .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
     for row in &result.rows {
         let cells: Vec<String> = row.iter().map(cell_string).collect();
         wtr.write_record(&cells)
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
     }
     wtr.into_inner()
         .map(|v| String::from_utf8_lossy(&v).into_owned())
-        .map_err(|e| CoreError::QueryFailed(e.to_string()))
+        .map_err(|e| SqlError::QueryFailed(e.to_string()))
 }
 
-fn format_yaml(result: &QueryResult) -> Result<String, CoreError> {
+fn format_yaml(result: &QueryResult) -> Result<String, SqlError> {
     let mut out = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
         let mut obj = serde_json::Map::new();
@@ -123,10 +122,10 @@ fn format_yaml(result: &QueryResult) -> Result<String, CoreError> {
         }
         out.push(serde_json::Value::Object(obj));
     }
-    serde_saphyr::to_string(&out).map_err(|e| CoreError::QueryFailed(e.to_string()))
+    serde_saphyr::to_string(&out).map_err(|e| SqlError::QueryFailed(e.to_string()))
 }
 
-fn format_raw(result: &QueryResult) -> Result<String, CoreError> {
+fn format_raw(result: &QueryResult) -> Result<String, SqlError> {
     let mut lines = Vec::new();
     for row in &result.rows {
         let cells: Vec<String> = row.iter().map(cell_string).collect();
@@ -164,7 +163,7 @@ fn json_value(v: &Value) -> serde_json::Value {
     }
 }
 
-fn format_markdown(result: &QueryResult) -> Result<String, CoreError> {
+fn format_markdown(result: &QueryResult) -> Result<String, SqlError> {
     if result.columns.is_empty() {
         return Ok("(no columns)\n".into());
     }
@@ -225,7 +224,7 @@ fn escape_md_cell(s: &str) -> String {
     padded
 }
 
-fn format_jsonl(result: &QueryResult) -> Result<String, CoreError> {
+fn format_jsonl(result: &QueryResult) -> Result<String, SqlError> {
     if result.rows.is_empty() {
         return Ok(String::new());
     }
@@ -236,14 +235,14 @@ fn format_jsonl(result: &QueryResult) -> Result<String, CoreError> {
             obj.insert(col.name.clone(), json_value(val));
         }
         let line = serde_json::to_string(&serde_json::Value::Object(obj))
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         out.push_str(&line);
         out.push('\n');
     }
     Ok(out)
 }
 
-fn format_html(result: &QueryResult) -> Result<String, CoreError> {
+fn format_html(result: &QueryResult) -> Result<String, SqlError> {
     let mut out = String::new();
     out.push_str("<table>\n<thead>\n<tr>\n");
     for col in &result.columns {
@@ -293,7 +292,7 @@ fn html_escape(s: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{ColumnInfo, TypeHint, Value};
+    use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
 
     fn col(name: &str) -> ColumnInfo {
         ColumnInfo {
@@ -312,7 +311,10 @@ mod tests {
 
     #[test]
     fn parse_markdown_and_aliases() {
-        assert_eq!(OutputFormat::parse("markdown"), Some(OutputFormat::Markdown));
+        assert_eq!(
+            OutputFormat::parse("markdown"),
+            Some(OutputFormat::Markdown)
+        );
         assert_eq!(OutputFormat::parse("md"), Some(OutputFormat::Markdown));
         assert_eq!(OutputFormat::parse("MD"), Some(OutputFormat::Markdown));
         assert_eq!(OutputFormat::parse("jsonl"), Some(OutputFormat::Jsonl));
@@ -346,17 +348,11 @@ mod tests {
 
     #[test]
     fn markdown_escapes_pipe_and_newline() {
-        let result = qr(
-            vec!["c"],
-            vec![vec![Value::String("a|b\nc".into())]],
-        );
+        let result = qr(vec!["c"], vec![vec![Value::String("a|b\nc".into())]]);
         let out = format_result(&result, OutputFormat::Markdown).unwrap();
         assert!(out.contains("a\\|b<br>c"));
         // Also verify \r\n becomes a single <br> (not <br>\r or \r<br>).
-        let result_crlf = qr(
-            vec!["c"],
-            vec![vec![Value::String("a\r\nb".into())]],
-        );
+        let result_crlf = qr(vec!["c"], vec![vec![Value::String("a\r\nb".into())]]);
         let out_crlf = format_result(&result_crlf, OutputFormat::Markdown).unwrap();
         assert!(out_crlf.contains("a<br>b"));
         assert!(!out_crlf.contains('\r'));

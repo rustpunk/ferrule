@@ -9,9 +9,9 @@
 use chrono::Duration;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::QueryResult;
 use ferrule_core::formatter::format_result;
-use ferrule_core::value::{ColumnInfo, TypeHint, Value};
+use ferrule_sql::connection::QueryResult;
+use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
 
 use super::OutputFlags;
 use crate::error::CliError;

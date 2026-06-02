@@ -167,7 +167,10 @@ impl BenchSummary {
     /// shows one row per bench run, not N. Format matches the plan:
     /// `bench(N): <original SQL trimmed>`.
     pub fn history_sql(&self, original_sql: &str) -> String {
-        let trimmed: String = original_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed: String = original_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         format!("bench({}): {trimmed}", self.n())
     }
 

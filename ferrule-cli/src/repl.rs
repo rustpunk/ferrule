@@ -5,12 +5,12 @@ use crate::error::CliError;
 use ferrule_config::bookmarks::BookmarkStore;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_config::registry::ConnectionRegistry;
-use ferrule_core::backend::Backend;
-use ferrule_core::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::params::{infer_type, substitute, ParameterSet};
-use ferrule_core::url::DatabaseUrl;
-use ferrule_core::value::{ColumnInfo, TypeHint, Value};
+use ferrule_sql::backend::Backend;
+use ferrule_sql::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
+use ferrule_sql::url::DatabaseUrl;
+use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
 use std::io::Write;
 
 /// Mutable REPL session state.
@@ -170,7 +170,7 @@ impl Repl {
             return;
         }
 
-        let paged = match ferrule_core::apply_paging(
+        let paged = match ferrule_sql::apply_paging(
             &substituted,
             self.state.limit,
             self.state.offset,
@@ -209,7 +209,7 @@ impl Repl {
             rt.block_on(async {
                 match self.conn.query(&paged).await {
                     Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
-                    Err(ferrule_core::CoreError::QueryFailed(_)) => {
+                    Err(ferrule_sql::SqlError::QueryFailed(_)) => {
                         match self.conn.execute(&paged).await {
                             Ok(summary) => Ok(vec![StatementResult::Summary(summary)]),
                             Err(_) => self.conn.execute_multi(&paged).await,
@@ -516,9 +516,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
         }
         "g" => {
             if !args.is_empty() {
-                eprintln!(
-                    "\\g takes no arguments (server-side cursor paging not yet supported)"
-                );
+                eprintln!("\\g takes no arguments (server-side cursor paging not yet supported)");
             } else {
                 match repl.state.last_sql.clone() {
                     Some(sql) => repl.execute_sql(&sql, rt),
@@ -1177,7 +1175,10 @@ mod tests {
         assert_eq!(OutputFormat::parse("csv"), Some(OutputFormat::Csv));
         assert_eq!(OutputFormat::parse("yaml"), Some(OutputFormat::Yaml));
         assert_eq!(OutputFormat::parse("raw"), Some(OutputFormat::Raw));
-        assert_eq!(OutputFormat::parse("markdown"), Some(OutputFormat::Markdown));
+        assert_eq!(
+            OutputFormat::parse("markdown"),
+            Some(OutputFormat::Markdown)
+        );
         assert_eq!(OutputFormat::parse("md"), Some(OutputFormat::Markdown));
         assert_eq!(OutputFormat::parse("jsonl"), Some(OutputFormat::Jsonl));
         assert_eq!(OutputFormat::parse("ndjson"), Some(OutputFormat::Jsonl));

@@ -1,8 +1,6 @@
-use crate::backend::Backend;
-use crate::connection::Connection;
-use crate::error::CoreError;
-use crate::params::render_value;
-use crate::value::{TypeHint, Value};
+use ferrule_sql::render_value;
+use ferrule_sql::value::{TypeHint, Value};
+use ferrule_sql::{Backend, Connection, SqlError};
 
 /// Supported load formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +45,7 @@ pub async fn load_data(
     data: &str,
     backend: Backend,
     opts: &LoadOptions,
-) -> Result<usize, CoreError> {
+) -> Result<usize, SqlError> {
     match opts.format {
         LoadFormat::Csv => load_csv(conn, data, backend, opts).await,
         LoadFormat::Json => load_json(conn, data, backend, opts).await,
@@ -59,11 +57,11 @@ async fn load_csv(
     data: &str,
     backend: Backend,
     opts: &LoadOptions,
-) -> Result<usize, CoreError> {
+) -> Result<usize, SqlError> {
     let mut rdr = csv::Reader::from_reader(data.as_bytes());
     let headers: Vec<String> = rdr
         .headers()
-        .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+        .map_err(|e| SqlError::QueryFailed(e.to_string()))?
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -74,7 +72,7 @@ async fn load_csv(
     let mut total = 0usize;
     let mut batch = Vec::new();
     for result in rdr.records() {
-        let record = result.map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+        let record = result.map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         let values: Vec<String> = record
             .iter()
             .map(|s| render_value(&Value::String(s.to_string()), backend))
@@ -106,9 +104,9 @@ async fn load_json(
     data: &str,
     backend: Backend,
     opts: &LoadOptions,
-) -> Result<usize, CoreError> {
+) -> Result<usize, SqlError> {
     let arr: Vec<serde_json::Value> =
-        serde_json::from_str(data).map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+        serde_json::from_str(data).map_err(|e| SqlError::QueryFailed(e.to_string()))?;
     if arr.is_empty() {
         return Ok(0);
     }
@@ -116,7 +114,7 @@ async fn load_json(
     // Infer columns from first object
     let first = arr[0]
         .as_object()
-        .ok_or_else(|| CoreError::QueryFailed("JSON array must contain objects".into()))?;
+        .ok_or_else(|| SqlError::QueryFailed("JSON array must contain objects".into()))?;
     let columns: Vec<String> = first.keys().cloned().collect();
     let quoted_table = quote_identifier(&opts.table);
     let quoted_cols: Vec<String> = columns.iter().map(|c| quote_identifier(c)).collect();

@@ -1,8 +1,6 @@
-use crate::backend::Backend;
-use crate::connection::Connection;
-use crate::error::CoreError;
-use crate::params::render_value;
-use crate::value::{ColumnInfo, Value};
+use ferrule_sql::render_value;
+use ferrule_sql::value::{ColumnInfo, Value};
+use ferrule_sql::{Backend, Connection, SqlError};
 use std::fmt::Write as _;
 
 /// Supported dump formats.
@@ -58,8 +56,8 @@ pub async fn dump_table(
     table: &str,
     backend: Backend,
     opts: &DumpOptions,
-) -> Result<String, CoreError> {
-    let quoted_table = crate::copy::quote_identifier(table, backend);
+) -> Result<String, SqlError> {
+    let quoted_table = ferrule_sql::copy::quote_identifier(table, backend);
 
     // Determinism (Scope A): append ORDER BY before paging so that
     // the per-page LIMIT/OFFSET windows partition a stable order.
@@ -73,8 +71,7 @@ pub async fn dump_table(
                  sorting by all columns (slower)."
             );
             let described = conn.describe_table(opts.schema.as_deref(), table).await?;
-            let mut names: Vec<String> =
-                described.columns.iter().map(|c| c.name.clone()).collect();
+            let mut names: Vec<String> = described.columns.iter().map(|c| c.name.clone()).collect();
             names.sort();
             names
         } else {
@@ -99,7 +96,7 @@ pub async fn dump_query(
     backend: Backend,
     opts: &DumpOptions,
     table_name: Option<&str>,
-) -> Result<String, CoreError> {
+) -> Result<String, SqlError> {
     // Determinism precondition: refuse `--deterministic` against a
     // raw query that lacks an ORDER BY. The substring match is
     // intentionally pragmatic — a query that contains "order by"
@@ -110,7 +107,7 @@ pub async fn dump_query(
         && opts.format == DumpFormat::Sql
         && !sql.to_lowercase().contains("order by")
     {
-        return Err(CoreError::QueryFailed(
+        return Err(SqlError::QueryFailed(
             "dump_query --deterministic requires an ORDER BY clause in the source SQL \
              (substring match is intentionally pragmatic — a query that contains \
              'order by' only inside a comment or string literal will pass this check)."
@@ -128,7 +125,7 @@ pub async fn dump_query(
             {
                 let mut wtr = csv::Writer::from_writer(&mut buf);
                 loop {
-                    let paged = crate::query_builder::apply_paging(
+                    let paged = ferrule_sql::query_builder::apply_paging(
                         sql,
                         Some(opts.batch_size),
                         Some(offset),
@@ -142,7 +139,7 @@ pub async fn dump_query(
                             let headers: Vec<&str> =
                                 columns.iter().map(|c| c.name.as_str()).collect();
                             wtr.write_record(&headers)
-                                .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                                .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
                         }
                         first_page = false;
                     }
@@ -154,7 +151,7 @@ pub async fn dump_query(
                     for row in &page.rows {
                         let cells: Vec<String> = row.iter().map(value_to_csv_cell).collect();
                         wtr.write_record(&cells)
-                            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
                     }
 
                     let fetched = page.rows.len();
@@ -164,9 +161,9 @@ pub async fn dump_query(
                     }
                 }
                 wtr.flush()
-                    .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                    .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
             }
-            String::from_utf8(buf).map_err(|e| CoreError::QueryFailed(e.to_string()))
+            String::from_utf8(buf).map_err(|e| SqlError::QueryFailed(e.to_string()))
         }
 
         DumpFormat::Json => {
@@ -175,7 +172,7 @@ pub async fn dump_query(
             let mut first_row = true;
 
             loop {
-                let paged = crate::query_builder::apply_paging(
+                let paged = ferrule_sql::query_builder::apply_paging(
                     sql,
                     Some(opts.batch_size),
                     Some(offset),
@@ -205,7 +202,7 @@ pub async fn dump_query(
                         obj.insert(col.name.clone(), json_value(val));
                     }
                     let json_str = serde_json::to_string(&serde_json::Value::Object(obj))
-                        .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+                        .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
                     buf.extend_from_slice(json_str.as_bytes());
                 }
 
@@ -217,16 +214,16 @@ pub async fn dump_query(
             }
 
             buf.push(b']');
-            String::from_utf8(buf).map_err(|e| CoreError::QueryFailed(e.to_string()))
+            String::from_utf8(buf).map_err(|e| SqlError::QueryFailed(e.to_string()))
         }
 
         DumpFormat::Sql => {
             let table = table_name.unwrap_or("dumped_table");
-            let quoted_table = crate::copy::quote_identifier(table, backend);
+            let quoted_table = ferrule_sql::copy::quote_identifier(table, backend);
             let mut out = String::new();
 
             loop {
-                let paged = crate::query_builder::apply_paging(
+                let paged = ferrule_sql::query_builder::apply_paging(
                     sql,
                     Some(opts.batch_size),
                     Some(offset),
@@ -247,7 +244,7 @@ pub async fn dump_query(
 
                 let col_names: Vec<String> = columns
                     .iter()
-                    .map(|c| crate::copy::quote_identifier(&c.name, backend))
+                    .map(|c| ferrule_sql::copy::quote_identifier(&c.name, backend))
                     .collect();
                 let cols = col_names.join(", ");
 
@@ -352,14 +349,14 @@ fn canonicalize_json_value(v: serde_json::Value) -> serde_json::Value {
 
 /// Render a [`Value`] for inclusion in a deterministic SQL dump.
 ///
-/// Identical to [`crate::params::render_value`] for every variant
+/// Identical to [`ferrule_sql::render_value`] for every variant
 /// except `Value::Json`, which is re-serialised through
 /// [`canonicalize_json_value`] so object keys are sorted.
 fn render_value_deterministic(v: &Value, backend: Backend) -> String {
     match v {
         Value::Json(j) => {
             let canon = canonicalize_json_value(j.clone());
-            crate::params::quote_string(&canon.to_string())
+            ferrule_sql::quote_string(&canon.to_string())
         }
         _ => render_value(v, backend),
     }
@@ -374,7 +371,7 @@ fn build_order_by(cols: &[String], backend: Backend) -> String {
     }
     let quoted: Vec<String> = cols
         .iter()
-        .map(|c| crate::copy::quote_identifier(c, backend))
+        .map(|c| ferrule_sql::copy::quote_identifier(c, backend))
         .collect();
     format!(" ORDER BY {}", quoted.join(", "))
 }
@@ -387,18 +384,15 @@ mod tests {
     fn json_value_keys_sorted_in_deterministic() {
         let v = serde_json::json!({"z":1, "a":2, "nested":{"y":1,"b":2}});
         let c = canonicalize_json_value(v);
-        assert_eq!(
-            c.to_string(),
-            r#"{"a":2,"nested":{"b":2,"y":1},"z":1}"#
-        );
+        assert_eq!(c.to_string(), r#"{"a":2,"nested":{"b":2,"y":1},"z":1}"#);
     }
 
     #[cfg(feature = "sqlite")]
     mod sqlite_dump_tests {
         use super::*;
-        use crate::backends::sqlite::connect as sqlite_connect;
-        use crate::connection::ConnectOptions;
-        use crate::url::DatabaseUrl;
+        use ferrule_sql::backends::sqlite::connect as sqlite_connect;
+        use ferrule_sql::ConnectOptions;
+        use ferrule_sql::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static N: AtomicU64 = AtomicU64::new(0);
@@ -411,10 +405,12 @@ mod tests {
 
         async fn open_sqlite(
             path: &std::path::Path,
-        ) -> crate::backends::sqlite::SqliteConnection {
+        ) -> ferrule_sql::backends::sqlite::SqliteConnection {
             let _ = std::fs::remove_file(path);
             let url = DatabaseUrl::parse(&format!("sqlite://{}", path.display())).unwrap();
-            sqlite_connect(&url, &ConnectOptions::default()).await.unwrap()
+            sqlite_connect(&url, &ConnectOptions::default())
+                .await
+                .unwrap()
         }
 
         #[tokio::test]
@@ -425,9 +421,15 @@ mod tests {
                 .await
                 .unwrap();
             // Insert out of PK order.
-            conn.execute("INSERT INTO users VALUES (2, 'Bob')").await.unwrap();
-            conn.execute("INSERT INTO users VALUES (1, 'Alice')").await.unwrap();
-            conn.execute("INSERT INTO users VALUES (3, 'Carol')").await.unwrap();
+            conn.execute("INSERT INTO users VALUES (2, 'Bob')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO users VALUES (1, 'Alice')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO users VALUES (3, 'Carol')")
+                .await
+                .unwrap();
 
             let opts = DumpOptions {
                 format: DumpFormat::Sql,
@@ -469,13 +471,25 @@ mod tests {
                 .await
                 .unwrap();
             // a: 1, 2, 3
-            a.execute("INSERT INTO users VALUES (1, 'Alice')").await.unwrap();
-            a.execute("INSERT INTO users VALUES (2, 'Bob')").await.unwrap();
-            a.execute("INSERT INTO users VALUES (3, 'Carol')").await.unwrap();
+            a.execute("INSERT INTO users VALUES (1, 'Alice')")
+                .await
+                .unwrap();
+            a.execute("INSERT INTO users VALUES (2, 'Bob')")
+                .await
+                .unwrap();
+            a.execute("INSERT INTO users VALUES (3, 'Carol')")
+                .await
+                .unwrap();
             // b: 3, 1, 2
-            b.execute("INSERT INTO users VALUES (3, 'Carol')").await.unwrap();
-            b.execute("INSERT INTO users VALUES (1, 'Alice')").await.unwrap();
-            b.execute("INSERT INTO users VALUES (2, 'Bob')").await.unwrap();
+            b.execute("INSERT INTO users VALUES (3, 'Carol')")
+                .await
+                .unwrap();
+            b.execute("INSERT INTO users VALUES (1, 'Alice')")
+                .await
+                .unwrap();
+            b.execute("INSERT INTO users VALUES (2, 'Bob')")
+                .await
+                .unwrap();
 
             let opts = DumpOptions {
                 format: DumpFormat::Sql,
@@ -502,13 +516,21 @@ mod tests {
             // that a `WITHOUT ROWID` table would require an explicit
             // PK, so we use a plain heap and confirm primary_key()
             // returns empty.
-            conn.execute("CREATE TABLE heap (a INTEGER, b TEXT)").await.unwrap();
+            conn.execute("CREATE TABLE heap (a INTEGER, b TEXT)")
+                .await
+                .unwrap();
             let pks = conn.primary_key(None, "heap").await.unwrap();
             assert!(pks.is_empty(), "expected no PK for heap, got {pks:?}");
 
-            conn.execute("INSERT INTO heap VALUES (2, 'beta')").await.unwrap();
-            conn.execute("INSERT INTO heap VALUES (1, 'alpha')").await.unwrap();
-            conn.execute("INSERT INTO heap VALUES (3, 'gamma')").await.unwrap();
+            conn.execute("INSERT INTO heap VALUES (2, 'beta')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO heap VALUES (1, 'alpha')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO heap VALUES (3, 'gamma')")
+                .await
+                .unwrap();
 
             let opts = DumpOptions {
                 format: DumpFormat::Sql,

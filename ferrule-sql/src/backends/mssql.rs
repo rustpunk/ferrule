@@ -2,7 +2,7 @@ use crate::connection::{
     BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
     StatementResult,
 };
-use crate::error::CoreError;
+use crate::error::SqlError;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
@@ -20,12 +20,12 @@ pub struct MssqlConnection {
 
 #[async_trait]
 impl Connection for MssqlConnection {
-    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError> {
+    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
         let result = self
             .client
             .execute(sql, &[])
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
         let affected = result.rows_affected().first().copied();
         Ok(ExecutionSummary {
             rows_affected: affected,
@@ -33,15 +33,15 @@ impl Connection for MssqlConnection {
         })
     }
 
-    async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError> {
+    async fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
         let rows = self
             .client
             .query(sql, &[])
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?
             .into_first_result()
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         if rows.is_empty() {
             return Ok(QueryResult {
@@ -77,15 +77,15 @@ impl Connection for MssqlConnection {
         })
     }
 
-    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, CoreError> {
+    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
         let result_sets = self
             .client
             .query(sql, &[])
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?
             .into_results()
             .await
-            .map_err(|e| CoreError::QueryFailed(e.to_string()))?;
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         let mut results = Vec::new();
         for rows in result_sets {
@@ -131,18 +131,18 @@ impl Connection for MssqlConnection {
         Ok(results)
     }
 
-    async fn ping(&mut self) -> Result<(), CoreError> {
+    async fn ping(&mut self) -> Result<(), SqlError> {
         self.client
             .query("SELECT 1", &[])
             .await
-            .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?
+            .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?
             .into_first_result()
             .await
-            .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
         Ok(())
     }
 
-    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError> {
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
         let schema = schema.unwrap_or("dbo");
         let sql = format!(
             "SELECT TABLE_NAME AS table_name FROM information_schema.tables WHERE table_schema = '{}' AND table_type = 'BASE TABLE' ORDER BY table_name",
@@ -166,7 +166,7 @@ impl Connection for MssqlConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<QueryResult, CoreError> {
+    ) -> Result<QueryResult, SqlError> {
         let schema = schema.unwrap_or("dbo");
         let sql = format!(
             "SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, NUMERIC_PRECISION AS numeric_precision, NUMERIC_SCALE AS numeric_scale FROM information_schema.columns WHERE table_schema = '{}' AND table_name = '{}' ORDER BY ORDINAL_POSITION",
@@ -180,7 +180,7 @@ impl Connection for MssqlConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<Vec<String>, CoreError> {
+    ) -> Result<Vec<String>, SqlError> {
         let schema = schema.unwrap_or("dbo");
         // INFORMATION_SCHEMA covers both PK columns and key order;
         // join against TABLE_CONSTRAINTS to filter to PRIMARY KEY only.
@@ -212,7 +212,7 @@ impl Connection for MssqlConnection {
     async fn list_foreign_keys(
         &mut self,
         schema: Option<&str>,
-    ) -> Result<Vec<ForeignKey>, CoreError> {
+    ) -> Result<Vec<ForeignKey>, SqlError> {
         let schema = schema.unwrap_or("dbo");
         // sys.foreign_key_columns has one row per (FK, position) and
         // exposes constraint_object_id for grouping.
@@ -273,10 +273,7 @@ impl Connection for MssqlConnection {
         Ok(map.into_values().collect())
     }
 
-    async fn bulk_insert_rows(
-        &mut self,
-        target: BulkInsert<'_>,
-    ) -> Result<usize, CoreError> {
+    async fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError> {
         if target.rows.is_empty() {
             return Ok(0);
         }
@@ -287,8 +284,7 @@ impl Connection for MssqlConnection {
         // `Updateable` columns *in physical order*. Both interpolations
         // happen verbatim, so we pre-quote with the backend's
         // ANSI-quoting helper.
-        let qtable =
-            crate::copy::quote_identifier(target.table, crate::backend::Backend::MsSql);
+        let qtable = crate::copy::quote_identifier(target.table, crate::backend::Backend::MsSql);
 
         // C1 pre-flight: the destination's physical column order
         // (minus IDENTITY columns) MUST match `target.columns` exactly
@@ -297,9 +293,7 @@ impl Connection for MssqlConnection {
         // mismatch). The generic INSERT path uses named column lists
         // so it doesn't have this hazard; return `BulkUnavailable` on
         // mismatch so `--bulk-native=auto` degrades cleanly.
-        let dest_cols = self
-            .fetch_bulk_updatable_columns(target.table)
-            .await?;
+        let dest_cols = self.fetch_bulk_updatable_columns(target.table).await?;
         verify_bulk_column_alignment(&dest_cols, target.columns)?;
 
         let mut req = self
@@ -315,15 +309,15 @@ impl Connection for MssqlConnection {
                 let hint = hints.get(idx).copied().unwrap_or(TypeHint::Other);
                 token_row.push(value_to_column_data(v, hint)?);
             }
-            req.send(token_row).await.map_err(|e| {
-                CoreError::QueryFailed(format!("MSSQL bulk send: {e}"))
-            })?;
+            req.send(token_row)
+                .await
+                .map_err(|e| SqlError::QueryFailed(format!("MSSQL bulk send: {e}")))?;
         }
 
         let res = req
             .finalize()
             .await
-            .map_err(|e| CoreError::QueryFailed(format!("MSSQL bulk finalize: {e}")))?;
+            .map_err(|e| SqlError::QueryFailed(format!("MSSQL bulk finalize: {e}")))?;
         Ok(res.total() as usize)
     }
 }
@@ -346,10 +340,7 @@ impl MssqlConnection {
     /// hard error from tiberius mid-stream — both of which the
     /// `verify_bulk_column_alignment` step catches downstream, but
     /// filtering here keeps the auto-fallback path clean.
-    async fn fetch_bulk_updatable_columns(
-        &mut self,
-        table: &str,
-    ) -> Result<Vec<String>, CoreError> {
+    async fn fetch_bulk_updatable_columns(&mut self, table: &str) -> Result<Vec<String>, SqlError> {
         // Resolve the (schema, name) pair from the user's input.
         // Accepts plain `test_users`, dot-qualified `dbo.test_users`,
         // T-SQL bracketed `[dbo].[test_users]`, and even brackets
@@ -357,10 +348,7 @@ impl MssqlConnection {
         // the regression that motivated bracketed support.
         let qualified = parse_mssql_qualified_identifier(table);
         let schema_filter = match &qualified.schema {
-            Some(schema) => format!(
-                " AND c.TABLE_SCHEMA = '{}'",
-                escape_mssql_string(schema)
-            ),
+            Some(schema) => format!(" AND c.TABLE_SCHEMA = '{}'", escape_mssql_string(schema)),
             None => String::new(),
         };
         let table_name = qualified.name;
@@ -376,7 +364,7 @@ impl MssqlConnection {
             schema_filter,
         );
         let result = self.query(&sql).await.map_err(|e| {
-            CoreError::BulkUnavailable(format!(
+            SqlError::BulkUnavailable(format!(
                 "MSSQL bulk pre-flight: could not introspect destination columns: {e}"
             ))
         })?;
@@ -386,7 +374,8 @@ impl MssqlConnection {
             // IDENTITY, computed, and ROWVERSION (DATA_TYPE = 'timestamp').
             let is_identity = column_flag_bool(&row[1]);
             let is_computed = column_flag_bool(&row[2]);
-            let is_rowversion = matches!(&row[3], Value::String(s) if s.eq_ignore_ascii_case("timestamp"));
+            let is_rowversion =
+                matches!(&row[3], Value::String(s) if s.eq_ignore_ascii_case("timestamp"));
             if is_identity || is_computed || is_rowversion {
                 continue;
             }
@@ -513,15 +502,15 @@ fn parse_one_identifier(s: &str) -> (String, Option<&str>) {
 /// case-insensitive (MSSQL identifiers default to case-insensitive
 /// collation; the destination metadata may return original case but
 /// the source may have produced any case). Returns
-/// [`CoreError::BulkUnavailable`] on mismatch so the dispatcher
+/// [`SqlError::BulkUnavailable`] on mismatch so the dispatcher
 /// degrades to the generic INSERT path (which uses named column
 /// lists and works regardless of physical order).
 fn verify_bulk_column_alignment(
     dest_cols: &[String],
     target_cols: &[ColumnInfo],
-) -> Result<(), CoreError> {
+) -> Result<(), SqlError> {
     if dest_cols.len() != target_cols.len() {
-        return Err(CoreError::BulkUnavailable(format!(
+        return Err(SqlError::BulkUnavailable(format!(
             "MSSQL bulk path requires destination to have exactly the same \
              non-IDENTITY columns as the source ({} dest cols vs {} source cols). \
              The destination may have IDENTITY columns the source doesn't, or \
@@ -533,7 +522,7 @@ fn verify_bulk_column_alignment(
     }
     for (idx, (dest, src)) in dest_cols.iter().zip(target_cols).enumerate() {
         if !dest.eq_ignore_ascii_case(&src.name) {
-            return Err(CoreError::BulkUnavailable(format!(
+            return Err(SqlError::BulkUnavailable(format!(
                 "MSSQL bulk path requires destination column order to match source. \
                  Position {idx}: dest = {dest:?}, source = {src_name:?}. \
                  Generic INSERT uses a named column list and works regardless of order",
@@ -545,7 +534,7 @@ fn verify_bulk_column_alignment(
 }
 
 /// Classify a `tiberius::error::Error` raised by `client.bulk_insert`
-/// setup. Returns [`CoreError::BulkUnavailable`] only for conditions
+/// setup. Returns [`SqlError::BulkUnavailable`] only for conditions
 /// where falling back to a generic INSERT could *actually succeed* —
 /// not for errors that would hit the generic path too (permission
 /// denied, missing table). The `Auto` dispatcher's "fall back to
@@ -557,16 +546,16 @@ fn verify_bulk_column_alignment(
 /// - Missing column metadata — the bulk handshake's
 ///   `SELECT TOP 0 *` returned no usable columns. Generic INSERT can
 ///   still hit a synonym or other indirection that bulk can't.
-fn classify_bulk_setup_error(e: &tiberius::error::Error) -> CoreError {
+fn classify_bulk_setup_error(e: &tiberius::error::Error) -> SqlError {
     let msg = e.to_string();
     if msg.contains("Cannot bulk load") || msg.contains("expecting column metadata") {
-        return CoreError::BulkUnavailable(format!("MSSQL rejected bulk_insert setup: {msg}"));
+        return SqlError::BulkUnavailable(format!("MSSQL rejected bulk_insert setup: {msg}"));
     }
     // "Invalid object name" / permission errors / network errors: the
     // generic INSERT path would fail with the same root cause, so
     // surface the error immediately rather than confusing the user
     // with a "fall back to --bulk-native=auto" hint.
-    CoreError::QueryFailed(format!("MSSQL bulk_insert setup: {msg}"))
+    SqlError::QueryFailed(format!("MSSQL bulk_insert setup: {msg}"))
 }
 
 /// Translate a ferrule [`Value`] into tiberius `ColumnData<'static>`
@@ -575,7 +564,7 @@ fn classify_bulk_setup_error(e: &tiberius::error::Error) -> CoreError {
 /// for non-null values the variant of `Value` is authoritative.
 ///
 /// This mirrors [`mssql_to_value`] (the read path) symmetrically.
-fn value_to_column_data(v: &Value, hint: TypeHint) -> Result<ColumnData<'static>, CoreError> {
+fn value_to_column_data(v: &Value, hint: TypeHint) -> Result<ColumnData<'static>, SqlError> {
     use std::borrow::Cow;
 
     Ok(match v {
@@ -584,9 +573,8 @@ fn value_to_column_data(v: &Value, hint: TypeHint) -> Result<ColumnData<'static>
         Value::Int64(n) => ColumnData::I64(Some(*n)),
         Value::Float64(f) => ColumnData::F64(Some(*f)),
         Value::Decimal(s) => {
-            let n = parse_decimal_to_numeric(s).map_err(|e| {
-                CoreError::QueryFailed(format!("MSSQL bulk: decimal {s:?}: {e}"))
-            })?;
+            let n = parse_decimal_to_numeric(s)
+                .map_err(|e| SqlError::QueryFailed(format!("MSSQL bulk: decimal {s:?}: {e}")))?;
             ColumnData::Numeric(Some(n))
         }
         Value::String(s) => ColumnData::String(Some(Cow::Owned(s.clone()))),
@@ -598,23 +586,20 @@ fn value_to_column_data(v: &Value, hint: TypeHint) -> Result<ColumnData<'static>
         Value::Json(j) => {
             // ferrule's DDL translator maps JSON → NVARCHAR(MAX) on
             // MSSQL — no native JSON column type. Serialize compact.
-            let rendered = serde_json::to_string(j).map_err(|e| {
-                CoreError::QueryFailed(format!("MSSQL bulk: JSON serialize: {e}"))
-            })?;
+            let rendered = serde_json::to_string(j)
+                .map_err(|e| SqlError::QueryFailed(format!("MSSQL bulk: JSON serialize: {e}")))?;
             ColumnData::String(Some(Cow::Owned(rendered)))
         }
         Value::Uuid(s) => {
-            let u = tiberius::Uuid::parse_str(s).map_err(|e| {
-                CoreError::QueryFailed(format!("MSSQL bulk: UUID {s:?}: {e}"))
-            })?;
+            let u = tiberius::Uuid::parse_str(s)
+                .map_err(|e| SqlError::QueryFailed(format!("MSSQL bulk: UUID {s:?}: {e}")))?;
             ColumnData::Guid(Some(u))
         }
         Value::Array(a) => {
             // DDL translator maps Array → NVARCHAR(MAX) (no native
             // array type). Serialize compact JSON.
-            let rendered = serde_json::to_string(a).map_err(|e| {
-                CoreError::QueryFailed(format!("MSSQL bulk: array serialize: {e}"))
-            })?;
+            let rendered = serde_json::to_string(a)
+                .map_err(|e| SqlError::QueryFailed(format!("MSSQL bulk: array serialize: {e}")))?;
             ColumnData::String(Some(Cow::Owned(rendered)))
         }
     })
@@ -672,9 +657,7 @@ fn parse_decimal_to_numeric(s: &str) -> Result<Numeric, String> {
     if !digits.chars().all(|c| c.is_ascii_digit()) {
         return Err(format!("non-digit character in {s:?}"));
     }
-    let raw: i128 = digits
-        .parse()
-        .map_err(|e| format!("parse mantissa: {e}"))?;
+    let raw: i128 = digits.parse().map_err(|e| format!("parse mantissa: {e}"))?;
     let scale: u8 = frac_part
         .len()
         .try_into()
@@ -688,7 +671,7 @@ fn parse_decimal_to_numeric(s: &str) -> Result<Numeric, String> {
 pub async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
-) -> Result<MssqlConnection, CoreError> {
+) -> Result<MssqlConnection, SqlError> {
     let mut config = tiberius::Config::new();
     config.host(url.host().unwrap_or("localhost"));
     config.port(url.port().unwrap_or(1433));
@@ -728,13 +711,13 @@ pub async fn connect(
 
     let tcp = tokio::net::TcpStream::connect(config.get_addr())
         .await
-        .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+        .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
     tcp.set_nodelay(true)
-        .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+        .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
 
     let client = tiberius::Client::connect(config, tcp.compat_write())
         .await
-        .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
+        .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
 
     Ok(MssqlConnection { client })
 }
@@ -1043,7 +1026,7 @@ mod tests {
         let dest = vec!["a".to_string(), "b".to_string()];
         let target = vec![col("a"), col("b"), col("c")];
         let err = verify_bulk_column_alignment(&dest, &target).expect_err("count mismatch");
-        assert!(matches!(err, CoreError::BulkUnavailable(_)));
+        assert!(matches!(err, SqlError::BulkUnavailable(_)));
         let msg = err.to_string();
         assert!(
             msg.contains("2 dest cols") && msg.contains("3 source cols"),
@@ -1058,7 +1041,7 @@ mod tests {
         let dest = vec!["b".to_string(), "a".to_string()];
         let target = vec![col("a"), col("b")];
         let err = verify_bulk_column_alignment(&dest, &target).expect_err("order mismatch");
-        assert!(matches!(err, CoreError::BulkUnavailable(_)));
+        assert!(matches!(err, SqlError::BulkUnavailable(_)));
         let msg = err.to_string();
         assert!(
             msg.contains("Position 0") && msg.contains("\"b\"") && msg.contains("\"a\""),
@@ -1074,7 +1057,7 @@ mod tests {
         let dest = vec!["a".to_string(), "b".to_string(), "extra".to_string()];
         let target = vec![col("a"), col("b")];
         let err = verify_bulk_column_alignment(&dest, &target).expect_err("extra dest cols");
-        assert!(matches!(err, CoreError::BulkUnavailable(_)));
+        assert!(matches!(err, SqlError::BulkUnavailable(_)));
     }
 
     // -------- #41: parse_mssql_qualified_identifier --------
@@ -1354,12 +1337,36 @@ mod tests {
         .expect("CREATE TABLE");
 
         let columns = vec![
-            ColumnInfo { name: "id".into(), type_hint: TypeHint::Int64, nullable: false },
-            ColumnInfo { name: "name".into(), type_hint: TypeHint::String, nullable: true },
-            ColumnInfo { name: "active".into(), type_hint: TypeHint::Bool, nullable: true },
-            ColumnInfo { name: "score".into(), type_hint: TypeHint::Decimal, nullable: true },
-            ColumnInfo { name: "meta".into(), type_hint: TypeHint::Json, nullable: true },
-            ColumnInfo { name: "uid".into(), type_hint: TypeHint::Uuid, nullable: true },
+            ColumnInfo {
+                name: "id".into(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "name".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "active".into(),
+                type_hint: TypeHint::Bool,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "score".into(),
+                type_hint: TypeHint::Decimal,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "meta".into(),
+                type_hint: TypeHint::Json,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "uid".into(),
+                type_hint: TypeHint::Uuid,
+                nullable: true,
+            },
         ];
 
         let rows: Vec<Row> = vec![
@@ -1418,7 +1425,10 @@ mod tests {
         } else if let Value::Float64(f) = result.rows[0][3] {
             assert!((f - 99.5).abs() < 1e-6, "row 1 score got {f}");
         } else {
-            panic!("row 1 score should be Decimal or Float64, got {:?}", result.rows[0][3]);
+            panic!(
+                "row 1 score should be Decimal or Float64, got {:?}",
+                result.rows[0][3]
+            );
         }
 
         // Row 2 — all of name/score/active populated; uid NULL.
@@ -1451,9 +1461,7 @@ mod tests {
     #[tokio::test]
     async fn test_mssql_list_foreign_keys() {
         let Some(mut conn) = try_connect().await else {
-            eprintln!(
-                "MSSQL test container not available, skipping test_mssql_list_foreign_keys"
-            );
+            eprintln!("MSSQL test container not available, skipping test_mssql_list_foreign_keys");
             return;
         };
         let pid = std::process::id();
@@ -1501,8 +1509,12 @@ mod tests {
         let pid = std::process::id();
         let src_table = format!("ferrule_ms_skip_src_{pid}");
         let dst_table = format!("ferrule_ms_skip_dst_{pid}");
-        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}")).await;
+        let _ = src
+            .execute(&format!("DROP TABLE IF EXISTS {src_table}"))
+            .await;
+        let _ = dst
+            .execute(&format!("DROP TABLE IF EXISTS {dst_table}"))
+            .await;
         src.execute(&format!(
             "CREATE TABLE {src_table} (id INT PRIMARY KEY, name NVARCHAR(64), val INT)"
         ))
@@ -1536,7 +1548,9 @@ mod tests {
             .expect("copy_rows skip");
 
         let out = dst
-            .query(&format!("SELECT id, name, val FROM {dst_table} ORDER BY id"))
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
             .await
             .expect("verify skip");
         assert_eq!(out.rows.len(), 2);
@@ -1557,7 +1571,9 @@ mod tests {
             .expect("copy_rows upsert");
 
         let out = dst
-            .query(&format!("SELECT id, name, val FROM {dst_table} ORDER BY id"))
+            .query(&format!(
+                "SELECT id, name, val FROM {dst_table} ORDER BY id"
+            ))
             .await
             .expect("verify upsert");
         assert_eq!(out.rows.len(), 2);

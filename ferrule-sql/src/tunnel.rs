@@ -258,32 +258,29 @@ mod ssh_impl {
 
     #[async_trait::async_trait]
     impl crate::Connection for TunneledConnection {
-        async fn execute(
-            &mut self,
-            sql: &str,
-        ) -> Result<crate::ExecutionSummary, crate::CoreError> {
+        async fn execute(&mut self, sql: &str) -> Result<crate::ExecutionSummary, crate::SqlError> {
             self.inner.execute(sql).await
         }
 
-        async fn query(&mut self, sql: &str) -> Result<crate::QueryResult, crate::CoreError> {
+        async fn query(&mut self, sql: &str) -> Result<crate::QueryResult, crate::SqlError> {
             self.inner.query(sql).await
         }
 
         async fn execute_multi(
             &mut self,
             sql: &str,
-        ) -> Result<Vec<crate::StatementResult>, crate::CoreError> {
+        ) -> Result<Vec<crate::StatementResult>, crate::SqlError> {
             self.inner.execute_multi(sql).await
         }
 
-        async fn ping(&mut self) -> Result<(), crate::CoreError> {
+        async fn ping(&mut self) -> Result<(), crate::SqlError> {
             self.inner.ping().await
         }
 
         async fn list_tables(
             &mut self,
             schema: Option<&str>,
-        ) -> Result<Vec<String>, crate::CoreError> {
+        ) -> Result<Vec<String>, crate::SqlError> {
             self.inner.list_tables(schema).await
         }
 
@@ -291,7 +288,7 @@ mod ssh_impl {
             &mut self,
             schema: Option<&str>,
             table: &str,
-        ) -> Result<crate::QueryResult, crate::CoreError> {
+        ) -> Result<crate::QueryResult, crate::SqlError> {
             self.inner.describe_table(schema, table).await
         }
 
@@ -299,21 +296,21 @@ mod ssh_impl {
             &mut self,
             schema: Option<&str>,
             table: &str,
-        ) -> Result<Vec<String>, crate::CoreError> {
+        ) -> Result<Vec<String>, crate::SqlError> {
             self.inner.primary_key(schema, table).await
         }
 
         async fn list_foreign_keys(
             &mut self,
             schema: Option<&str>,
-        ) -> Result<Vec<crate::ForeignKey>, crate::CoreError> {
+        ) -> Result<Vec<crate::ForeignKey>, crate::SqlError> {
             self.inner.list_foreign_keys(schema).await
         }
 
         async fn bulk_insert_rows(
             &mut self,
             target: crate::connection::BulkInsert<'_>,
-        ) -> Result<usize, crate::CoreError> {
+        ) -> Result<usize, crate::SqlError> {
             self.inner.bulk_insert_rows(target).await
         }
     }

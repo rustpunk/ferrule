@@ -1,8 +1,19 @@
 use thiserror::Error;
 
-/// Errors originating in `ferrule-core`.
+/// Errors originating in the `ferrule-sql` driver and write-path layer.
+///
+/// Every backend method, URL parse, connect dispatch, transaction
+/// helper, and copy routine returns this type. Variant names and tuple
+/// shapes are load-bearing across the workspace (the CLI pattern-matches
+/// [`SqlError::QueryFailed`] in several hot paths), so preserve them when
+/// editing.
+///
+/// `RegistryError` is registry/CLI-level rather than driver-level; it
+/// rides along here as a deliberate minimal-diff choice during the
+/// `ferrule-core` -> `ferrule-sql` extraction and is a candidate for a
+/// later relocation to a core-side error type.
 #[derive(Error, Debug)]
-pub enum CoreError {
+pub enum SqlError {
     #[error("unsupported URL scheme: {0}")]
     UnsupportedScheme(String),
 

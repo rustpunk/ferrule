@@ -1,10 +1,10 @@
 use super::DiffArgs;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::Backend;
-use ferrule_core::connection::{ConnectOptions, Connection, QueryResult};
 use ferrule_core::formatter::OutputFormat;
-use ferrule_core::value::Value;
+use ferrule_sql::backend::Backend;
+use ferrule_sql::connection::{ConnectOptions, Connection, QueryResult};
+use ferrule_sql::value::Value;
 use std::collections::BTreeMap;
 
 /// One column extracted from a `describe_table` result, normalised across
@@ -221,7 +221,7 @@ fn render_json(diff: &SchemaDiff) -> Result<String, CliError> {
         }).collect::<Vec<_>>(),
     });
     serde_json::to_string_pretty(&json)
-        .map_err(|e| CliError::query(ferrule_core::CoreError::QueryFailed(e.to_string())))
+        .map_err(|e| CliError::query(ferrule_sql::SqlError::QueryFailed(e.to_string())))
 }
 
 fn render_text(diff: &SchemaDiff) -> String {
@@ -347,8 +347,8 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrule_core::connection::QueryResult;
-    use ferrule_core::value::ColumnInfo;
+    use ferrule_sql::connection::QueryResult;
+    use ferrule_sql::value::ColumnInfo;
 
     fn col(name: &str, data_type: &str) -> ColumnSpec {
         ColumnSpec {
@@ -405,32 +405,32 @@ mod tests {
             columns: vec![
                 ColumnInfo {
                     name: "cid".into(),
-                    type_hint: ferrule_core::value::TypeHint::Int64,
+                    type_hint: ferrule_sql::value::TypeHint::Int64,
                     nullable: false,
                 },
                 ColumnInfo {
                     name: "name".into(),
-                    type_hint: ferrule_core::value::TypeHint::String,
+                    type_hint: ferrule_sql::value::TypeHint::String,
                     nullable: false,
                 },
                 ColumnInfo {
                     name: "type".into(),
-                    type_hint: ferrule_core::value::TypeHint::String,
+                    type_hint: ferrule_sql::value::TypeHint::String,
                     nullable: false,
                 },
                 ColumnInfo {
                     name: "notnull".into(),
-                    type_hint: ferrule_core::value::TypeHint::Int64,
+                    type_hint: ferrule_sql::value::TypeHint::Int64,
                     nullable: false,
                 },
                 ColumnInfo {
                     name: "dflt_value".into(),
-                    type_hint: ferrule_core::value::TypeHint::String,
+                    type_hint: ferrule_sql::value::TypeHint::String,
                     nullable: true,
                 },
                 ColumnInfo {
                     name: "pk".into(),
-                    type_hint: ferrule_core::value::TypeHint::Int64,
+                    type_hint: ferrule_sql::value::TypeHint::Int64,
                     nullable: false,
                 },
             ],
@@ -459,7 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_sqlite_drift_detected() {
-        use ferrule_core::url::DatabaseUrl;
+        use ferrule_sql::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static N: AtomicU64 = AtomicU64::new(0);
@@ -473,10 +473,10 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut a = ferrule_core::connect(&url_a, &ConnectOptions::default(), None)
+        let mut a = ferrule_sql::connect(&url_a, &ConnectOptions::default(), None)
             .await
             .unwrap();
-        let mut b = ferrule_core::connect(&url_b, &ConnectOptions::default(), None)
+        let mut b = ferrule_sql::connect(&url_b, &ConnectOptions::default(), None)
             .await
             .unwrap();
 

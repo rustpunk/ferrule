@@ -4,8 +4,8 @@ use super::{
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::ConnectOptions;
 use ferrule_core::{DumpFormat, DumpOptions};
+use ferrule_sql::connection::ConnectOptions;
 
 #[derive(Args, Clone, Debug)]
 pub struct DumpArgs {
@@ -66,7 +66,7 @@ pub async fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), Cli
     .await?;
     check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
-    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
+    let backend = ferrule_sql::Backend::from_scheme(resolved.url.scheme())
         .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     if args.deterministic && args.conn_flags.daemon {

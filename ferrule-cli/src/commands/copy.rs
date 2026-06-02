@@ -1,14 +1,14 @@
 use super::CopyArgs;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::Backend;
-use ferrule_core::connection::ConnectOptions;
-use ferrule_core::copy::{
+use ferrule_sql::backend::Backend;
+use ferrule_sql::connection::ConnectOptions;
+use ferrule_sql::copy::{
     copy_all_tables, copy_rows, AllTablesOptions, BulkMode, CopyFormat, CopyOptions, CopySource,
     IfExists,
 };
 
-// `BulkMode` itself comes from ferrule_core; the CLI wraps it in
+// `BulkMode` itself comes from ferrule_sql; the CLI wraps it in
 // `BulkNativeMode` so clap can enumerate values in --help and reject
 // bad inputs with a real usage error instead of routing them through
 // the runtime parser.
@@ -38,26 +38,28 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
         }
         None
     } else {
-        Some(match (args.table.clone(), args.query.clone(), args.into.clone()) {
-            (Some(t), None, _) => CopySource::Table(t),
-            (None, Some(q), Some(i)) => CopySource::Query { sql: q, into: i },
-            (None, Some(_), None) => {
-                return Err(CliError::usage(
-                    "--query requires --into NAME for the target table.",
-                ));
-            }
-            (None, None, _) => {
-                return Err(CliError::usage(
-                    "Pass --table NAME, --query SQL --into NAME, or --all-tables.",
-                ));
-            }
-            (Some(_), Some(_), _) => {
-                // clap's conflicts_with should catch this, but belt-and-braces.
-                return Err(CliError::usage(
-                    "--table and --query are mutually exclusive.",
-                ));
-            }
-        })
+        Some(
+            match (args.table.clone(), args.query.clone(), args.into.clone()) {
+                (Some(t), None, _) => CopySource::Table(t),
+                (None, Some(q), Some(i)) => CopySource::Query { sql: q, into: i },
+                (None, Some(_), None) => {
+                    return Err(CliError::usage(
+                        "--query requires --into NAME for the target table.",
+                    ));
+                }
+                (None, None, _) => {
+                    return Err(CliError::usage(
+                        "Pass --table NAME, --query SQL --into NAME, or --all-tables.",
+                    ));
+                }
+                (Some(_), Some(_), _) => {
+                    // clap's conflicts_with should catch this, but belt-and-braces.
+                    return Err(CliError::usage(
+                        "--table and --query are mutually exclusive.",
+                    ));
+                }
+            },
+        )
     };
 
     let if_exists = IfExists::parse(&args.if_exists).ok_or_else(|| {
@@ -331,29 +333,30 @@ mod tests {
 
     #[test]
     fn merge_per_side_str_rejects_both_set() {
-        let err = merge_per_side_str(
-            Some("u@a"),
-            Some("u@b"),
-            "--ssh-tunnel",
-            "--src-ssh-tunnel",
-        )
-        .expect_err("expected usage error");
+        let err = merge_per_side_str(Some("u@a"), Some("u@b"), "--ssh-tunnel", "--src-ssh-tunnel")
+            .expect_err("expected usage error");
         let msg = format!("{err}");
-        assert!(msg.contains("--ssh-tunnel"), "msg should name both flags: {msg}");
-        assert!(msg.contains("--src-ssh-tunnel"), "msg should name both flags: {msg}");
+        assert!(
+            msg.contains("--ssh-tunnel"),
+            "msg should name both flags: {msg}"
+        );
+        assert!(
+            msg.contains("--src-ssh-tunnel"),
+            "msg should name both flags: {msg}"
+        );
     }
 
     #[test]
     fn merge_per_side_str_prefers_side_when_only_side_set() {
-        let v = merge_per_side_str(Some("u@a"), None, "--ssh-tunnel", "--src-ssh-tunnel")
-            .expect("ok");
+        let v =
+            merge_per_side_str(Some("u@a"), None, "--ssh-tunnel", "--src-ssh-tunnel").expect("ok");
         assert_eq!(v, Some("u@a".to_string()));
     }
 
     #[test]
     fn merge_per_side_str_falls_back_to_shared() {
-        let v = merge_per_side_str(None, Some("u@a"), "--ssh-tunnel", "--src-ssh-tunnel")
-            .expect("ok");
+        let v =
+            merge_per_side_str(None, Some("u@a"), "--ssh-tunnel", "--src-ssh-tunnel").expect("ok");
         assert_eq!(v, Some("u@a".to_string()));
     }
 
@@ -368,8 +371,14 @@ mod tests {
         let err = merge_per_side_bool(true, true, "--insecure", "--src-insecure")
             .expect_err("expected usage error");
         let msg = format!("{err}");
-        assert!(msg.contains("--insecure"), "msg should name both flags: {msg}");
-        assert!(msg.contains("--src-insecure"), "msg should name both flags: {msg}");
+        assert!(
+            msg.contains("--insecure"),
+            "msg should name both flags: {msg}"
+        );
+        assert!(
+            msg.contains("--src-insecure"),
+            "msg should name both flags: {msg}"
+        );
     }
 
     #[test]
