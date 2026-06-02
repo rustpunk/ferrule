@@ -3,8 +3,9 @@
 use super::{resolve_connection, ConnectionFlags};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::ConnectOptions;
-use ferrule_core::migrate::{Dialect, Direction, MigrationEngine};
+use ferrule_sql::connection::ConnectOptions;
+use ferrule_core::migrate::{Direction, MigrationEngine};
+use ferrule_sql::Dialect;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -54,7 +55,7 @@ pub enum MigrateCmd {
 }
 
 fn core_err(msg: String) -> CliError {
-    CliError::query(ferrule_core::CoreError::QueryFailed(msg))
+    CliError::query(ferrule_sql::SqlError::QueryFailed(msg))
 }
 
 pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), CliError> {

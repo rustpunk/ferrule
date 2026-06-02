@@ -3,8 +3,8 @@ use crate::bench::BenchSummary;
 use crate::cache::{self, CacheDb, CacheKey};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::Backend;
-use ferrule_core::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
+use ferrule_sql::backend::Backend;
+use ferrule_sql::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
 use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::{infer_type, parse_param, substitute, ParameterSet};
@@ -33,14 +33,14 @@ fn maybe_apply_filter(rendered: String, filter: Option<&str>) -> Result<String, 
         return Ok(rendered);
     };
     let parsed: serde_json::Value = serde_json::from_str(&rendered).map_err(|e| {
-        CliError::query(ferrule_core::CoreError::QueryFailed(format!(
+        CliError::query(ferrule_sql::SqlError::QueryFailed(format!(
             "filter expects JSON output but rendered output is not valid JSON: {e}"
         )))
     })?;
     let filtered = crate::output::apply_filter(parsed, expr)
-        .map_err(|e| CliError::query(ferrule_core::CoreError::QueryFailed(e)))?;
+        .map_err(|e| CliError::query(ferrule_sql::SqlError::QueryFailed(e)))?;
     serde_json::to_string_pretty(&filtered)
-        .map_err(|e| CliError::query(ferrule_core::CoreError::QueryFailed(e.to_string())))
+        .map_err(|e| CliError::query(ferrule_sql::SqlError::QueryFailed(e.to_string())))
 }
 
 fn render_query_result(
@@ -116,7 +116,7 @@ async fn run_bench(
         // Mirror the regular dispatch triage so DML and SELECT both work.
         let iter_result: Result<(), CliError> = match conn.query(sql).await {
             Ok(_) => Ok(()),
-            Err(ferrule_core::CoreError::QueryFailed(_)) => match conn.execute(sql).await {
+            Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(sql).await {
                 Ok(_) => Ok(()),
                 Err(_) => conn
                     .execute_multi(sql)
@@ -129,7 +129,7 @@ async fn run_bench(
         if let Err(e) = iter_result {
             if txn.begin {
                 let _ =
-                    ferrule_core::transaction::rollback_transaction(conn, txn.backend).await;
+                    ferrule_sql::transaction::rollback_transaction(conn, txn.backend).await;
                 eprintln!("[ferrule] inner statement failed — rolled back wrapping transaction");
             }
             return Err(e);
@@ -160,10 +160,10 @@ async fn run_bench(
 
     if txn.begin {
         if txn.rollback {
-            let _ = ferrule_core::transaction::rollback_transaction(conn, txn.backend).await;
+            let _ = ferrule_sql::transaction::rollback_transaction(conn, txn.backend).await;
             eprintln!("[ferrule] explicit ROLLBACK (--rollback)");
         } else {
-            ferrule_core::transaction::commit_transaction(conn, txn.backend)
+            ferrule_sql::transaction::commit_transaction(conn, txn.backend)
                 .await
                 .map_err(CliError::query)?;
         }
@@ -412,7 +412,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         eprintln!("[ferrule] Resolved URL: {}", resolved.url.redacted());
     }
 
-    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
+    let backend = ferrule_sql::Backend::from_scheme(resolved.url.scheme())
         .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     // Substitute parameters into SQL before paging
@@ -487,13 +487,13 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     // still returns `true` so the wrapping COMMIT/ROLLBACK terminates
     // the implicit transaction.
     let outer_tx_opened = if args.begin {
-        ferrule_core::transaction::begin_transaction(&mut *conn, backend).await
+        ferrule_sql::transaction::begin_transaction(&mut *conn, backend).await
     } else {
         false
     };
 
     // Inject server-side paging into the SQL
-    let sql = ferrule_core::apply_paging(&sql, limit, offset, backend).map_err(CliError::query)?;
+    let sql = ferrule_sql::apply_paging(&sql, limit, offset, backend).map_err(CliError::query)?;
 
     if (limit.is_some() || offset.is_some()) && args.output.verbose {
         eprintln!("[ferrule] Paged SQL: {}", sql);
@@ -522,7 +522,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     let query_start = std::time::Instant::now();
     let dispatch_result: Result<Vec<StatementResult>, CliError> = match conn.query(&sql).await {
         Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
-        Err(ferrule_core::CoreError::QueryFailed(_)) => match conn.execute(&sql).await {
+        Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql).await {
             Ok(summary) => Ok(vec![StatementResult::Summary(summary)]),
             Err(_) => conn.execute_multi(&sql).await.map_err(CliError::query),
         },
@@ -536,7 +536,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         Err(e) => {
             if outer_tx_opened {
                 let _ =
-                    ferrule_core::transaction::rollback_transaction(&mut *conn, backend).await;
+                    ferrule_sql::transaction::rollback_transaction(&mut *conn, backend).await;
                 eprintln!("[ferrule] inner statement failed — rolled back wrapping transaction");
             }
             return Err(e);
@@ -609,7 +609,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             break 'cache_insert;
         }
         let preview_end = sql.len().min(200);
-        let redacted = ferrule_core::DatabaseUrl::parse(&args.connection)
+        let redacted = ferrule_sql::DatabaseUrl::parse(&args.connection)
             .map(|u| u.redacted())
             .unwrap_or_else(|_| args.connection.clone());
         let meta = cache::CacheMeta {
@@ -657,10 +657,10 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
 
     if outer_tx_opened {
         if args.rollback {
-            let _ = ferrule_core::transaction::rollback_transaction(&mut *conn, backend).await;
+            let _ = ferrule_sql::transaction::rollback_transaction(&mut *conn, backend).await;
             eprintln!("[ferrule] explicit ROLLBACK (--rollback)");
         } else {
-            ferrule_core::transaction::commit_transaction(&mut *conn, backend)
+            ferrule_sql::transaction::commit_transaction(&mut *conn, backend)
                 .await
                 .map_err(CliError::query)?;
         }
@@ -697,8 +697,8 @@ fn check_fail_on_empty(results: &[StatementResult]) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrule_core::connection::ExecutionSummary;
-    use ferrule_core::value::{ColumnInfo, TypeHint, Value};
+    use ferrule_sql::connection::ExecutionSummary;
+    use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
 
     fn col(name: &str) -> ColumnInfo {
         ColumnInfo {

@@ -17,6 +17,16 @@ oracle = ["ferrule-core/oracle"]
 ssh = ["ferrule-core/ssh"]
 
 [dependencies]
+# The extracted SQL driver core: neutral Value/Row types, DatabaseUrl
+# parser, the Connection trait + per-backend drivers, the connect
+# dispatcher (incl. SSH-tunnel transport under `ssh`), transaction
+# helpers, the copy/bulk write path, the Dialect classifier, and the
+# SqlError error type. Consumed directly by the CLI command tree; the
+# backend feature flags below stay forwarded through ferrule-core (which
+# in turn forwards to ferrule-sql), so cargo's per-crate feature
+# unification keeps the ssh-gated `connect_with_tunnel` available to the
+# CLI whenever the CLI's `ssh` feature is on.
+ferrule-sql = { path = "../ferrule-sql" }
 ferrule-core = { path = "../ferrule-core" }
 ferrule-config = { path = "../ferrule-config" }
 

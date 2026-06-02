@@ -22,9 +22,10 @@
 //! See `docs/src/cache.md` for the user-facing contract.
 
 use ferrule_config::profile::CacheConfig;
-use ferrule_core::connection::QueryResult;
-use ferrule_core::value::{ColumnInfo, Row};
-use ferrule_core::{DatabaseUrl, ParameterSet};
+use ferrule_sql::connection::QueryResult;
+use ferrule_core::ParameterSet;
+use ferrule_sql::value::{ColumnInfo, Row};
+use ferrule_sql::DatabaseUrl;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -301,7 +302,7 @@ fn cache_key_input(conn: &str, sql: &str, params: &ParameterSet) -> String {
         .map(|u| u.redacted())
         .unwrap_or_else(|_| conn.to_string());
     let normalized = normalize_sql(sql);
-    let mut canon: Vec<(String, ferrule_core::value::Value)> = params
+    let mut canon: Vec<(String, ferrule_sql::value::Value)> = params
         .map
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -517,7 +518,7 @@ const MIGRATIONS: &[(u32, &str)] = &[(1, SCHEMA_V1)];
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrule_core::value::{ColumnInfo, TypeHint, Value};
+    use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
     use std::sync::Mutex;
 
     /// Cross-test mutex for `FERRULE_NO_CACHE` env-var manipulation

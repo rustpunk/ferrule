@@ -1,8 +1,8 @@
 use crate::error::CliError;
 use dashmap::DashMap;
-use ferrule_core::connection::{ConnectOptions, StatementResult};
+use ferrule_sql::connection::{ConnectOptions, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
-use ferrule_core::url::DatabaseUrl;
+use ferrule_sql::url::DatabaseUrl;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,7 +57,7 @@ pub enum Response {
 // ---------------------------------------------------------------------------
 
 struct PooledConnection {
-    conn: Mutex<Box<dyn ferrule_core::Connection>>,
+    conn: Mutex<Box<dyn ferrule_sql::Connection>>,
     last_used: std::time::Instant,
 }
 
@@ -74,7 +74,7 @@ async fn get_or_connect(pool: &Pool, url: &DatabaseUrl, insecure: bool) -> Resul
     }
 
     let opts = ConnectOptions { insecure };
-    let conn = ferrule_core::backend::connect(url, &opts, None)
+    let conn = ferrule_sql::backend::connect(url, &opts, None)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -120,7 +120,7 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
                 }
             };
 
-            let backend = match ferrule_core::Backend::from_scheme(db_url.scheme()) {
+            let backend = match ferrule_sql::Backend::from_scheme(db_url.scheme()) {
                 Some(b) => b,
                 None => {
                     return Response::Err {
@@ -129,7 +129,7 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
                 }
             };
 
-            let paged_sql = match ferrule_core::apply_paging(&sql, limit, offset, backend) {
+            let paged_sql = match ferrule_sql::apply_paging(&sql, limit, offset, backend) {
                 Ok(s) => s,
                 Err(e) => {
                     return Response::Err {
@@ -149,7 +149,7 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
 
             let results = match guard.query(&paged_sql).await {
                 Ok(qr) => vec![StatementResult::Query(qr)],
-                Err(ferrule_core::CoreError::QueryFailed(_)) => {
+                Err(ferrule_sql::SqlError::QueryFailed(_)) => {
                     match guard.execute(&paged_sql).await {
                         Ok(summary) => {
                             vec![StatementResult::Summary(summary)]

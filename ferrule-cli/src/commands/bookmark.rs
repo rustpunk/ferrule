@@ -5,8 +5,8 @@ use crate::error::CliError;
 use clap::{Args, Subcommand};
 use ferrule_config::bookmarks::BookmarkStore;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::Backend;
-use ferrule_core::connection::{ConnectOptions, StatementResult};
+use ferrule_sql::backend::Backend;
+use ferrule_sql::connection::{ConnectOptions, StatementResult};
 use ferrule_core::formatter::format_result as fmt_result;
 use std::io::Write;
 
@@ -195,11 +195,11 @@ async fn cmd_run(
 
     let mut conn = connect_resolved(resolved, &opts).await?;
 
-    let sql = ferrule_core::apply_paging(&sql, limit, offset, backend).map_err(CliError::query)?;
+    let sql = ferrule_sql::apply_paging(&sql, limit, offset, backend).map_err(CliError::query)?;
 
     let results = match conn.query(&sql).await {
         Ok(qr) => vec![StatementResult::Query(qr)],
-        Err(ferrule_core::CoreError::QueryFailed(_)) => match conn.execute(&sql).await {
+        Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql).await {
             Ok(summary) => vec![StatementResult::Summary(summary)],
             Err(_) => conn.execute_multi(&sql).await.map_err(CliError::query)?,
         },

@@ -28,7 +28,7 @@ pub use watch::WatchArgs;
 
 use clap::{Args, Subcommand, ValueEnum};
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::copy::{BulkMode, CopyFormat};
+use ferrule_sql::copy::{BulkMode, CopyFormat};
 
 /// CLI-side representation of [`BulkMode`]. Derived from
 /// `clap::ValueEnum` so `--help` enumerates the valid values and

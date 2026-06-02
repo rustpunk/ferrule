@@ -36,7 +36,7 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
             )
             .await?;
             super::check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
-            let opts = ferrule_core::connection::ConnectOptions {
+            let opts = ferrule_sql::connection::ConnectOptions {
                 insecure: conn_flags.insecure,
             };
             if opts.insecure {

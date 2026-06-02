@@ -1,8 +1,8 @@
 use crate::error::CliError;
 use crate::ssh_keys::KeySource;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::tunnel::SshConfig;
-use ferrule_core::url::DatabaseUrl;
+use ferrule_sql::tunnel::SshConfig;
+use ferrule_sql::url::DatabaseUrl;
 
 /// SSH inputs collected by [`resolve_connection`]: the merged SSH
 /// configuration plus the resolved [`KeySource`]. The caller hands
@@ -23,7 +23,7 @@ pub struct SshTunnelInputs {
 pub struct ResolvedConnection {
     pub url: DatabaseUrl,
     pub ssh: Option<SshTunnelInputs>,
-    pub proxy: Option<ferrule_core::ProxyConfig>,
+    pub proxy: Option<ferrule_sql::ProxyConfig>,
 }
 
 /// Resolve a connection string — either a raw URL or a registry/profile
@@ -97,19 +97,19 @@ pub fn check_daemon_ssh_compat(
     Ok(())
 }
 
-/// Establish a [`Connection`](ferrule_core::Connection) from a
+/// Establish a [`Connection`](ferrule_sql::Connection) from a
 /// [`ResolvedConnection`]. Routes through the SSH tunnel when
 /// `resolved.ssh` is `Some` (gated behind the `ssh` feature; without
 /// it, this returns a "compiled without SSH support" diagnostic).
 pub async fn connect_resolved(
     resolved: ResolvedConnection,
-    opts: &ferrule_core::ConnectOptions,
-) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
+    opts: &ferrule_sql::ConnectOptions,
+) -> Result<Box<dyn ferrule_sql::Connection>, CliError> {
     let proxy = resolved.proxy.as_ref();
     if let Some(ssh) = resolved.ssh {
         return connect_via_ssh_tunnel(resolved.url, ssh, opts, proxy).await;
     }
-    ferrule_core::connect(&resolved.url, opts, proxy)
+    ferrule_sql::connect(&resolved.url, opts, proxy)
         .await
         .map_err(CliError::connection)
 }
@@ -118,12 +118,12 @@ pub async fn connect_resolved(
 async fn connect_via_ssh_tunnel(
     url: DatabaseUrl,
     ssh: SshTunnelInputs,
-    opts: &ferrule_core::ConnectOptions,
-    proxy: Option<&ferrule_core::ProxyConfig>,
-) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
+    opts: &ferrule_sql::ConnectOptions,
+    proxy: Option<&ferrule_sql::ProxyConfig>,
+) -> Result<Box<dyn ferrule_sql::Connection>, CliError> {
     let key_source = match &ssh.key_source {
-        KeySource::File(path) => match ferrule_core::tunnel::ssh_key_needs_passphrase(path) {
-            Ok(false) => ferrule_core::KeySource::File(path.clone(), None),
+        KeySource::File(path) => match ferrule_sql::tunnel::ssh_key_needs_passphrase(path) {
+            Ok(false) => ferrule_sql::KeySource::File(path.clone(), None),
             Ok(true) => {
                 let tty = is_terminal::IsTerminal::is_terminal(&std::io::stdin());
                 if !tty {
@@ -144,18 +144,18 @@ async fn connect_via_ssh_tunnel(
                 .await
                 .map_err(|e| CliError::usage(format!("Passphrase prompt failed: {e}")))?
                 .map_err(CliError::Io)?;
-                ferrule_core::KeySource::File(
+                ferrule_sql::KeySource::File(
                     path.clone(),
                     Some(secrecy::SecretString::new(passphrase.into())),
                 )
             }
             Err(e) => return Err(CliError::usage(e.to_string())),
         },
-        KeySource::Agent(path) => ferrule_core::KeySource::Agent(path.clone()),
+        KeySource::Agent(path) => ferrule_sql::KeySource::Agent(path.clone()),
     };
-    match ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy).await {
+    match ferrule_sql::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy).await {
         Ok(conn) => Ok(conn),
-        Err(ferrule_core::CoreError::SshUnknownHost {
+        Err(ferrule_sql::SqlError::SshUnknownHost {
             host,
             port,
             algorithm,
@@ -185,16 +185,16 @@ async fn connect_via_ssh_tunnel(
                     "Host {host}:{port} not accepted. Aborting."
                 )));
             }
-            ferrule_core::tunnel::learn_host_key(&host, port, &key).map_err(|e| {
-                CliError::connection(ferrule_core::CoreError::ConnectionFailed(e.to_string()))
+            ferrule_sql::tunnel::learn_host_key(&host, port, &key).map_err(|e| {
+                CliError::connection(ferrule_sql::SqlError::ConnectionFailed(e.to_string()))
             })?;
             // Retry once after writing the key.
-            ferrule_core::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy)
+            ferrule_sql::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy)
                 .await
                 .map_err(CliError::connection)
         }
-        Err(ferrule_core::CoreError::SshHostKeyMismatch { host, port }) => Err(
-            CliError::connection(ferrule_core::CoreError::ConnectionFailed(format!(
+        Err(ferrule_sql::SqlError::SshHostKeyMismatch { host, port }) => Err(
+            CliError::connection(ferrule_sql::SqlError::ConnectionFailed(format!(
                 "SSH host key mismatch for {host}:{port}\n\
                  The key sent by the server does not match the one recorded \
                  in ~/.ssh/known_hosts.\n\
@@ -210,9 +210,9 @@ async fn connect_via_ssh_tunnel(
 async fn connect_via_ssh_tunnel(
     _url: DatabaseUrl,
     ssh: SshTunnelInputs,
-    _opts: &ferrule_core::ConnectOptions,
-    _proxy: Option<&ferrule_core::ProxyConfig>,
-) -> Result<Box<dyn ferrule_core::Connection>, CliError> {
+    _opts: &ferrule_sql::ConnectOptions,
+    _proxy: Option<&ferrule_sql::ProxyConfig>,
+) -> Result<Box<dyn ferrule_sql::Connection>, CliError> {
     let _ = (&ssh.config, &ssh.key_source);
     Err(CliError::usage(
         "This ferrule binary was built without the `ssh` feature. \

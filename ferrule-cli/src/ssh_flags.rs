@@ -14,7 +14,7 @@
 
 use crate::error::CliError;
 use ferrule_config::profile::{ConnectionProfile, GlobalConfig};
-use ferrule_core::tunnel::SshConfig;
+use ferrule_sql::tunnel::SshConfig;
 
 /// Result of parsing a `--ssh-tunnel [user@]host[:port]` flag value.
 #[derive(Debug, Clone, PartialEq, Eq)]

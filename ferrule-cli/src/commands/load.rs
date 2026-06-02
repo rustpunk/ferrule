@@ -2,7 +2,7 @@ use super::{check_daemon_ssh_compat, connect_resolved, resolve_connection, Conne
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::ConnectOptions;
+use ferrule_sql::connection::ConnectOptions;
 use ferrule_core::{LoadFormat, LoadOptions};
 use std::path::Path;
 
@@ -79,7 +79,7 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
     .await?;
     check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
-    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
+    let backend = ferrule_sql::Backend::from_scheme(resolved.url.scheme())
         .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     let opts = LoadOptions {

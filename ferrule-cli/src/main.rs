@@ -247,7 +247,7 @@ impl Snapshot {
 /// passed through `DatabaseUrl::redacted()` (which scrubs the password);
 /// registry names and SQLite paths fall through unchanged.
 fn redact(s: &str) -> String {
-    ferrule_core::DatabaseUrl::parse(s)
+    ferrule_sql::DatabaseUrl::parse(s)
         .map(|u| u.redacted())
         .unwrap_or_else(|_| s.to_string())
 }

@@ -1385,6 +1385,7 @@ dependencies = [
  "dirs",
  "ferrule-config",
  "ferrule-core",
+ "ferrule-sql",
  "hasp",
  "indexmap",
  "is-terminal",

@@ -4,7 +4,7 @@ use super::{
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::connection::ConnectOptions;
+use ferrule_sql::connection::ConnectOptions;
 use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::format_result;
 
@@ -49,7 +49,7 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
         eprintln!("[ferrule] Resolved URL: {}", resolved.url.redacted());
     }
 
-    let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
+    let backend = ferrule_sql::Backend::from_scheme(resolved.url.scheme())
         .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
     let (wrapped_sql, explain_out, is_multi) =
@@ -98,11 +98,11 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
         results
             .into_iter()
             .find_map(|r| match r {
-                ferrule_core::connection::StatementResult::Query(qr) => Some(qr),
+                ferrule_sql::connection::StatementResult::Query(qr) => Some(qr),
                 _ => None,
             })
             .ok_or_else(|| {
-                CliError::query(ferrule_core::CoreError::QueryFailed(
+                CliError::query(ferrule_sql::SqlError::QueryFailed(
                     "EXPLAIN produced no query result".to_string(),
                 ))
             })?

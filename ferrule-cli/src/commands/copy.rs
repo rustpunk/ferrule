@@ -1,14 +1,14 @@
 use super::CopyArgs;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_core::backend::Backend;
-use ferrule_core::connection::ConnectOptions;
-use ferrule_core::copy::{
+use ferrule_sql::backend::Backend;
+use ferrule_sql::connection::ConnectOptions;
+use ferrule_sql::copy::{
     copy_all_tables, copy_rows, AllTablesOptions, BulkMode, CopyFormat, CopyOptions, CopySource,
     IfExists,
 };
 
-// `BulkMode` itself comes from ferrule_core; the CLI wraps it in
+// `BulkMode` itself comes from ferrule_sql; the CLI wraps it in
 // `BulkNativeMode` so clap can enumerate values in --help and reject
 // bad inputs with a real usage error instead of routing them through
 // the runtime parser.
