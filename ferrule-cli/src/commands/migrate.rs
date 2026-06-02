@@ -4,7 +4,7 @@ use super::{resolve_connection, ConnectionFlags};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_core::connection::ConnectOptions;
-use ferrule_core::migrate::{Direction, MigrationEngine};
+use ferrule_core::migrate::{Dialect, Direction, MigrationEngine};
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -68,12 +68,39 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
     )
     .await?;
 
+    // Enforce the same `--daemon` + SSH-tunnel incompatibility guard every
+    // other command runs, so `migrate --daemon --ssh-tunnel` fails with the
+    // documented usage error instead of silently bypassing it.
+    super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
+
+    // The connection-pooling daemon speaks a one-shot, formatted-payload
+    // protocol (Query / ListTables / DescribeTable). A migration run is a
+    // stateful sequence — create the tracking table, read applied versions
+    // as structured rows, execute multi-statement DDL, then insert/delete
+    // the tracking row — that the daemon protocol cannot express. Rather
+    // than silently ignore `--daemon` (dropping pooling without warning),
+    // reject it with a clear usage error.
+    if args.conn_flags.daemon {
+        return Err(CliError::usage(
+            "migrate does not support --daemon: the connection-pooling daemon \
+             handles one-shot queries, not the stateful multi-step migration \
+             session (tracking-table setup, structured-row reads, multi-statement \
+             DDL). Run migrate without --daemon.",
+        ));
+    }
+
     let opts = ConnectOptions {
         insecure: args.conn_flags.insecure,
     };
+
+    // Capture the SQL dialect from the URL scheme before
+    // `connect_resolved` consumes `resolved`. Unrecognised schemes fall
+    // back to SQLite semantics (ANSI `LIMIT`, `TEXT` columns).
+    let dialect = Dialect::from_scheme(resolved.url.scheme()).unwrap_or(Dialect::Sqlite);
+
     let conn = super::connect_resolved(resolved, &opts).await?;
 
-    let mut engine = MigrationEngine::new(conn, args.dir.clone());
+    let mut engine = MigrationEngine::new(conn, args.dir.clone(), dialect);
 
     match args.cmd {
         MigrateCmd::Up => {
@@ -128,7 +155,20 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 .count();
             let pending_count = up_files.len() - applied_count;
 
-            for f in up_files {
+            // Drift: versions recorded in ferrule_migrations that have no
+            // matching `.up.sql` on disk — a deleted or renamed migration the
+            // database still believes is applied. Without this the command
+            // would report a clean status and mask exactly that divergence.
+            let on_disk: std::collections::HashSet<&str> =
+                up_files.iter().map(|f| f.version.as_str()).collect();
+            let mut drift: Vec<&str> = applied
+                .iter()
+                .map(String::as_str)
+                .filter(|v| !on_disk.contains(v))
+                .collect();
+            drift.sort_unstable();
+
+            for f in &up_files {
                 let marker = if applied.contains(&f.version) {
                     "✔"
                 } else {
@@ -136,8 +176,16 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 };
                 println!("{} {}", marker, f.version);
             }
+            for v in &drift {
+                println!("✗ {} (applied, missing on disk)", v);
+            }
             println!();
-            println!("{} applied, {} pending", applied_count, pending_count);
+            println!(
+                "{} applied, {} pending, {} drift",
+                applied_count,
+                pending_count,
+                drift.len()
+            );
         }
 
         MigrateCmd::History => {
@@ -145,7 +193,7 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 .ensure_migration_table()
                 .await
                 .map_err(CliError::query)?;
-            let applied = engine.last_applied(100).await.map_err(CliError::query)?;
+            let applied = engine.all_applied().await.map_err(CliError::query)?;
             if applied.is_empty() {
                 println!("No applied migrations.");
             }
@@ -159,18 +207,25 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 .ensure_migration_table()
                 .await
                 .map_err(CliError::query)?;
-            let applied = engine.last_applied(100).await.map_err(CliError::query)?;
-            let mut ok = true;
-            for m in applied {
-                match engine.verify_checksum(&m.version).await {
-                    Err(e) => {
-                        eprintln!("  ✗ {} — {}", m.version, e);
-                        ok = false;
-                    }
-                    Ok(()) => println!("  ✔ {}", m.version),
+            let applied = engine.all_applied().await.map_err(CliError::query)?;
+            // Scan the migrations directory once and compare every applied
+            // migration against the checksums already returned above — no
+            // per-migration directory re-scan or follow-up SELECT.
+            let drift = engine
+                .verify_applied(&applied)
+                .await
+                .map_err(CliError::query)?;
+            let drifted: std::collections::HashSet<&str> =
+                drift.iter().map(|d| d.version.as_str()).collect();
+            for m in &applied {
+                if !drifted.contains(m.version.as_str()) {
+                    println!("  ✔ {}", m.version);
                 }
             }
-            if !ok {
+            for d in &drift {
+                eprintln!("  ✗ {} — {}", d.version, d.reason);
+            }
+            if !drift.is_empty() {
                 std::process::exit(1);
             }
         }
@@ -183,13 +238,29 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
             tokio::fs::create_dir_all(&args.dir)
                 .await
                 .map_err(|e| core_err(format!("cannot create migrations dir: {}", e)))?;
+            // Refuse to clobber existing files. Two `create <name>` runs in
+            // the same second collapse to the same stem; `tokio::fs::write`
+            // would truncate, silently destroying hand-written SQL in the
+            // earlier pair. Check both targets first and error instead.
+            for path in [&up, &down] {
+                if tokio::fs::try_exists(path)
+                    .await
+                    .map_err(|e| core_err(format!("cannot check {}: {}", path.display(), e)))?
+                {
+                    return Err(core_err(format!(
+                        "migration file already exists: {}\nRefusing to overwrite; choose a different name or remove the existing file.",
+                        path.display()
+                    )));
+                }
+            }
             tokio::fs::write(&up, "-- up\n\n")
                 .await
                 .map_err(|e| core_err(format!("cannot write {}: {}", up.display(), e)))?;
             tokio::fs::write(&down, "-- down\n\n")
                 .await
                 .map_err(|e| core_err(format!("cannot write {}: {}", down.display(), e)))?;
-            println!("Created migrations/{}_*.{{up,down}}.sql", ts);
+            println!("Created {}", up.display());
+            println!("Created {}", down.display());
         }
     }
 
