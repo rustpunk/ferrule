@@ -4,7 +4,7 @@ use super::{resolve_connection, ConnectionFlags};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_core::connection::ConnectOptions;
-use ferrule_core::migrate::{Direction, MigrationEngine};
+use ferrule_core::migrate::{Dialect, Direction, MigrationEngine};
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -71,9 +71,15 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
     let opts = ConnectOptions {
         insecure: args.conn_flags.insecure,
     };
+
+    // Capture the SQL dialect from the URL scheme before
+    // `connect_resolved` consumes `resolved`. Unrecognised schemes fall
+    // back to SQLite semantics (ANSI `LIMIT`, `TEXT` columns).
+    let dialect = Dialect::from_scheme(resolved.url.scheme()).unwrap_or(Dialect::Sqlite);
+
     let conn = super::connect_resolved(resolved, &opts).await?;
 
-    let mut engine = MigrationEngine::new(conn, args.dir.clone());
+    let mut engine = MigrationEngine::new(conn, args.dir.clone(), dialect);
 
     match args.cmd {
         MigrateCmd::Up => {
