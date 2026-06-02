@@ -1,7 +1,7 @@
 //! Lightweight, multi-backend SQL migration runner.
 //!
 //! A `migrations/` directory of timestamp-ordered `.up.sql` / `.down.sql`
-//! files is tracked in a `__ferrule_migrations` table inside the target
+//! files is tracked in a `ferrule_migrations` table inside the target
 //! database.  Pure SQL, no ORM, no DSL.
 //!
 //! File naming: `YYYYMMDDHHMMSS_<name>.{up,down}.sql` — lex sort = order.
@@ -77,7 +77,7 @@ impl MigrationEngine {
         }
     }
 
-    /// Ensure the `__ferrule_migrations` tracking table exists.
+    /// Ensure the `ferrule_migrations` tracking table exists.
     ///
     /// The DDL is dialect-specific because the canonical column types,
     /// the timestamp default, and the "create if absent" idiom differ
@@ -97,21 +97,21 @@ impl MigrationEngine {
     pub async fn ensure_migration_table(&mut self) -> Result<(), CoreError> {
         let sql = match self.dialect {
             Dialect::Sqlite | Dialect::Postgres => {
-                r#"CREATE TABLE IF NOT EXISTS __ferrule_migrations (
+                r#"CREATE TABLE IF NOT EXISTS ferrule_migrations (
     version TEXT PRIMARY KEY,
     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     checksum TEXT NOT NULL
 )"#
                 .to_string()
             }
-            Dialect::MySql => r#"CREATE TABLE IF NOT EXISTS __ferrule_migrations (
+            Dialect::MySql => r#"CREATE TABLE IF NOT EXISTS ferrule_migrations (
     version VARCHAR(255) PRIMARY KEY,
     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     checksum VARCHAR(64) NOT NULL
 )"#
             .to_string(),
-            Dialect::MsSql => r#"IF OBJECT_ID(N'__ferrule_migrations', N'U') IS NULL
-CREATE TABLE __ferrule_migrations (
+            Dialect::MsSql => r#"IF OBJECT_ID(N'ferrule_migrations', N'U') IS NULL
+CREATE TABLE ferrule_migrations (
     version NVARCHAR(255) PRIMARY KEY,
     applied_at DATETIME2 DEFAULT SYSUTCDATETIME(),
     checksum NVARCHAR(64) NOT NULL
@@ -122,7 +122,7 @@ CREATE TABLE __ferrule_migrations (
                 // is the table-already-exists signal; swallow it so the
                 // call is idempotent like the other dialects.
                 r#"BEGIN
-    EXECUTE IMMEDIATE 'CREATE TABLE __ferrule_migrations (
+    EXECUTE IMMEDIATE 'CREATE TABLE ferrule_migrations (
         version VARCHAR2(255) PRIMARY KEY,
         applied_at TIMESTAMP DEFAULT SYSTIMESTAMP,
         checksum VARCHAR2(64) NOT NULL
@@ -151,7 +151,7 @@ END;"#
 
     /// Apply a single migration (`.up.sql`).
     ///
-    /// The migration script and the `__ferrule_migrations` tracking-row
+    /// The migration script and the `ferrule_migrations` tracking-row
     /// `INSERT` are committed as a single unit on backends with
     /// transactional DDL (SQLite, Postgres, MSSQL): both succeed or both
     /// roll back, so a mid-script failure can never leave the migration
@@ -171,7 +171,7 @@ END;"#
 
         validate_version(&file.version)?;
         let track = format!(
-            "INSERT INTO __ferrule_migrations (version, checksum) VALUES ({}, {})",
+            "INSERT INTO ferrule_migrations (version, checksum) VALUES ({}, {})",
             quote_string(&file.version),
             quote_string(&checksum)
         );
@@ -180,7 +180,7 @@ END;"#
 
     /// Rollback a single migration (`.down.sql`).
     ///
-    /// The rollback script and the `__ferrule_migrations` tracking-row
+    /// The rollback script and the `ferrule_migrations` tracking-row
     /// `DELETE` are committed together on backends with transactional DDL
     /// (SQLite, Postgres, MSSQL): the row is removed only if the entire
     /// down script succeeds, so a mid-script failure can never leave the
@@ -198,7 +198,7 @@ END;"#
 
         validate_version(&file.version)?;
         let track = format!(
-            "DELETE FROM __ferrule_migrations WHERE version = {}",
+            "DELETE FROM ferrule_migrations WHERE version = {}",
             quote_string(&file.version)
         );
         self.apply_atomic(&sql, &track).await
@@ -219,11 +219,13 @@ END;"#
     ///   default).
     /// - **MySQL / Oracle** — DDL implicitly commits, so wrapping it in a
     ///   transaction would not protect it. The script and the tracking
-    ///   statement run as two separate autocommitted operations
-    ///   (best-effort). A failure partway through the script can therefore
-    ///   leave the schema partially changed and the tracking row out of
-    ///   sync; this is an inherent limitation of these engines, not a bug
-    ///   in the runner.
+    ///   statement run as two separate operations (best-effort). A failure
+    ///   partway through the script can therefore leave the schema partially
+    ///   changed and the tracking row out of sync; this is an inherent
+    ///   limitation of these engines, not a bug in the runner. Oracle does
+    ///   not autocommit DML, so an explicit `COMMIT` persists the
+    ///   tracking-row write (and any DML in the script); MySQL autocommits,
+    ///   so it needs none.
     async fn apply_atomic(&mut self, script: &str, track: &str) -> Result<(), CoreError> {
         match self.dialect {
             Dialect::Sqlite | Dialect::Postgres | Dialect::MsSql => {
@@ -273,6 +275,13 @@ END;"#
             Dialect::MySql | Dialect::Oracle => {
                 self.conn.execute_multi(script).await?;
                 self.conn.execute(track).await?;
+                // Oracle does not autocommit DML: without an explicit COMMIT
+                // the tracking-row INSERT/DELETE (and any DML in the script)
+                // is rolled back when the connection closes. MySQL autocommits
+                // each statement, so this is Oracle-only.
+                if self.dialect == Dialect::Oracle {
+                    self.conn.execute("COMMIT").await?;
+                }
                 Ok(())
             }
         }
@@ -294,14 +303,14 @@ END;"#
         let order = "ORDER BY applied_at DESC, version DESC";
         let sql = match self.dialect {
             Dialect::Sqlite | Dialect::Postgres | Dialect::MySql => {
-                format!("SELECT version, checksum FROM __ferrule_migrations {order} LIMIT {n}")
+                format!("SELECT version, checksum FROM ferrule_migrations {order} LIMIT {n}")
             }
             Dialect::MsSql => {
-                format!("SELECT TOP {n} version, checksum FROM __ferrule_migrations {order}")
+                format!("SELECT TOP {n} version, checksum FROM ferrule_migrations {order}")
             }
             Dialect::Oracle => {
                 format!(
-                    "SELECT version, checksum FROM __ferrule_migrations {order} FETCH FIRST {n} ROWS ONLY"
+                    "SELECT version, checksum FROM ferrule_migrations {order} FETCH FIRST {n} ROWS ONLY"
                 )
             }
         };
@@ -318,11 +327,11 @@ END;"#
     /// same query runs on all backends.
     pub async fn all_applied(&mut self) -> Result<Vec<AppliedMigration>, CoreError> {
         let sql =
-            "SELECT version, checksum FROM __ferrule_migrations ORDER BY applied_at DESC, version DESC";
+            "SELECT version, checksum FROM ferrule_migrations ORDER BY applied_at DESC, version DESC";
         self.query_applied(sql).await
     }
 
-    /// Run a `SELECT version, checksum FROM __ferrule_migrations ...` query
+    /// Run a `SELECT version, checksum FROM ferrule_migrations ...` query
     /// and collect the rows into [`AppliedMigration`]s.
     async fn query_applied(&mut self, sql: &str) -> Result<Vec<AppliedMigration>, CoreError> {
         let result = self.conn.query(sql).await?;
@@ -348,7 +357,7 @@ END;"#
     pub async fn verify_checksum(&mut self, version: &str) -> Result<(), CoreError> {
         validate_version(version)?;
         let sql = format!(
-            "SELECT checksum FROM __ferrule_migrations WHERE version = {}",
+            "SELECT checksum FROM ferrule_migrations WHERE version = {}",
             quote_string(version)
         );
         let result = self.conn.query(&sql).await?;
@@ -398,7 +407,7 @@ END;"#
     // ------------------------------------------------------------------
 
     pub async fn applied_versions(&mut self) -> Result<HashSet<String>, CoreError> {
-        let sql = "SELECT version FROM __ferrule_migrations";
+        let sql = "SELECT version FROM ferrule_migrations";
         let result = self.conn.query(sql).await?;
         let mut set = HashSet::with_capacity(result.rows.len());
         for row in result.rows {

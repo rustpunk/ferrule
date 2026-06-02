@@ -155,7 +155,7 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 .count();
             let pending_count = up_files.len() - applied_count;
 
-            // Drift: versions recorded in __ferrule_migrations that have no
+            // Drift: versions recorded in ferrule_migrations that have no
             // matching `.up.sql` on disk — a deleted or renamed migration the
             // database still believes is applied. Without this the command
             // would report a clean status and mask exactly that divergence.
