@@ -1,0 +1,45 @@
+[package]
+name = "ferrule-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+postgres = ["dep:tokio-postgres","dep:tokio-postgres-rustls","dep:tokio-rustls","dep:webpki-roots","dep:uuid","dep:rust_decimal","dep:rustls","dep:bytes","dep:futures-util"]
+mysql = ["dep:mysql_async","dep:bytes","dep:futures-util"]
+mssql = ["dep:tiberius","dep:tokio-util"]
+sqlite = ["dep:rusqlite"]
+oracle = ["dep:oracle"]
+ssh = ["dep:russh","dep:pkcs5"]
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+indexmap = { workspace = true }
+url = { workspace = true }
+secrecy = { workspace = true }
+async-trait = "0.1"
+base64 = { workspace = true }
+hex = "0.4"
+rust_decimal = { version = "1", optional = true, features = ["db-tokio-postgres"] }
+tokio-postgres = { version = "0.7", optional = true, features = ["with-serde_json-1","with-chrono-0_4","with-uuid-1"] }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+uuid = { workspace = true, optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink","alloc"] }
+mysql_async = { version = "0.35", optional = true }
+tiberius = { version = "0.12", optional = true, features = ["chrono"] }
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled","chrono","serde_json"], optional = true }
+oracle = { version = "0.6", optional = true, features = ["chrono"] }
+russh = { version = "0.60", optional = true }
+pkcs5 = { version = "=0.8.0-rc.13", optional = true }

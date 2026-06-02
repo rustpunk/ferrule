@@ -2,7 +2,7 @@
 
 use crate::backends;
 use crate::connection::{ConnectOptions, Connection};
-use crate::error::CoreError;
+use crate::error::SqlError;
 use crate::url::DatabaseUrl;
 
 /// Supported database backends.
@@ -59,9 +59,9 @@ impl Backend {
 async fn connect_direct(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
-) -> Result<Box<dyn Connection>, CoreError> {
+) -> Result<Box<dyn Connection>, SqlError> {
     let backend = Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CoreError::UnsupportedScheme(url.scheme().to_string()))?;
+        .ok_or_else(|| SqlError::UnsupportedScheme(url.scheme().to_string()))?;
 
     match backend {
         #[cfg(feature = "postgres")]
@@ -103,16 +103,16 @@ pub async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
     proxy: Option<&crate::proxy::ProxyConfig>,
-) -> Result<Box<dyn Connection>, CoreError> {
+) -> Result<Box<dyn Connection>, SqlError> {
     let backend = Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CoreError::UnsupportedScheme(url.scheme().to_string()))?;
+        .ok_or_else(|| SqlError::UnsupportedScheme(url.scheme().to_string()))?;
 
     match backend {
         #[cfg(feature = "postgres")]
         Backend::Postgres => {
             if let Some(proxy) = proxy {
                 let target_host = url.host().ok_or_else(|| {
-                    CoreError::ConnectionFailed(
+                    SqlError::ConnectionFailed(
                         "URL has no host — proxy requires a network target".to_string(),
                     )
                 })?;
@@ -164,11 +164,11 @@ async fn connect_via_proxy_listener(
     opts: &ConnectOptions,
     proxy: &crate::proxy::ProxyConfig,
     backend: Backend,
-) -> Result<Box<dyn Connection>, CoreError> {
+) -> Result<Box<dyn Connection>, SqlError> {
     let target_host = url
         .host()
         .ok_or_else(|| {
-            CoreError::ConnectionFailed(
+            SqlError::ConnectionFailed(
                 "URL has no host — proxy requires a network target".to_string(),
             )
         })?
@@ -177,7 +177,7 @@ async fn connect_via_proxy_listener(
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .map_err(|e| CoreError::ConnectionFailed(format!("proxy listener bind: {e}")))?;
+        .map_err(|e| SqlError::ConnectionFailed(format!("proxy listener bind: {e}")))?;
     let port = listener.local_addr()?.port();
 
     let proxy = proxy.clone();
@@ -247,17 +247,17 @@ pub async fn connect_with_tunnel(
     ssh_config: &crate::tunnel::SshConfig,
     key_source: &crate::tunnel::KeySource,
     proxy: Option<&crate::proxy::ProxyConfig>,
-) -> Result<Box<dyn Connection>, CoreError> {
+) -> Result<Box<dyn Connection>, SqlError> {
     use crate::tunnel::{
         setup_tunnel, TunnelError, TunnelTransport, TunnelTransportResult, TunneledConnection,
     };
 
     let backend = Backend::from_scheme(url.scheme())
-        .ok_or_else(|| CoreError::UnsupportedScheme(url.scheme().to_string()))?;
+        .ok_or_else(|| SqlError::UnsupportedScheme(url.scheme().to_string()))?;
 
     #[cfg(feature = "sqlite")]
     if matches!(backend, Backend::Sqlite) {
-        return Err(CoreError::ConnectionFailed(
+        return Err(SqlError::ConnectionFailed(
             "SSH tunneling is not applicable to SQLite (local-file backend)".to_string(),
         ));
     }
@@ -265,7 +265,7 @@ pub async fn connect_with_tunnel(
     let target_host = url
         .host()
         .ok_or_else(|| {
-            CoreError::ConnectionFailed(
+            SqlError::ConnectionFailed(
                 "URL has no host — SSH tunneling requires a network-based backend".to_string(),
             )
         })?
@@ -289,7 +289,7 @@ pub async fn connect_with_tunnel(
     .await
     .map_err(|e| match e {
         TunnelError::HostKeyMismatch { host, port, .. } => {
-            CoreError::SshHostKeyMismatch { host, port }
+            SqlError::SshHostKeyMismatch { host, port }
         }
         TunnelError::UnknownHost {
             host,
@@ -298,14 +298,14 @@ pub async fn connect_with_tunnel(
             fingerprint,
             key,
             ..
-        } => CoreError::SshUnknownHost {
+        } => SqlError::SshUnknownHost {
             host,
             port,
             algorithm,
             fingerprint,
             key,
         },
-        other => CoreError::ConnectionFailed(format!("SSH tunnel setup: {other}")),
+        other => SqlError::ConnectionFailed(format!("SSH tunnel setup: {other}")),
     })?;
 
     let session = tunnel.session;
@@ -320,7 +320,7 @@ pub async fn connect_with_tunnel(
                     forwarder: None,
                 }));
             }
-            Err(CoreError::ConnectionFailed(
+            Err(SqlError::ConnectionFailed(
                 "Stream transport selected but no backend handler is registered \
                  (this is a ferrule bug — please report)"
                     .to_string(),
@@ -365,14 +365,14 @@ fn default_port_for(backend: Backend) -> u16 {
     feature = "mssql",
     feature = "oracle"
 ))]
-fn rewrite_url_to_local(url: &DatabaseUrl, port: u16) -> Result<DatabaseUrl, CoreError> {
+fn rewrite_url_to_local(url: &DatabaseUrl, port: u16) -> Result<DatabaseUrl, SqlError> {
     let mut parsed = ::url::Url::parse(url.raw())
-        .map_err(|e| CoreError::InvalidUrl(format!("re-parse for tunnel rewrite: {e}")))?;
+        .map_err(|e| SqlError::InvalidUrl(format!("re-parse for tunnel rewrite: {e}")))?;
     parsed
         .set_host(Some("127.0.0.1"))
-        .map_err(|e| CoreError::InvalidUrl(format!("set_host(127.0.0.1): {e}")))?;
+        .map_err(|e| SqlError::InvalidUrl(format!("set_host(127.0.0.1): {e}")))?;
     parsed
         .set_port(Some(port))
-        .map_err(|()| CoreError::InvalidUrl("set_port failed".to_string()))?;
+        .map_err(|()| SqlError::InvalidUrl("set_port failed".to_string()))?;
     DatabaseUrl::parse(parsed.as_str())
 }

@@ -1,5 +1,5 @@
 use crate::backend::Backend;
-use crate::error::CoreError;
+use crate::error::SqlError;
 
 /// Apply dialect-specific LIMIT / OFFSET paging to a SQL statement.
 ///
@@ -24,7 +24,7 @@ pub fn apply_paging(
     limit: Option<usize>,
     offset: Option<usize>,
     backend: Backend,
-) -> Result<String, CoreError> {
+) -> Result<String, SqlError> {
     let limit = limit.filter(|n| *n > 0);
     let offset = offset.filter(|n| *n > 0);
 
@@ -39,7 +39,7 @@ pub fn apply_paging(
 
     // Refuse multi-statement paging (only if semicolons remain after stripping trailing)
     if trimmed.contains(';') {
-        return Err(CoreError::QueryFailed(
+        return Err(SqlError::QueryFailed(
             "Multi-statement SQL does not support --limit / --offset.".into(),
         ));
     }
@@ -114,7 +114,7 @@ fn build_mssql_paging(
     upper: &str,
     limit: usize,
     offset: usize,
-) -> Result<String, CoreError> {
+) -> Result<String, SqlError> {
     let needs_order_by = !upper.contains("ORDER BY");
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let mut result = trimmed.to_string();
@@ -134,7 +134,7 @@ fn build_oracle_paging(
     upper: &str,
     limit: usize,
     offset: usize,
-) -> Result<String, CoreError> {
+) -> Result<String, SqlError> {
     let needs_order_by = !upper.contains("ORDER BY");
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let mut result = trimmed.to_string();

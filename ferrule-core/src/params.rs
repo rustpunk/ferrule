@@ -54,67 +54,6 @@ pub fn substitute(sql: &str, params: &ParameterSet, backend: Backend) -> Result<
     Ok(result)
 }
 
-/// Render a `Value` into a SQL literal suitable for inline substitution.
-pub fn render_value(value: &Value, backend: Backend) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Bool(b) => match backend {
-            #[cfg(feature = "oracle")]
-            Backend::Oracle => {
-                if *b {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                }
-            }
-            #[cfg(feature = "postgres")]
-            Backend::Postgres => bool_literal(*b),
-            #[cfg(feature = "mysql")]
-            Backend::MySql => bool_literal(*b),
-            #[cfg(feature = "mssql")]
-            Backend::MsSql => bool_literal(*b),
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite => bool_literal(*b),
-        },
-        Value::Int64(i) => i.to_string(),
-        Value::Float64(f) => f.to_string(),
-        Value::Decimal(d) => d.clone(),
-        Value::String(s) => quote_string(s),
-        Value::Bytes(_b) => {
-            // Bytes in parameter substitution are rare; render as a hex literal.
-            // This is best-effort and backend-specific.
-            let hex: String = _b.iter().map(|b| format!("{:02x}", b)).collect();
-            format!("X'{}'", hex)
-        }
-        other => quote_string(&other.to_string()),
-    }
-}
-
-/// Render a boolean as a SQL literal (`TRUE` / `FALSE`).
-fn bool_literal(b: bool) -> String {
-    if b {
-        "TRUE".to_string()
-    } else {
-        "FALSE".to_string()
-    }
-}
-
-/// Quote a string for SQL: wrap in single quotes, escape `'` as `''`.
-pub fn quote_string(v: &str) -> String {
-    let mut out = String::with_capacity(v.len() + 2);
-    out.push('\'');
-    for ch in v.chars() {
-        if ch == '\'' {
-            out.push('\'');
-            out.push('\'');
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 /// Parse a `NAME=VALUE` string, splitting at the first `=`.
 pub fn parse_param(s: &str) -> Result<(String, String), CoreError> {
     let pos = s.find('=').ok_or_else(|| {
@@ -225,13 +164,6 @@ mod tests {
         assert_eq!(infer_type("true"), Value::Bool(true));
         assert_eq!(infer_type("TRUE"), Value::Bool(true));
         assert_eq!(infer_type("FALSE"), Value::Bool(false));
-    }
-
-    #[test]
-    fn test_quote_escape() {
-        assert_eq!(quote_string("O'Brien"), "'O''Brien'");
-        assert_eq!(quote_string("hello"), "'hello'");
-        assert_eq!(quote_string("it's a test"), "'it''s a test'");
     }
 
     #[test]

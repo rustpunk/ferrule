@@ -9,7 +9,7 @@
 //!
 //! SOCKS5 is out of scope for Phase 1 — see `notes/TODO.md`.
 
-use crate::error::CoreError;
+use crate::error::SqlError;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use std::env;
@@ -32,13 +32,13 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     /// Parse from a URL string like `http://proxy:8080` or
     /// `http://user:pass@proxy:8080`.
-    pub fn parse(url: &str) -> Result<Self, CoreError> {
+    pub fn parse(url: &str) -> Result<Self, SqlError> {
         let parsed =
-            ::url::Url::parse(url).map_err(|e| CoreError::InvalidUrl(format!("proxy URL: {e}")))?;
+            ::url::Url::parse(url).map_err(|e| SqlError::InvalidUrl(format!("proxy URL: {e}")))?;
 
         let host = parsed
             .host_str()
-            .ok_or_else(|| CoreError::InvalidUrl("proxy URL has no host".to_string()))?
+            .ok_or_else(|| SqlError::InvalidUrl("proxy URL has no host".to_string()))?
             .to_string();
         let port = parsed.port().unwrap_or(8080);
 
@@ -136,13 +136,13 @@ pub async fn http_connect(
     proxy: &ProxyConfig,
     target_host: &str,
     target_port: u16,
-) -> Result<tokio::net::TcpStream, CoreError> {
+) -> Result<tokio::net::TcpStream, SqlError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port))
         .await
         .map_err(|e| {
-            CoreError::ConnectionFailed(format!(
+            SqlError::ConnectionFailed(format!(
                 "proxy connect to {}:{}: {e}",
                 proxy.host, proxy.port
             ))
@@ -164,7 +164,7 @@ pub async fn http_connect(
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(|e| CoreError::ConnectionFailed(format!("proxy write: {e}")))?;
+        .map_err(|e| SqlError::ConnectionFailed(format!("proxy write: {e}")))?;
 
     // Read the response. HTTP CONNECT responses are short (a few
     // hundred bytes at most), so a 1 KB buffer is plenty.
@@ -172,15 +172,14 @@ pub async fn http_connect(
     let n = stream
         .read(&mut buf)
         .await
-        .map_err(|e| CoreError::ConnectionFailed(format!("proxy read: {e}")))?;
+        .map_err(|e| SqlError::ConnectionFailed(format!("proxy read: {e}")))?;
 
-    let response = std::str::from_utf8(&buf[..n]).map_err(|_| {
-        CoreError::ConnectionFailed("proxy returned non-UTF-8 response".to_string())
-    })?;
+    let response = std::str::from_utf8(&buf[..n])
+        .map_err(|_| SqlError::ConnectionFailed("proxy returned non-UTF-8 response".to_string()))?;
 
     let status_line = response.lines().next().unwrap_or("").trim();
     if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
-        return Err(CoreError::ConnectionFailed(format!(
+        return Err(SqlError::ConnectionFailed(format!(
             "proxy error: {status_line}"
         )));
     }
@@ -201,26 +200,26 @@ pub struct ProxiedConnection {
 
 #[async_trait::async_trait]
 impl crate::Connection for ProxiedConnection {
-    async fn execute(&mut self, sql: &str) -> Result<crate::ExecutionSummary, crate::CoreError> {
+    async fn execute(&mut self, sql: &str) -> Result<crate::ExecutionSummary, crate::SqlError> {
         self.inner.execute(sql).await
     }
 
-    async fn query(&mut self, sql: &str) -> Result<crate::QueryResult, crate::CoreError> {
+    async fn query(&mut self, sql: &str) -> Result<crate::QueryResult, crate::SqlError> {
         self.inner.query(sql).await
     }
 
     async fn execute_multi(
         &mut self,
         sql: &str,
-    ) -> Result<Vec<crate::StatementResult>, crate::CoreError> {
+    ) -> Result<Vec<crate::StatementResult>, crate::SqlError> {
         self.inner.execute_multi(sql).await
     }
 
-    async fn ping(&mut self) -> Result<(), crate::CoreError> {
+    async fn ping(&mut self) -> Result<(), crate::SqlError> {
         self.inner.ping().await
     }
 
-    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, crate::CoreError> {
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, crate::SqlError> {
         self.inner.list_tables(schema).await
     }
 
@@ -228,7 +227,7 @@ impl crate::Connection for ProxiedConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<crate::QueryResult, crate::CoreError> {
+    ) -> Result<crate::QueryResult, crate::SqlError> {
         self.inner.describe_table(schema, table).await
     }
 
@@ -236,21 +235,21 @@ impl crate::Connection for ProxiedConnection {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<Vec<String>, crate::CoreError> {
+    ) -> Result<Vec<String>, crate::SqlError> {
         self.inner.primary_key(schema, table).await
     }
 
     async fn list_foreign_keys(
         &mut self,
         schema: Option<&str>,
-    ) -> Result<Vec<crate::ForeignKey>, crate::CoreError> {
+    ) -> Result<Vec<crate::ForeignKey>, crate::SqlError> {
         self.inner.list_foreign_keys(schema).await
     }
 
     async fn bulk_insert_rows(
         &mut self,
         target: crate::connection::BulkInsert<'_>,
-    ) -> Result<usize, crate::CoreError> {
+    ) -> Result<usize, crate::SqlError> {
         self.inner.bulk_insert_rows(target).await
     }
 }

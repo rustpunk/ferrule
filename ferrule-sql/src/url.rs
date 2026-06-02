@@ -1,4 +1,4 @@
-use crate::error::CoreError;
+use crate::error::SqlError;
 use indexmap::IndexMap;
 use secrecy::SecretString;
 use url::Url;
@@ -12,8 +12,8 @@ pub struct DatabaseUrl {
 
 impl DatabaseUrl {
     /// Parse a raw connection string.
-    pub fn parse(raw: &str) -> Result<Self, CoreError> {
-        let parsed = Url::parse(raw).map_err(|e| CoreError::InvalidUrl(format!("{e}")))?;
+    pub fn parse(raw: &str) -> Result<Self, SqlError> {
+        let parsed = Url::parse(raw).map_err(|e| SqlError::InvalidUrl(format!("{e}")))?;
         Ok(Self {
             raw: raw.to_string(),
             parsed,

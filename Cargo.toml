@@ -1,5 +1,5 @@
 [workspace]
-members = ["ferrule-core", "ferrule-config", "ferrule-cli"]
+members = ["ferrule-sql", "ferrule-core", "ferrule-config", "ferrule-cli"]
 resolver = "2"
 
 [workspace.package]

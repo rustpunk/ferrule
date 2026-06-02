@@ -1,4 +1,4 @@
-use crate::error::CoreError;
+use crate::error::SqlError;
 use crate::value::{ColumnInfo, Row};
 use async_trait::async_trait;
 
@@ -67,20 +67,20 @@ pub struct ForeignKey {
 #[async_trait]
 pub trait Connection: Send {
     /// Execute a statement that may not return rows (INSERT, UPDATE, CREATE, etc.).
-    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, CoreError>;
+    async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError>;
 
     /// Execute a SELECT-like query and return rows.
-    async fn query(&mut self, sql: &str) -> Result<QueryResult, CoreError>;
+    async fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError>;
 
     /// Execute one or more statements.
     ///
     /// The default implementation tries `query()` first, then falls back to
     /// `execute()` — i.e. single-statement only. Backends that natively
     /// support multi-resultsets (Postgres, MSSQL) should override this.
-    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, CoreError> {
+    async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
         match self.query(sql).await {
             Ok(result) => Ok(vec![StatementResult::Query(result)]),
-            Err(CoreError::QueryFailed(_)) => {
+            Err(SqlError::QueryFailed(_)) => {
                 let summary = self.execute(sql).await?;
                 Ok(vec![StatementResult::Summary(summary)])
             }
@@ -89,17 +89,17 @@ pub trait Connection: Send {
     }
 
     /// Test connectivity (ping / `SELECT 1`).
-    async fn ping(&mut self) -> Result<(), CoreError>;
+    async fn ping(&mut self) -> Result<(), SqlError>;
 
     /// List tables in the given schema (or default schema if `None`).
-    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, CoreError>;
+    async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError>;
 
     /// Describe the columns of a single table.
     async fn describe_table(
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<QueryResult, CoreError>;
+    ) -> Result<QueryResult, SqlError>;
 
     /// Return the column names of `table`'s primary key, in key
     /// position order. Returns an empty `Vec` when the table has no
@@ -113,7 +113,7 @@ pub trait Connection: Send {
         &mut self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<Vec<String>, CoreError>;
+    ) -> Result<Vec<String>, SqlError>;
 
     /// Return every foreign-key edge in `schema` (or the default
     /// schema if `None`). Used by schema-level copy to topologically
@@ -125,7 +125,7 @@ pub trait Connection: Send {
     async fn list_foreign_keys(
         &mut self,
         schema: Option<&str>,
-    ) -> Result<Vec<ForeignKey>, CoreError>;
+    ) -> Result<Vec<ForeignKey>, SqlError>;
 
     /// Insert `target.rows` into `target.table` using the backend's
     /// native bulk loader (Postgres `COPY FROM STDIN`, MSSQL
@@ -134,13 +134,10 @@ pub trait Connection: Send {
     ///
     /// Backends that have no native bulk loader (SQLite, and the
     /// proxy / tunnel wrappers in their current shape) must return
-    /// [`CoreError::BulkUnavailable`] so the caller can route the
+    /// [`SqlError::BulkUnavailable`] so the caller can route the
     /// batch through the generic INSERT path. Treat this method as
     /// required — forgetting to implement it on a new backend or
     /// wrapper is a bug we want to catch at compile time, not at
     /// runtime in the "just slow" form.
-    async fn bulk_insert_rows(
-        &mut self,
-        target: BulkInsert<'_>,
-    ) -> Result<usize, CoreError>;
+    async fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError>;
 }
