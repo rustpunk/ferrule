@@ -166,17 +166,24 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 .await
                 .map_err(CliError::query)?;
             let applied = engine.last_applied(100).await.map_err(CliError::query)?;
-            let mut ok = true;
-            for m in applied {
-                match engine.verify_checksum(&m.version).await {
-                    Err(e) => {
-                        eprintln!("  ✗ {} — {}", m.version, e);
-                        ok = false;
-                    }
-                    Ok(()) => println!("  ✔ {}", m.version),
+            // Scan the migrations directory once and compare every applied
+            // migration against the checksums already returned above — no
+            // per-migration directory re-scan or follow-up SELECT.
+            let drift = engine
+                .verify_applied(&applied)
+                .await
+                .map_err(CliError::query)?;
+            let drifted: std::collections::HashSet<&str> =
+                drift.iter().map(|d| d.version.as_str()).collect();
+            for m in &applied {
+                if !drifted.contains(m.version.as_str()) {
+                    println!("  ✔ {}", m.version);
                 }
             }
-            if !ok {
+            for d in &drift {
+                eprintln!("  ✗ {} — {}", d.version, d.reason);
+            }
+            if !drift.is_empty() {
                 std::process::exit(1);
             }
         }

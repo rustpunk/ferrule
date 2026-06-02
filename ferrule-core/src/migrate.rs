@@ -9,7 +9,7 @@
 use crate::connection::Connection;
 use crate::error::CoreError;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// A single discovered migration file.
@@ -286,8 +286,16 @@ END;"#
         Ok(out)
     }
 
-    /// Verify that a migration file on disk still matches the checksum
-    /// recorded in the database.  Returns `Ok(())` if clean, `Err` on drift.
+    /// Verify that a single migration's `.up.sql` file on disk still matches
+    /// the checksum recorded in the database. Returns `Ok(())` if clean,
+    /// `Err` on drift.
+    ///
+    /// The on-disk file is resolved by reusing [`MigrationEngine::scan_dir`]
+    /// (`Direction::Up`) and matching the derived version **exactly**, the
+    /// same way `apply_up` and `pending_migrations` identify files. An
+    /// earlier `name.starts_with(version)` prefix match could bind the
+    /// wrong file (e.g. version `2026` matching `20260602_x.up.sql`),
+    /// reporting spurious drift or masking real drift.
     pub async fn verify_checksum(&mut self, version: &str) -> Result<(), CoreError> {
         let sql = format!(
             "SELECT checksum FROM __ferrule_migrations WHERE version = '{}'",
@@ -305,42 +313,26 @@ END;"#
                 ))
             })?;
 
-        let _up_path = self.migrations_dir.join(format!("{}_*.up.sql", version));
-        // Find the actual file — there may be multiple matches if the
-        // user renamed the descriptive part.
-        let entries = tokio::fs::read_dir(&self.migrations_dir)
-            .await
-            .map_err(|e| CoreError::QueryFailed(format!("cannot read migrations dir: {}", e)))?;
+        let up_files = self.scan_dir(Direction::Up)?;
+        let file = up_files
+            .iter()
+            .find(|f| f.version == version)
+            .ok_or_else(|| {
+                CoreError::QueryFailed(format!(
+                    "migration file for version '{}' not found in {}",
+                    version,
+                    self.migrations_dir.display()
+                ))
+            })?;
 
-        let mut found = None;
-        let mut entries = entries;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| CoreError::QueryFailed(format!("cannot read migrations dir: {}", e)))?
-        {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(version) && name.ends_with(".up.sql") {
-                let content = tokio::fs::read_to_string(entry.path()).await.map_err(|e| {
-                    CoreError::QueryFailed(format!(
-                        "cannot read migration file {}: {}",
-                        entry.path().display(),
-                        e
-                    ))
-                })?;
-                found = Some(hex_digest(&content));
-                break;
-            }
-        }
-
-        let file_checksum = found.ok_or_else(|| {
+        let content = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
             CoreError::QueryFailed(format!(
-                "migration file for version '{}' not found in {}",
-                version,
-                self.migrations_dir.display()
+                "cannot read migration file {}: {}",
+                file.path.display(),
+                e
             ))
         })?;
+        let file_checksum = hex_digest(&content);
 
         if db_checksum != file_checksum {
             return Err(CoreError::QueryFailed(format!(
@@ -365,6 +357,18 @@ END;"#
         Ok(set)
     }
 
+    /// Scan the migrations directory for files in the given `direction`,
+    /// returning them sorted lexicographically by version.
+    ///
+    /// The version is the substring before the first `_` in the file stem
+    /// (`20260602120000_add_users.up.sql` -> `20260602120000`). Because
+    /// two distinct files can collapse onto the same version under that
+    /// rule, this detects the collision up front and returns a
+    /// [`CoreError::QueryFailed`] naming the conflicting files. Surfacing
+    /// it here — before any `apply_up` runs — prevents a duplicate version
+    /// from being discovered only when the second tracking-row `INSERT`
+    /// hits the primary-key constraint mid-run, which would leave one
+    /// migration's DDL applied but untracked.
     pub fn scan_dir(&self, direction: Direction) -> Result<Vec<MigrationFile>, CoreError> {
         let ext = match direction {
             Direction::Up => ".up.sql",
@@ -395,7 +399,89 @@ END;"#
             }
         }
         files.sort_by(|a, b| a.version.cmp(&b.version));
+
+        // Reject two files that derive the same version: applying both
+        // would commit the first migration's DDL then violate the
+        // tracking table's primary key on the second.
+        let mut seen: HashMap<&str, &PathBuf> = HashMap::with_capacity(files.len());
+        for file in &files {
+            if let Some(prev) = seen.insert(file.version.as_str(), &file.path) {
+                return Err(CoreError::QueryFailed(format!(
+                    "duplicate migration version '{}' derived from two files:\n  {}\n  {}\nRename one so each version (the text before the first '_') is unique.",
+                    file.version,
+                    prev.display(),
+                    file.path.display()
+                )));
+            }
+        }
+
         Ok(files)
+    }
+
+    /// Build a `version -> file-checksum` map by scanning the up migrations
+    /// directory exactly once.
+    ///
+    /// The checksum is the SHA-256 hex digest of the `.up.sql` file's
+    /// contents, identical to what [`MigrationEngine::apply_up`] records in
+    /// the tracking table. This lets `verify` compare every applied
+    /// migration against on-disk content using the checksums it already has
+    /// from the applied-list query — one directory scan and zero extra
+    /// `SELECT`s, instead of re-reading the directory and re-querying the
+    /// database once per applied migration.
+    pub async fn on_disk_checksums(&self) -> Result<HashMap<String, String>, CoreError> {
+        let files = self.scan_dir(Direction::Up)?;
+        let mut map = HashMap::with_capacity(files.len());
+        for file in files {
+            let content = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
+                CoreError::QueryFailed(format!(
+                    "cannot read migration file {}: {}",
+                    file.path.display(),
+                    e
+                ))
+            })?;
+            map.insert(file.version, hex_digest(&content));
+        }
+        Ok(map)
+    }
+
+    /// Verify that every supplied applied migration still matches its
+    /// `.up.sql` file on disk, using checksums already held in hand.
+    ///
+    /// `applied` is the list returned by [`MigrationEngine::last_applied`]
+    /// (or any caller-built list of applied versions + recorded checksums).
+    /// The directory is scanned once via
+    /// [`MigrationEngine::on_disk_checksums`]; no per-migration queries are
+    /// issued. The returned vector lists every drifted migration with a
+    /// human-readable reason — empty means all clean.
+    pub async fn verify_applied(
+        &self,
+        applied: &[AppliedMigration],
+    ) -> Result<Vec<ChecksumDrift>, CoreError> {
+        let on_disk = self.on_disk_checksums().await?;
+        let mut drift = Vec::new();
+        for migration in applied {
+            match on_disk.get(&migration.version) {
+                None => drift.push(ChecksumDrift {
+                    version: migration.version.clone(),
+                    reason: format!(
+                        "migration file for version '{}' not found in {}",
+                        migration.version,
+                        self.migrations_dir.display()
+                    ),
+                }),
+                Some(file_checksum) if *file_checksum != migration.checksum => {
+                    drift.push(ChecksumDrift {
+                        version: migration.version.clone(),
+                        reason: format!(
+                            "checksum mismatch:\n      db:   {}\n      file: {}\n      The migration file was edited after it was applied.",
+                            migration.checksum, file_checksum
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(drift)
     }
 }
 
@@ -404,6 +490,15 @@ END;"#
 pub struct AppliedMigration {
     pub version: String,
     pub checksum: String,
+}
+
+/// A drifted migration found by [`MigrationEngine::verify_applied`]:
+/// either its `.up.sql` file is missing on disk, or its on-disk checksum
+/// no longer matches the value recorded when it was applied.
+#[derive(Debug, Clone)]
+pub struct ChecksumDrift {
+    pub version: String,
+    pub reason: String,
 }
 
 /// Generate a hex SHA-256 digest of the input string.
