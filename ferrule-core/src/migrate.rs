@@ -245,13 +245,26 @@ END;"#
                     format!("{script};\n")
                 };
                 let batch = format!("{prelude}{begin}\n{body}{track};\nCOMMIT;");
-                match self.conn.execute_multi(&batch).await {
-                    Ok(_) => Ok(()),
+                // SQLite and Postgres run the whole batch through
+                // `execute_multi` (SQLite splits it statement-by-statement;
+                // Postgres sends it as one `simple_query`). MSSQL must use
+                // `execute` instead: its `execute_multi` runs the batch via
+                // tiberius' result-returning `query` path, whose metadata pass
+                // executes a DDL batch twice (the second `CREATE TABLE` then
+                // fails "already exists"). `execute` uses the plain
+                // non-resultset path and runs the batch exactly once.
+                let run = match self.dialect {
+                    Dialect::MsSql => self.conn.execute(&batch).await.map(|_| ()),
+                    _ => self.conn.execute_multi(&batch).await.map(|_| ()),
+                };
+                match run {
+                    Ok(()) => Ok(()),
                     Err(e) => {
                         // Discard any partial work and return the original
                         // error. The rollback is best-effort: if it also
-                        // fails (e.g. the connection is gone) the caller
-                        // still sees the underlying migration failure.
+                        // fails (e.g. the connection is gone, or XACT_ABORT
+                        // already rolled back) the caller still sees the
+                        // underlying migration failure.
                         let _ = self.conn.execute("ROLLBACK;").await;
                         Err(e)
                     }
