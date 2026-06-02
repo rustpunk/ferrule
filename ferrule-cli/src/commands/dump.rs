@@ -27,6 +27,13 @@ pub struct DumpArgs {
     #[arg(long)]
     pub schema: Option<String>,
 
+    /// Produce a byte-stable, diff-friendly SQL dump. Rows are sorted
+    /// server-side by primary key (or by every column when the table
+    /// has no PK), and each row becomes its own `INSERT INTO ...
+    /// VALUES (...);` statement. Only affects `--dump-format sql`.
+    #[arg(long)]
+    pub deterministic: bool,
+
     #[command(flatten)]
     pub output: OutputFlags,
 
@@ -43,6 +50,7 @@ pub async fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), Cli
 
     let mut opts = DumpOptions {
         format,
+        deterministic: args.deterministic,
         ..DumpOptions::default()
     };
     opts.schema = args.schema.clone();
@@ -60,6 +68,13 @@ pub async fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), Cli
 
     let backend = ferrule_core::Backend::from_scheme(resolved.url.scheme())
         .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
+
+    if args.deterministic && args.conn_flags.daemon {
+        return Err(CliError::usage(
+            "--deterministic is not supported via --daemon yet \
+             (daemon streaming lands in Wave 3); run direct without --daemon.",
+        ));
+    }
 
     if args.conn_flags.daemon {
         eprintln!("[ferrule] Routing via daemon...");

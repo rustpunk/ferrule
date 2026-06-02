@@ -8,5 +8,7 @@ pub mod registry;
 
 pub use bookmarks::{Bookmark, BookmarkStore};
 pub use credentials::resolve_password_stack;
-pub use profile::{ConnectionProfile, DefaultProfile, GlobalConfig, HistoryConfig, SlowLogConfig};
+pub use profile::{
+    CacheConfig, ConnectionProfile, DefaultProfile, GlobalConfig, HistoryConfig, SlowLogConfig,
+};
 pub use registry::{ConnectionEntry, ConnectionRegistry};

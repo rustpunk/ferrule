@@ -17,6 +17,7 @@ pub mod url;
 pub mod value;
 
 pub mod query_builder;
+pub mod transaction;
 
 mod backends;
 
@@ -31,6 +32,7 @@ pub use copy::{
     copy_all_tables, copy_rows, discover_tables, topo_sort, translate_ddl, translate_type,
     AllTablesOptions, BulkMode, CopyFormat, CopyOptions, CopySource, CycleError, IfExists,
 };
+pub use transaction::{begin_transaction, commit_transaction, rollback_transaction};
 pub use dump::{dump_query, dump_table, DumpFormat, DumpOptions};
 pub use error::CoreError;
 pub use explain::{explain_sql, is_modifying, ExplainOutput};

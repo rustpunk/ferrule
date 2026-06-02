@@ -157,7 +157,10 @@ The history store is the foundation for several follow-ups already
 filed:
 
 - **[#5] Result caching by query hash** — keys off `(conn_redacted,
-  normalized_sql, params)` against this same SQLite store.
+  normalized_sql, params)` against a **separate `results.db`** (NOT
+  the history.db; cache eviction churns faster than telemetry
+  retention). Shipped in the Output Polish sprint — see
+  [Result Cache](cache.md).
 - **[#48] `ferrule history prune`** — explicit pruning beyond the
   open-loop retention knobs.
 - **[#49] SQL-body redaction** — pluggable regex-based scrubbing for

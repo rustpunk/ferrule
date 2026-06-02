@@ -288,6 +288,38 @@ pub struct QueryArgs {
     /// usage error.
     #[arg(long)]
     pub fail_on_empty: bool,
+
+    /// Wrap the statement batch in a single outer transaction. The
+    /// entire script runs as one BEGIN ... COMMIT (or BEGIN ...
+    /// ROLLBACK with --rollback). Inner statement failure best-effort
+    /// rolls back and surfaces the original error. Cannot be combined
+    /// with --daemon or --watch (transaction affinity would be lost).
+    #[arg(long)]
+    pub begin: bool,
+
+    /// Explicit COMMIT at end of batch. Equivalent to --begin alone
+    /// (the COMMIT is implicit when --begin is set without --rollback).
+    /// Requires --begin; conflicts with --rollback.
+    #[arg(long, requires = "begin", conflicts_with = "rollback")]
+    pub commit: bool,
+
+    /// Force ROLLBACK at end of batch even on success. Useful for
+    /// dry-run / read-only snapshot semantics. Requires --begin.
+    #[arg(long, requires = "begin")]
+    pub rollback: bool,
+
+    /// Result-cache opt-in. `DURATION` (e.g. `5m`, `2h`, `30s`, `7d`)
+    /// overrides `[cache] default_ttl` for this invocation. Pass
+    /// `--cache 0` to bypass the cache once without disabling it
+    /// globally. The cache is keyed off the redacted connection URL,
+    /// normalized SQL, and named parameters — see `docs/src/cache.md`.
+    #[arg(long, value_name = "DURATION")]
+    pub cache: Option<String>,
+
+    /// Bypass cache lookup AND insert for this invocation. Equivalent
+    /// to running with `FERRULE_NO_CACHE=1` for one command.
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 /// Tables command arguments.

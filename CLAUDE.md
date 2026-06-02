@@ -887,3 +887,205 @@ The formatter layer never sees driver-specific types.
 ## Stubbing Policy
 
 This scaffold contains many `todo!()` bodies. Each crate root has `#![allow(dead_code, unused_variables, unused_imports)]` so that `cargo clippy` passes. Do not remove these pragmas until Wave 1 is complete.
+
+### Output formats — smoke (Phase 1 #12)
+
+All formats render against in-memory SQLite; no external services required.
+
+```bash
+ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format markdown
+# → pipe-table with header, --- separator, single data row.
+
+ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format md
+# → identical (alias).
+
+ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format jsonl
+# → exactly one JSON object on one line, trailing newline.
+
+ferrule query "sqlite::memory:" "SELECT 1 AS id, 'a' AS name" --format ndjson
+# → identical (alias).
+
+ferrule query "sqlite::memory:" "SELECT '<x>' AS c" --format html
+# → contains <table>/<thead>/<tbody>; cell renders as &lt;x&gt;.
+```
+
+### Dump deterministic — smoke (Phase 2 #20)
+
+Reuses the seeded `ferrule-pg-test` container from the Postgres section
+above. SQLite alternative works too — swap the URL for `sqlite:///tmp/...`
+and seed `test_users` locally.
+
+```bash
+PG="postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable"
+
+# Determinism: two dumps, byte-equal.
+ferrule dump "$PG" test_users --dump-format sql --deterministic > /tmp/dump1.sql
+ferrule dump "$PG" test_users --dump-format sql --deterministic > /tmp/dump2.sql
+diff /tmp/dump1.sql /tmp/dump2.sql && echo "  byte-equal"
+
+# Per-row INSERTs (one statement per data row).
+grep -c '^INSERT INTO' /tmp/dump1.sql   # → equals row count of test_users
+
+# Regression: non-deterministic mode unchanged (batched VALUES).
+ferrule dump "$PG" test_users --dump-format sql > /tmp/dump3.sql
+grep -c '^INSERT INTO' /tmp/dump3.sql   # → 1 (single batched VALUES list)
+
+rm /tmp/dump{1,2,3}.sql
+```
+
+### REPL fill-in — smoke (Phase 3 #11)
+
+Scripted via piped stdin:
+
+```bash
+ferrule repl "sqlite::memory:" <<'EOF'
+SELECT 1;
+\g
+\explain on
+SELECT 1;
+\explain off
+\help
+\q
+EOF
+```
+
+Expected: `SELECT 1` prints `1`; `\g` re-prints `1`; `\explain on`
+prints `Explain mode: on`; the second `SELECT 1` prints
+`EXPLAIN QUERY PLAN` output instead of the raw value; `\explain off`
+prints `Explain mode: off`; `\help` lists the new `\g`,
+`\explain on|off|toggle`, and `\watch <secs>` lines.
+
+Manual `\watch` smoke (interactive — needs a TTY for Ctrl+C):
+
+```bash
+ferrule repl "sqlite::memory:"
+ferrule=> SELECT 1;
+ferrule=> \watch 1
+# wait one iteration, press Ctrl+C to return to the prompt
+ferrule=> \q
+```
+
+`\watch 0` is rejected with
+`\watch interval must be at least 1 second`. Outside a running loop,
+`\watch interval N` and `\watch stop` print polite errors and do
+nothing (mid-loop control is reserved for a future wave). When
+`\explain` mode is on, `\watch` wraps the SQL through EXPLAIN on
+each iteration via `ferrule_core::explain_sql`.
+
+### Transaction flags — smoke (Phase 4 #2)
+
+`ferrule query --begin/--commit/--rollback` wraps the entire
+statement batch in a single outer transaction. SQLite works
+out-of-the-box (no container needed); the same flags exercise the
+Postgres / MySQL / MSSQL / Oracle fixtures from the sections above
+when paired with the seeded `test_users` table.
+
+```bash
+# Setup (SQLite driver runs one statement per query — split DDL out):
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "CREATE TABLE t(a INT)"
+
+# 1. SQLite happy path: --begin INSERT --commit → row persists.
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" \
+  "INSERT INTO t VALUES (1)" --begin --commit
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "SELECT COUNT(*) FROM t"
+# → expect 1
+
+# 2. SQLite rollback: --begin --rollback INSERT → row does NOT persist.
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" \
+  "INSERT INTO t VALUES (2)" --begin --rollback
+# → stderr "explicit ROLLBACK (--rollback)"
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "SELECT COUNT(*) FROM t"
+# → still 1
+
+# 3. SQLite inner-fail: --begin INSERT into nonexistent table
+#    → original error surfaces; exit 4.
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" \
+  "INSERT INTO nonexistent VALUES (3)" --begin
+# → exit 4, stderr contains
+#   "inner statement failed — rolled back wrapping transaction"
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "SELECT COUNT(*) FROM t"
+# → still 1 (best-effort rollback held the line)
+
+# 4. Mutual-exclusion regression: --commit alone → clap exit 2.
+ferrule query "sqlite:///tmp/ferrule-txn-smoke.db" "SELECT 1" --commit
+# → exit 2 (MissingRequiredArgument)
+
+# 5. (Optional) Postgres / MySQL / MSSQL exercise the multi-statement
+# path; rerun the same flags against the seeded test_users table in
+# the per-backend sections above:
+#   ferrule query "postgres://..." "INSERT ...; SELECT ..." --begin --commit
+#   ferrule query "postgres://..." "INSERT ...; SELECT bad" --begin
+# (SQLite driver runs one statement per query — see docs/src/querying.md).
+
+rm /tmp/ferrule-txn-smoke.db
+```
+
+`--begin --daemon` and `--begin --watch` are rejected pre-connect
+as usage errors (no connection affinity per tick).
+`--begin --bench N` wraps the entire bench loop in ONE outer
+transaction; pair with `--rollback` for side-effect-free
+microbenchmarks. Backend SQL emitted: `BEGIN/COMMIT/ROLLBACK` for
+PostgreSQL / MySQL / SQLite, `BEGIN TRANSACTION/...` for MSSQL, and
+COMMIT / ROLLBACK only for Oracle (implicit txn — BEGIN is a noop).
+
+### Result cache — smoke (Phase 5 #5)
+
+`ferrule query --cache <DURATION>` / `--no-cache` and the
+`FERRULE_NO_CACHE` env kill switch route SELECT results through a
+separate SQLite store at `~/.local/share/ferrule/results.db`. The
+cache is opt-out (defaults to enabled with `default_ttl = "5m"`) and
+fails silently — every cache error falls through to the real query.
+SQLite alone exercises every path; the smoke below uses an isolated
+config at `/tmp/ferrule-cache.toml` so it doesn't touch the user's
+data dir.
+
+```bash
+# Setup: isolated cache config + a fresh data DB.
+cat > /tmp/ferrule-cache.toml <<'EOF'
+[cache]
+enabled = true
+default_ttl = "5m"
+path = "/tmp/ferrule-cache.db"
+EOF
+rm -f /tmp/ferrule-cache.db /tmp/ferrule-cache-data.db
+
+# 1. Miss + insert: first run populates the cache.
+ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" "SELECT 1" --verbose 2>&1 \
+  | grep -E "cache miss|cache hit"
+# → stderr: [ferrule] cache miss; inserted (ttl=300s)
+
+# 2. Hit: second identical run skips the database.
+ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" "SELECT 1" --verbose 2>&1 \
+  | grep -E "cache miss|cache hit"
+# → stderr: [ferrule] cache hit (key=..., age=Xs)
+
+# 3. --no-cache bypass: leaves the cache state intact.
+ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" "SELECT 1" --no-cache --verbose 2>&1 \
+  | grep -E "cache miss|cache hit" || echo "no cache event (expected)"
+
+# 4. is_modifying bypass: an INSERT does NOT touch the cache.
+ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" \
+  "CREATE TABLE t(x INT); INSERT INTO t VALUES (1)" 2>&1 || true
+sqlite3 /tmp/ferrule-cache.db \
+  "SELECT count(*) FROM cache WHERE sql_preview LIKE 'INSERT%';"
+# → 0
+
+# 5. Env kill switch: FERRULE_NO_CACHE=1 disables cache wholesale.
+FERRULE_NO_CACHE=1 ferrule -c /tmp/ferrule-cache.toml query \
+  "sqlite:///tmp/ferrule-cache-data.db" "SELECT 1" --verbose 2>&1 \
+  | grep -E "cache miss|cache hit" || echo "no cache event (expected)"
+
+# Cleanup.
+rm -f /tmp/ferrule-cache.toml /tmp/ferrule-cache.db /tmp/ferrule-cache-data.db
+```
+
+The cache file lives at `dirs::data_local_dir()/ferrule/results.db`
+by default — set `[cache] path = "..."` (or `--config` to a custom
+TOML, as above) to redirect. Schema migrations gate on `PRAGMA
+user_version`; a downgrade (newer ferrule wrote v2, older binary
+opens it) is a hard usage error rather than a silent re-migration.
+

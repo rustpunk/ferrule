@@ -12,7 +12,11 @@
 
 - **One binary, many databases** — Postgres, MySQL, MSSQL, SQLite out of the box. Oracle via opt-in feature.
 - **Pure Rust** — Native async drivers for Postgres (`tokio-postgres`), MySQL (`mysql_async`), MSSQL (`tiberius`), SQLite (`rusqlite`). No libpq, no libmysqlclient, no Microsoft ODBC drivers.
-- **Beautiful output** — Auto-detect TTY and render formatted tables, or stream JSON/CSV/YAML for piping.
+- **Beautiful output** — Auto-detect TTY and render formatted tables, or stream JSON/CSV/YAML for piping. Plus `--format markdown` for pasting into PRs/wikis, `--format jsonl` for streaming pipelines, and `--format html` for one-shot reports.
+- **Deterministic dump** — `ferrule dump --deterministic` emits a byte-stable INSERT stream (sorted columns, stable row order, deterministic NULL/blob rendering) so diff/grep/sha256 over schema snapshots all work.
+- **REPL fill-in** — `ferrule repl` accepts `\g`, `\explain on|toggle`, and `\watch <secs>`, threading parameter sets and bookmarks through an editline-style prompt with history.
+- **Script-mode transactions** — `ferrule query --begin --commit/--rollback` wraps a multi-statement batch in a single outer transaction (best-effort rollback on inner failure; cross-backend BEGIN/COMMIT/ROLLBACK emission).
+- **Result cache** — Opt-out per-query SELECT cache with `--cache <DURATION>` / `--no-cache` / `FERRULE_NO_CACHE`, backed by a separate SQLite store with TTL eviction. Fails silently — never blocks the real query.
 - **Connection registry** — Save named connections, resolve passwords from env vars, OS keyring, or interactive prompt.
 - **Query telemetry** — Persistent history log of every invocation, opt-in slow-query log, `--bench N` mode with p50/p95/p99 + ASCII histogram, `--fail-on-empty` exit-code gate.
 - **Zero runtime deps (default)** — `cargo install ferrule` produces a ~15–25 MB static binary.

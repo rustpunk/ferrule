@@ -14,6 +14,8 @@ pub struct GlobalConfig {
     pub history: HistoryConfig,
     #[serde(default)]
     pub slow_log: SlowLogConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 impl GlobalConfig {
@@ -219,6 +221,66 @@ impl SlowLogConfig {
 
 fn default_slow_threshold() -> String {
     "1s".to_string()
+}
+
+/// Result-cache configuration (R5 / #5). Default-on with a conservative
+/// 5-minute TTL. Backed by a *separate* `results.db` (NOT the history
+/// store — cache eviction churns faster than telemetry retention).
+///
+/// The `FERRULE_NO_CACHE` env var kills the cache for a single
+/// invocation without touching this config. Passing `--cache 0` to
+/// `ferrule query` also bypasses the cache for that one run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    /// Default TTL applied to inserts when the caller didn't pass an
+    /// explicit `--cache DURATION`. Same `s`/`m`/`h`/`d` suffix grammar
+    /// as `--since`. `"0"` (the literal string) disables insertion
+    /// without disabling lookup of existing entries.
+    #[serde(default = "default_cache_ttl")]
+    pub default_ttl: String,
+    /// Open-loop retention: rows older than this many days are pruned
+    /// opportunistically on the next `prune()` pass. `0` disables.
+    #[serde(default = "default_cache_max_age_days")]
+    pub max_age_days: u32,
+    /// Open-loop retention: cap on total rows. Oldest rows are
+    /// discarded first. `0` disables.
+    #[serde(default = "default_cache_max_rows")]
+    pub max_rows: u64,
+    /// Path to the SQLite store. When `None`, defaults to
+    /// `<XDG_DATA_HOME>/ferrule/results.db` via `dirs::data_local_dir()`.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            default_ttl: default_cache_ttl(),
+            max_age_days: default_cache_max_age_days(),
+            max_rows: default_cache_max_rows(),
+            path: None,
+        }
+    }
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
+fn default_cache_ttl() -> String {
+    "5m".to_string()
+}
+
+fn default_cache_max_age_days() -> u32 {
+    7
+}
+
+fn default_cache_max_rows() -> u64 {
+    10_000
 }
 
 /// Parse a `humantime`-style duration into milliseconds, or accept a

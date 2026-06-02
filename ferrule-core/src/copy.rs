@@ -11,6 +11,7 @@ use crate::backend::Backend;
 use crate::connection::{BulkInsert, Connection, ForeignKey};
 use crate::error::CoreError;
 use crate::params::render_value;
+use crate::transaction::{begin_transaction, commit_transaction, rollback_transaction};
 use crate::value::{ColumnInfo, TypeHint, Value};
 
 /// What to do when the target table already exists and is non-empty.
@@ -1114,7 +1115,10 @@ fn per_statement_row_cap(backend: Backend) -> Option<usize> {
 ///   the default).
 /// - MySQL: backticks. The ANSI form requires `ANSI_QUOTES` SQL_MODE
 ///   which ferrule does not assume.
-pub(crate) fn quote_identifier(id: &str, backend: Backend) -> String {
+///
+/// Public so `dump.rs` (and future schema-aware modules) can route
+/// identifier quoting through a single backend-aware implementation.
+pub fn quote_identifier(id: &str, backend: Backend) -> String {
     match backend {
         #[cfg(feature = "mysql")]
         Backend::MySql => format!("`{}`", id.replace('`', "``")),
@@ -1258,47 +1262,6 @@ async fn table_has_rows(
     )?;
     let result = conn.query(&sql).await?;
     Ok(!result.rows.is_empty())
-}
-
-/// Open a target-side transaction. Returns `true` if the BEGIN
-/// succeeded, `false` if the backend rejected the statement (best-
-/// effort: the caller proceeds without a wrapping transaction).
-async fn begin_transaction(conn: &mut dyn Connection, backend: Backend) -> bool {
-    let stmt = match backend {
-        #[cfg(feature = "mssql")]
-        Backend::MsSql => "BEGIN TRANSACTION",
-        // Oracle starts implicit transactions; an explicit BEGIN here
-        // would parse as a PL/SQL block. Skip the statement; the
-        // wrapping COMMIT at the end still terminates the implicit txn.
-        #[cfg(feature = "oracle")]
-        Backend::Oracle => return true,
-        _ => "BEGIN",
-    };
-    conn.execute(stmt).await.is_ok()
-}
-
-async fn commit_transaction(
-    conn: &mut dyn Connection,
-    backend: Backend,
-) -> Result<(), CoreError> {
-    let stmt = match backend {
-        #[cfg(feature = "mssql")]
-        Backend::MsSql => "COMMIT TRANSACTION",
-        _ => "COMMIT",
-    };
-    conn.execute(stmt).await.map(|_| ())
-}
-
-async fn rollback_transaction(
-    conn: &mut dyn Connection,
-    backend: Backend,
-) -> Result<(), CoreError> {
-    let stmt = match backend {
-        #[cfg(feature = "mssql")]
-        Backend::MsSql => "ROLLBACK TRANSACTION",
-        _ => "ROLLBACK",
-    };
-    conn.execute(stmt).await.map(|_| ())
 }
 
 // -------------------------------------------------------------------
@@ -1650,6 +1613,41 @@ mod tests {
     fn quote_identifier_mysql_uses_backticks() {
         assert_eq!(quote_identifier("users", Backend::MySql), "`users`");
         assert_eq!(quote_identifier("a`b", Backend::MySql), "`a``b`");
+    }
+
+    // The three tests below were ported verbatim from
+    // `ferrule-core/src/dump.rs::tests` when the local
+    // `quote_identifier(id)` helper was removed in favour of routing
+    // every dump-side identifier through the backend-aware
+    // [`quote_identifier`] in this module.
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn quote_identifier_wraps_in_double_quotes() {
+        assert_eq!(quote_identifier("users", Backend::Sqlite), "\"users\"");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn quote_identifier_escapes_embedded_quotes() {
+        assert_eq!(quote_identifier("a\"b", Backend::Sqlite), "\"a\"\"b\"");
+        assert_eq!(
+            quote_identifier("\"\"", Backend::Sqlite),
+            "\"\"\"\"\"\""
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn quote_identifier_preserves_other_chars() {
+        assert_eq!(
+            quote_identifier("col with space", Backend::Sqlite),
+            "\"col with space\""
+        );
+        assert_eq!(
+            quote_identifier("snake_case_99", Backend::Sqlite),
+            "\"snake_case_99\""
+        );
     }
 
     #[cfg(feature = "postgres")]

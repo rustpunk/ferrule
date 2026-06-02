@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::error::CliError;
+use crate::path_util::expand_tilde;
 
 /// A single ferrule invocation worth recording.
 #[derive(Debug, Clone)]
@@ -358,14 +359,6 @@ fn oneline_for_log(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn expand_tilde(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(s)
-}
 
 /// Shell-style glob: `*` matches any run, `?` matches a single char.
 /// Empty pattern matches anything. Case-insensitive.

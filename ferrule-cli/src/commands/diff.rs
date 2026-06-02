@@ -188,6 +188,11 @@ fn render_diff(diff: &SchemaDiff, format: OutputFormat) -> Result<String, CliErr
         // Tabled's column model assumes uniform columns, but a diff has
         // sections of different shape — the textual section format is more
         // useful here than a forced two-column table.
+        //
+        // The wildcard arm intentionally absorbs every non-JSON variant —
+        // including row-shaped formats like Markdown/JSONL/HTML (added in
+        // #12). Schema diffs are structural, not row-shaped, so a single
+        // text summary is the right rendering for all of them.
         _ => Ok(render_text(diff)),
     }
 }

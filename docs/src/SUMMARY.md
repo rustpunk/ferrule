@@ -31,6 +31,7 @@
 - [SSH Tunnels](ssh-tunnels.md)
 - [HTTP CONNECT Proxy](proxy.md)
 - [Query Telemetry](telemetry.md)
+- [Result Cache](cache.md)
 
 # Reference
 

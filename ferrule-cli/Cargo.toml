@@ -44,3 +44,8 @@ hasp = { path = "../../hasp/crates/hasp", default-features = false, features = [
 
 # Persistent query history store (R4 / #4).
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
+
+# Result-cache key derivation (R5 / #5). Already a workspace transitive
+# via ferrule-core; promoted to a direct dep so cache.rs doesn't pierce
+# the core abstraction for one hash call.
+sha2 = "0.10"
