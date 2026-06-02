@@ -359,7 +359,6 @@ fn oneline_for_log(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-
 /// Shell-style glob: `*` matches any run, `?` matches a single char.
 /// Empty pattern matches anything. Case-insensitive.
 fn glob_match(pat: &str, s: &str) -> bool {
@@ -622,7 +621,11 @@ mod tests {
 
         let body = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2, "only slow runs should be teed; got {body:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "only slow runs should be teed; got {body:?}"
+        );
         assert!(lines[0].contains("slow-1"));
         assert!(lines[1].contains("slow-2"));
         // Tab-separated.

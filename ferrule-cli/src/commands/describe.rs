@@ -1,8 +1,8 @@
 use super::DescribeArgs;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_sql::connection::ConnectOptions;
 use ferrule_core::formatter::format_result;
+use ferrule_sql::connection::ConnectOptions;
 
 pub async fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);

@@ -3,11 +3,11 @@ use crate::bench::BenchSummary;
 use crate::cache::{self, CacheDb, CacheKey};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_sql::backend::Backend;
-use ferrule_sql::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
 use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::{format_result, OutputFormat};
 use ferrule_core::{infer_type, parse_param, substitute, ParameterSet};
+use ferrule_sql::backend::Backend;
+use ferrule_sql::connection::{ConnectOptions, Connection, QueryResult, StatementResult};
 use std::time::Duration;
 
 /// Hints threaded into `run_bench` so the bench loop runs inside the
@@ -128,8 +128,7 @@ async fn run_bench(
         };
         if let Err(e) = iter_result {
             if txn.begin {
-                let _ =
-                    ferrule_sql::transaction::rollback_transaction(conn, txn.backend).await;
+                let _ = ferrule_sql::transaction::rollback_transaction(conn, txn.backend).await;
                 eprintln!("[ferrule] inner statement failed — rolled back wrapping transaction");
             }
             return Err(e);
@@ -358,10 +357,11 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         match db.lookup(key) {
             Ok(Some(cached)) => {
                 let lookup_micros = t.elapsed().as_micros() as u64;
-                let rendered =
-                    render_query_result(&cached.result, format, limit, offset)?;
+                let rendered = render_query_result(&cached.result, format, limit, offset)?;
                 if let Some(path) = args.output.output.as_deref() {
-                    tokio::fs::write(path, &rendered).await.map_err(CliError::Io)?;
+                    tokio::fs::write(path, &rendered)
+                        .await
+                        .map_err(CliError::Io)?;
                     eprintln!("Wrote to {}", path);
                 }
                 let filtered = maybe_apply_filter(rendered, args.filter.as_deref())?;
@@ -378,8 +378,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
                     );
                 }
                 if args.fail_on_empty {
-                    let synthetic =
-                        StatementResult::Query(cached.result.clone());
+                    let synthetic = StatementResult::Query(cached.result.clone());
                     check_fail_on_empty(&[synthetic])?;
                 }
                 return Ok(());
@@ -535,8 +534,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         Ok(r) => r,
         Err(e) => {
             if outer_tx_opened {
-                let _ =
-                    ferrule_sql::transaction::rollback_transaction(&mut *conn, backend).await;
+                let _ = ferrule_sql::transaction::rollback_transaction(&mut *conn, backend).await;
                 eprintln!("[ferrule] inner statement failed — rolled back wrapping transaction");
             }
             return Err(e);
@@ -956,9 +954,7 @@ mod tests {
 
         let mut args = synth_query_args(&url, "INSERT INTO t VALUES (2)");
         args.cache = Some("5m".into());
-        run(args, &global)
-            .await
-            .expect("insert run must succeed");
+        run(args, &global).await.expect("insert run must succeed");
         assert_eq!(
             cache_count(&cache_path),
             0,

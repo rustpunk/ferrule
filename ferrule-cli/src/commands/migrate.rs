@@ -3,8 +3,8 @@
 use super::{resolve_connection, ConnectionFlags};
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_sql::connection::ConnectOptions;
 use ferrule_core::migrate::{Direction, MigrationEngine};
+use ferrule_sql::connection::ConnectOptions;
 use ferrule_sql::Dialect;
 use std::path::PathBuf;
 

@@ -3,8 +3,8 @@ use crate::commands::{
 };
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_sql::connection::{ConnectOptions, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
+use ferrule_sql::connection::{ConnectOptions, StatementResult};
 use is_terminal::IsTerminal;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::io::Write;

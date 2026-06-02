@@ -5,9 +5,9 @@ use crate::error::CliError;
 use clap::{Args, Subcommand};
 use ferrule_config::bookmarks::BookmarkStore;
 use ferrule_config::profile::GlobalConfig;
+use ferrule_core::formatter::format_result as fmt_result;
 use ferrule_sql::backend::Backend;
 use ferrule_sql::connection::{ConnectOptions, StatementResult};
-use ferrule_core::formatter::format_result as fmt_result;
 use std::io::Write;
 
 #[derive(Args, Clone, Debug)]

@@ -1,7 +1,7 @@
 use crate::error::CliError;
 use dashmap::DashMap;
-use ferrule_sql::connection::{ConnectOptions, StatementResult};
 use ferrule_core::formatter::{format_result, OutputFormat};
+use ferrule_sql::connection::{ConnectOptions, StatementResult};
 use ferrule_sql::url::DatabaseUrl;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

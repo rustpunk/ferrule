@@ -1,9 +1,9 @@
 use super::DiffArgs;
 use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
+use ferrule_core::formatter::OutputFormat;
 use ferrule_sql::backend::Backend;
 use ferrule_sql::connection::{ConnectOptions, Connection, QueryResult};
-use ferrule_core::formatter::OutputFormat;
 use ferrule_sql::value::Value;
 use std::collections::BTreeMap;
 

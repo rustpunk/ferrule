@@ -2,8 +2,8 @@ use super::{check_daemon_ssh_compat, connect_resolved, resolve_connection, Conne
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_sql::connection::ConnectOptions;
 use ferrule_core::{LoadFormat, LoadOptions};
+use ferrule_sql::connection::ConnectOptions;
 use std::path::Path;
 
 #[derive(Args, Clone, Debug)]

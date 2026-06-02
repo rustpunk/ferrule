@@ -193,15 +193,15 @@ async fn connect_via_ssh_tunnel(
                 .await
                 .map_err(CliError::connection)
         }
-        Err(ferrule_sql::SqlError::SshHostKeyMismatch { host, port }) => Err(
-            CliError::connection(ferrule_sql::SqlError::ConnectionFailed(format!(
+        Err(ferrule_sql::SqlError::SshHostKeyMismatch { host, port }) => Err(CliError::connection(
+            ferrule_sql::SqlError::ConnectionFailed(format!(
                 "SSH host key mismatch for {host}:{port}\n\
                  The key sent by the server does not match the one recorded \
                  in ~/.ssh/known_hosts.\n\
                  To resolve: verify the new fingerprint and remove the old key:\
                  \n  ssh-keygen -R {host} -f ~/.ssh/known_hosts"
-            ))),
-        ),
+            )),
+        )),
         Err(other) => Err(CliError::connection(other)),
     }
 }

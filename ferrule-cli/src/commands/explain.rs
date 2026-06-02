@@ -4,9 +4,9 @@ use super::{
 use crate::error::CliError;
 use clap::Args;
 use ferrule_config::profile::GlobalConfig;
-use ferrule_sql::connection::ConnectOptions;
 use ferrule_core::explain::{explain_sql, is_modifying, ExplainOutput};
 use ferrule_core::formatter::format_result;
+use ferrule_sql::connection::ConnectOptions;
 
 #[derive(Args, Clone, Debug)]
 pub struct ExplainArgs {

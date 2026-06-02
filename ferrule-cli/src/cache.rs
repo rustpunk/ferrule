@@ -22,8 +22,8 @@
 //! See `docs/src/cache.md` for the user-facing contract.
 
 use ferrule_config::profile::CacheConfig;
-use ferrule_sql::connection::QueryResult;
 use ferrule_core::ParameterSet;
+use ferrule_sql::connection::QueryResult;
 use ferrule_sql::value::{ColumnInfo, Row};
 use ferrule_sql::DatabaseUrl;
 use rusqlite::{params, Connection};
@@ -233,10 +233,7 @@ impl CacheDb {
         let now = now_unix();
         // Per-row TTL expiry always runs.
         self.conn
-            .execute(
-                "DELETE FROM cache WHERE (ts + ttl_secs) < ?",
-                params![now],
-            )
+            .execute("DELETE FROM cache WHERE (ts + ttl_secs) < ?", params![now])
             .map_err(|e| CliError::usage(format!("cache: prune (ttl) failed: {e}")))?;
         if cfg.max_age_days > 0 {
             let cutoff = now - i64::from(cfg.max_age_days) * 86_400;
@@ -334,9 +331,9 @@ fn cache_key_input(conn: &str, sql: &str, params: &ParameterSet) -> String {
 pub fn normalize_sql(s: &str) -> String {
     enum State {
         Open,
-        Line,             // -- to next \n
-        Block,            // /* ... */
-        Quote(char),      // ', ", or `
+        Line,        // -- to next \n
+        Block,       // /* ... */
+        Quote(char), // ', ", or `
     }
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
@@ -457,10 +454,9 @@ pub fn parse_duration_secs(s: &str) -> Result<u64, CliError> {
 }
 
 fn migrate(conn: &Connection) -> Result<(), CliError> {
-    let current: u32 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
-        .map_err(|e| CliError::usage(format!("cache: read user_version: {e}")))?
-        as u32;
+    let current: u32 =
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .map_err(|e| CliError::usage(format!("cache: read user_version: {e}")))? as u32;
     if current > LATEST_VERSION {
         return Err(CliError::usage(format!(
             "cache: results.db user_version={current} is newer than this \
@@ -677,10 +673,20 @@ mod tests {
     fn prune_removes_expired() {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = CacheDb::open(&tmp.path().join("results.db")).unwrap();
-        db.insert(&CacheKey("k1".into()), &sample_qr(), Duration::from_secs(60), &meta())
-            .unwrap();
-        db.insert(&CacheKey("k2".into()), &sample_qr(), Duration::from_secs(60), &meta())
-            .unwrap();
+        db.insert(
+            &CacheKey("k1".into()),
+            &sample_qr(),
+            Duration::from_secs(60),
+            &meta(),
+        )
+        .unwrap();
+        db.insert(
+            &CacheKey("k2".into()),
+            &sample_qr(),
+            Duration::from_secs(60),
+            &meta(),
+        )
+        .unwrap();
         // Expire one row.
         db.conn
             .execute("UPDATE cache SET ts = ts - 3600 WHERE key = 'k1'", [])
@@ -718,7 +724,10 @@ mod tests {
         // Oldest five (k0..k4 — they got the largest negative offsets)
         // should be the ones evicted.
         let surviving: Vec<String> = {
-            let mut stmt = db.conn.prepare("SELECT key FROM cache ORDER BY key").unwrap();
+            let mut stmt = db
+                .conn
+                .prepare("SELECT key FROM cache ORDER BY key")
+                .unwrap();
             let rows = stmt
                 .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()

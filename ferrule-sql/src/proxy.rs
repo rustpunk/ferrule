@@ -257,6 +257,22 @@ impl crate::Connection for ProxiedConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global proxy
+    /// environment variables (`NO_PROXY` and the `*_PROXY` family).
+    /// `cargo test` runs a crate's tests in one binary in parallel by
+    /// default; without this guard, one test's `set_var` races
+    /// another's read (a stray `NO_PROXY=*` makes every host match),
+    /// producing intermittent failures. Every env-touching test below
+    /// holds this lock for its whole body.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Acquire the env lock, recovering from a poisoned mutex so a
+    /// panic in one serialized test does not cascade-fail its siblings.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     #[test]
     fn test_parse_simple() {
@@ -284,6 +300,7 @@ mod tests {
 
     #[test]
     fn test_is_no_proxy_star() {
+        let _guard = env_lock();
         std::env::set_var("NO_PROXY", "*");
         assert!(is_no_proxy("anything"));
         std::env::remove_var("NO_PROXY");
@@ -291,6 +308,7 @@ mod tests {
 
     #[test]
     fn test_is_no_proxy_exact() {
+        let _guard = env_lock();
         std::env::set_var("NO_PROXY", "localhost");
         assert!(is_no_proxy("localhost"));
         assert!(!is_no_proxy("otherhost"));
@@ -299,6 +317,7 @@ mod tests {
 
     #[test]
     fn test_is_no_proxy_suffix() {
+        let _guard = env_lock();
         std::env::set_var("NO_PROXY", ".example.com");
         assert!(is_no_proxy("db.example.com"));
         assert!(!is_no_proxy("example.com"));
@@ -307,6 +326,7 @@ mod tests {
 
     #[test]
     fn test_resolve_proxy_from_env_empty() {
+        let _guard = env_lock();
         // Should return None when no env vars are set
         assert!(resolve_proxy_from_env("postgres").is_none());
     }
