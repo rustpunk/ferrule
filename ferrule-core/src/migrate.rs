@@ -6,9 +6,8 @@
 //!
 //! File naming: `YYYYMMDDHHMMSS_<name>.{up,down}.sql` — lex sort = order.
 
-use crate::connection::Connection;
-use crate::error::CoreError;
-use crate::params::quote_string;
+use ferrule_sql::quote_string;
+use ferrule_sql::{Connection, Dialect, SqlError};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -60,7 +59,7 @@ impl MigrationEngine {
     /// - **Oracle** — has no `TEXT` type and `IF NOT EXISTS` is
     ///   unsupported pre-23c, so creation runs inside a PL/SQL block
     ///   that swallows ORA-00955 (name already used).
-    pub async fn ensure_migration_table(&mut self) -> Result<(), CoreError> {
+    pub async fn ensure_migration_table(&mut self) -> Result<(), SqlError> {
         let sql = match self.dialect {
             Dialect::Sqlite | Dialect::Postgres => {
                 r#"CREATE TABLE IF NOT EXISTS ferrule_migrations (
@@ -108,7 +107,7 @@ END;"#
 
     /// Return the list of migrations that have **not** yet been applied,
     /// sorted lexicographically by version.
-    pub async fn pending_migrations(&mut self) -> Result<Vec<MigrationFile>, CoreError> {
+    pub async fn pending_migrations(&mut self) -> Result<Vec<MigrationFile>, SqlError> {
         let applied = self.applied_versions().await?;
         let mut pending = self.scan_dir(Direction::Up)?;
         pending.retain(|m| !applied.contains(&m.version));
@@ -125,9 +124,9 @@ END;"#
     /// DDL implicitly commits, so the two steps run best-effort and a
     /// failure in the middle can leave the schema partially applied — see
     /// [`MigrationEngine::apply_atomic`] for the per-dialect details.
-    pub async fn apply_up(&mut self, file: &MigrationFile) -> Result<(), CoreError> {
+    pub async fn apply_up(&mut self, file: &MigrationFile) -> Result<(), SqlError> {
         let sql = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
-            CoreError::QueryFailed(format!(
+            SqlError::QueryFailed(format!(
                 "cannot read migration {}: {}",
                 file.path.display(),
                 e
@@ -153,9 +152,9 @@ END;"#
     /// schema half-rolled-back while the row still marks the migration
     /// applied. On MySQL and Oracle, DDL implicitly commits, so the two
     /// steps run best-effort — see [`MigrationEngine::apply_atomic`].
-    pub async fn apply_down(&mut self, file: &MigrationFile) -> Result<(), CoreError> {
+    pub async fn apply_down(&mut self, file: &MigrationFile) -> Result<(), SqlError> {
         let sql = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
-            CoreError::QueryFailed(format!(
+            SqlError::QueryFailed(format!(
                 "cannot read migration {}: {}",
                 file.path.display(),
                 e
@@ -192,7 +191,7 @@ END;"#
     ///   not autocommit DML, so an explicit `COMMIT` persists the
     ///   tracking-row write (and any DML in the script); MySQL autocommits,
     ///   so it needs none.
-    async fn apply_atomic(&mut self, script: &str, track: &str) -> Result<(), CoreError> {
+    async fn apply_atomic(&mut self, script: &str, track: &str) -> Result<(), SqlError> {
         match self.dialect {
             Dialect::Sqlite | Dialect::Postgres | Dialect::MsSql => {
                 let (begin, prelude) = match self.dialect {
@@ -265,7 +264,7 @@ END;"#
     /// The row-limit clause is dialect-specific: SQLite, Postgres, and
     /// MySQL accept `LIMIT n`; MSSQL uses `SELECT TOP n`; Oracle (12c+)
     /// uses `FETCH FIRST n ROWS ONLY`.
-    pub async fn last_applied(&mut self, n: usize) -> Result<Vec<AppliedMigration>, CoreError> {
+    pub async fn last_applied(&mut self, n: usize) -> Result<Vec<AppliedMigration>, SqlError> {
         let order = "ORDER BY applied_at DESC, version DESC";
         let sql = match self.dialect {
             Dialect::Sqlite | Dialect::Postgres | Dialect::MySql => {
@@ -291,7 +290,7 @@ END;"#
     /// silently truncated window. The ordering is identical to
     /// `last_applied` and needs no dialect-specific limit clause, so the
     /// same query runs on all backends.
-    pub async fn all_applied(&mut self) -> Result<Vec<AppliedMigration>, CoreError> {
+    pub async fn all_applied(&mut self) -> Result<Vec<AppliedMigration>, SqlError> {
         let sql =
             "SELECT version, checksum FROM ferrule_migrations ORDER BY applied_at DESC, version DESC";
         self.query_applied(sql).await
@@ -299,7 +298,7 @@ END;"#
 
     /// Run a `SELECT version, checksum FROM ferrule_migrations ...` query
     /// and collect the rows into [`AppliedMigration`]s.
-    async fn query_applied(&mut self, sql: &str) -> Result<Vec<AppliedMigration>, CoreError> {
+    async fn query_applied(&mut self, sql: &str) -> Result<Vec<AppliedMigration>, SqlError> {
         let result = self.conn.query(sql).await?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in result.rows {
@@ -320,7 +319,7 @@ END;"#
     /// earlier `name.starts_with(version)` prefix match could bind the
     /// wrong file (e.g. version `2026` matching `20260602_x.up.sql`),
     /// reporting spurious drift or masking real drift.
-    pub async fn verify_checksum(&mut self, version: &str) -> Result<(), CoreError> {
+    pub async fn verify_checksum(&mut self, version: &str) -> Result<(), SqlError> {
         validate_version(version)?;
         let sql = format!(
             "SELECT checksum FROM ferrule_migrations WHERE version = {}",
@@ -332,7 +331,7 @@ END;"#
             .first()
             .map(|r| r[0].to_string())
             .ok_or_else(|| {
-                CoreError::QueryFailed(format!(
+                SqlError::QueryFailed(format!(
                     "migration '{}' not found in tracking table",
                     version
                 ))
@@ -343,7 +342,7 @@ END;"#
             .iter()
             .find(|f| f.version == version)
             .ok_or_else(|| {
-                CoreError::QueryFailed(format!(
+                SqlError::QueryFailed(format!(
                     "migration file for version '{}' not found in {}",
                     version,
                     self.migrations_dir.display()
@@ -351,7 +350,7 @@ END;"#
             })?;
 
         let content = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
-            CoreError::QueryFailed(format!(
+            SqlError::QueryFailed(format!(
                 "cannot read migration file {}: {}",
                 file.path.display(),
                 e
@@ -360,7 +359,7 @@ END;"#
         let file_checksum = hex_digest(&content);
 
         if db_checksum != file_checksum {
-            return Err(CoreError::QueryFailed(format!(
+            return Err(SqlError::QueryFailed(format!(
                 "checksum mismatch for migration '{}':\n  db:    {}\n  file:  {}\n  The migration file was edited after it was applied.",
                 version, db_checksum, file_checksum
             )));
@@ -372,7 +371,7 @@ END;"#
     // Internal helpers
     // ------------------------------------------------------------------
 
-    pub async fn applied_versions(&mut self) -> Result<HashSet<String>, CoreError> {
+    pub async fn applied_versions(&mut self) -> Result<HashSet<String>, SqlError> {
         let sql = "SELECT version FROM ferrule_migrations";
         let result = self.conn.query(sql).await?;
         let mut set = HashSet::with_capacity(result.rows.len());
@@ -389,19 +388,19 @@ END;"#
     /// (`20260602120000_add_users.up.sql` -> `20260602120000`). Because
     /// two distinct files can collapse onto the same version under that
     /// rule, this detects the collision up front and returns a
-    /// [`CoreError::QueryFailed`] naming the conflicting files. Surfacing
+    /// [`SqlError::QueryFailed`] naming the conflicting files. Surfacing
     /// it here — before any `apply_up` runs — prevents a duplicate version
     /// from being discovered only when the second tracking-row `INSERT`
     /// hits the primary-key constraint mid-run, which would leave one
     /// migration's DDL applied but untracked.
-    pub fn scan_dir(&self, direction: Direction) -> Result<Vec<MigrationFile>, CoreError> {
+    pub fn scan_dir(&self, direction: Direction) -> Result<Vec<MigrationFile>, SqlError> {
         let ext = match direction {
             Direction::Up => ".up.sql",
             Direction::Down => ".down.sql",
         };
         let mut files = Vec::new();
         let entries = std::fs::read_dir(&self.migrations_dir).map_err(|e| {
-            CoreError::QueryFailed(format!(
+            SqlError::QueryFailed(format!(
                 "cannot read migrations directory '{}': {}",
                 self.migrations_dir.display(),
                 e
@@ -409,7 +408,7 @@ END;"#
         })?;
         for entry in entries {
             let entry = entry.map_err(|e| {
-                CoreError::QueryFailed(format!("cannot read directory entry: {}", e))
+                SqlError::QueryFailed(format!("cannot read directory entry: {}", e))
             })?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -431,7 +430,7 @@ END;"#
         let mut seen: HashMap<&str, &PathBuf> = HashMap::with_capacity(files.len());
         for file in &files {
             if let Some(prev) = seen.insert(file.version.as_str(), &file.path) {
-                return Err(CoreError::QueryFailed(format!(
+                return Err(SqlError::QueryFailed(format!(
                     "duplicate migration version '{}' derived from two files:\n  {}\n  {}\nRename one so each version (the text before the first '_') is unique.",
                     file.version,
                     prev.display(),
@@ -453,12 +452,12 @@ END;"#
     /// from the applied-list query — one directory scan and zero extra
     /// `SELECT`s, instead of re-reading the directory and re-querying the
     /// database once per applied migration.
-    pub async fn on_disk_checksums(&self) -> Result<HashMap<String, String>, CoreError> {
+    pub async fn on_disk_checksums(&self) -> Result<HashMap<String, String>, SqlError> {
         let files = self.scan_dir(Direction::Up)?;
         let mut map = HashMap::with_capacity(files.len());
         for file in files {
             let content = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
-                CoreError::QueryFailed(format!(
+                SqlError::QueryFailed(format!(
                     "cannot read migration file {}: {}",
                     file.path.display(),
                     e
@@ -481,7 +480,7 @@ END;"#
     pub async fn verify_applied(
         &self,
         applied: &[AppliedMigration],
-    ) -> Result<Vec<ChecksumDrift>, CoreError> {
+    ) -> Result<Vec<ChecksumDrift>, SqlError> {
         let on_disk = self.on_disk_checksums().await?;
         let mut drift = Vec::new();
         for migration in applied {
@@ -538,7 +537,7 @@ fn hex_digest(input: &str) -> String {
 /// single-quoted SQL literal.
 ///
 /// Versions are interpolated into the tracking-table `INSERT`/`DELETE`/`SELECT`
-/// statements and quoted with [`crate::params::quote_string`], which doubles
+/// statements and quoted with [`ferrule_sql::quote_string`], which doubles
 /// embedded `'`. That alone is enough for SQLite, Postgres, MSSQL, and Oracle,
 /// but MySQL interprets `\` as an escape inside string literals by default, so
 /// a backslash in a version could still break out of the literal. The version
@@ -546,9 +545,9 @@ fn hex_digest(input: &str) -> String {
 /// naming convention defines as timestamp digits, so any `'` or `\` indicates a
 /// malformed name rather than a legitimate version; reject it before building
 /// the statement.
-fn validate_version(version: &str) -> Result<(), CoreError> {
+fn validate_version(version: &str) -> Result<(), SqlError> {
     if version.contains('\'') || version.contains('\\') {
-        return Err(CoreError::QueryFailed(format!(
+        return Err(SqlError::QueryFailed(format!(
             "migration version '{version}' contains a quote or backslash; \
              rename the file so the version (the text before the first '_') \
              has no ' or \\ characters"
@@ -566,8 +565,8 @@ mod tests {
     //! transactional-atomicity batch in [`MigrationEngine::apply_atomic`]).
 
     use super::*;
-    use crate::connection::ConnectOptions;
-    use crate::url::DatabaseUrl;
+    use ferrule_sql::ConnectOptions;
+    use ferrule_sql::DatabaseUrl;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static CTR: AtomicU64 = AtomicU64::new(0);
@@ -596,9 +595,9 @@ mod tests {
     }
 
     async fn engine(t: &TestDir) -> MigrationEngine {
-        let url = DatabaseUrl::parse(&format!("sqlite://{}", t.db.display()))
-            .expect("parse sqlite url");
-        let conn = crate::backends::sqlite::connect(&url, &ConnectOptions::default())
+        let url =
+            DatabaseUrl::parse(&format!("sqlite://{}", t.db.display())).expect("parse sqlite url");
+        let conn = ferrule_sql::backends::sqlite::connect(&url, &ConnectOptions::default())
             .await
             .expect("connect sqlite");
         MigrationEngine::new(Box::new(conn), t.mig.clone(), Dialect::Sqlite)

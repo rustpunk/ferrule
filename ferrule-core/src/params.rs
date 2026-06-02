@@ -1,6 +1,6 @@
-use crate::backend::Backend;
-use crate::error::CoreError;
-use crate::value::Value;
+use ferrule_sql::render_value;
+use ferrule_sql::value::Value;
+use ferrule_sql::{Backend, SqlError};
 use indexmap::IndexMap;
 use std::str::FromStr;
 
@@ -25,8 +25,8 @@ impl ParameterSet {
 /// Substitute `${name}` placeholders in SQL with values from `params`.
 ///
 /// One pass only — no recursive substitution.
-/// Missing parameters return `CoreError::QueryFailed`.
-pub fn substitute(sql: &str, params: &ParameterSet, backend: Backend) -> Result<String, CoreError> {
+/// Missing parameters return `SqlError::QueryFailed`.
+pub fn substitute(sql: &str, params: &ParameterSet, backend: Backend) -> Result<String, SqlError> {
     let mut result = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
 
@@ -40,7 +40,7 @@ pub fn substitute(sql: &str, params: &ParameterSet, backend: Backend) -> Result<
             match params.map.get(&name) {
                 Some(value) => result.push_str(&render_value(value, backend)),
                 None => {
-                    return Err(CoreError::QueryFailed(format!(
+                    return Err(SqlError::QueryFailed(format!(
                         "Missing parameter: {}",
                         name
                     )));
@@ -55,9 +55,9 @@ pub fn substitute(sql: &str, params: &ParameterSet, backend: Backend) -> Result<
 }
 
 /// Parse a `NAME=VALUE` string, splitting at the first `=`.
-pub fn parse_param(s: &str) -> Result<(String, String), CoreError> {
+pub fn parse_param(s: &str) -> Result<(String, String), SqlError> {
     let pos = s.find('=').ok_or_else(|| {
-        CoreError::QueryFailed(format!(
+        SqlError::QueryFailed(format!(
             "Invalid parameter format '{}', expected NAME=VALUE",
             s
         ))
@@ -96,9 +96,9 @@ pub fn infer_type(v: &str) -> Value {
 }
 
 /// Load parameters from a JSON file (object mapping name → raw string value).
-pub fn load_from_json(path: &std::path::Path) -> Result<ParameterSet, CoreError> {
+pub fn load_from_json(path: &std::path::Path) -> Result<ParameterSet, SqlError> {
     let content = std::fs::read_to_string(path).map_err(|e| {
-        CoreError::QueryFailed(format!(
+        SqlError::QueryFailed(format!(
             "Cannot read parameter file '{}': {}",
             path.display(),
             e
@@ -106,7 +106,7 @@ pub fn load_from_json(path: &std::path::Path) -> Result<ParameterSet, CoreError>
     })?;
     let obj: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(&content).map_err(|e| {
-            CoreError::QueryFailed(format!(
+            SqlError::QueryFailed(format!(
                 "Invalid JSON in parameter file '{}': {}",
                 path.display(),
                 e

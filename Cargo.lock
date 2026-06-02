@@ -1422,22 +1422,12 @@ dependencies = [
 name = "ferrule-core"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "base64",
- "bytes",
  "chrono",
  "csv",
  "ferrule-config",
- "futures-util",
+ "ferrule-sql",
  "hex",
  "indexmap",
- "mysql_async",
- "oracle",
- "pkcs5",
- "rusqlite",
- "russh",
- "rust_decimal",
- "rustls",
  "secrecy",
  "serde",
  "serde-saphyr",
@@ -1445,15 +1435,7 @@ dependencies = [
  "sha2 0.10.9",
  "tabled",
  "thiserror 2.0.18",
- "tiberius",
  "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tokio-rustls",
- "tokio-util",
- "url",
- "uuid",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]

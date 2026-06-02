@@ -27,7 +27,14 @@ pub mod tunnel;
 pub mod url;
 pub mod value;
 
-mod backends;
+/// Per-backend driver modules, one feature-gated submodule per backend.
+///
+/// Public so downstream crates — notably `ferrule-core`'s CLI-support
+/// modules and their SQLite-backed integration tests — can reach the
+/// concrete connection constructors (e.g.
+/// `ferrule_sql::backends::sqlite::connect`) without routing through the
+/// URL-scheme dispatcher in [`connect`].
+pub mod backends;
 
 #[cfg(feature = "ssh")]
 pub use backend::connect_with_tunnel;
