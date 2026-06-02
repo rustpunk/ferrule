@@ -231,7 +231,20 @@ END;"#
                     Dialect::MsSql => ("BEGIN TRANSACTION;", "SET XACT_ABORT ON;\n"),
                     _ => ("BEGIN;", ""),
                 };
-                let batch = format!("{prelude}{begin}\n{script}\n;\n{track};\nCOMMIT;");
+                // Separate the migration script from the tracking statement
+                // with exactly one `;`. A bare/empty statement (`;` on its own)
+                // makes SQLite's per-statement execution path fail with the
+                // misleading "not an error", so only emit a terminator when the
+                // script actually has content.
+                let script = script.trim();
+                let body = if script.is_empty() {
+                    String::new()
+                } else if script.ends_with(';') {
+                    format!("{script}\n")
+                } else {
+                    format!("{script};\n")
+                };
+                let batch = format!("{prelude}{begin}\n{body}{track};\nCOMMIT;");
                 match self.conn.execute_multi(&batch).await {
                     Ok(_) => Ok(()),
                     Err(e) => {
@@ -554,4 +567,172 @@ fn validate_version(version: &str) -> Result<(), CoreError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    //! SQLite-backed integration tests for the migration engine.
+    //!
+    //! SQLite needs no external container, so these exercise the real
+    //! apply/rollback/verify code paths end-to-end (including the
+    //! transactional-atomicity batch in [`MigrationEngine::apply_atomic`]).
+
+    use super::*;
+    use crate::connection::ConnectOptions;
+    use crate::url::DatabaseUrl;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CTR: AtomicU64 = AtomicU64::new(0);
+
+    /// A throwaway temp directory (migrations + db file) cleaned up on drop.
+    struct TestDir {
+        base: PathBuf,
+        mig: PathBuf,
+        db: PathBuf,
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn test_dir() -> TestDir {
+        let pid = std::process::id();
+        let n = CTR.fetch_add(1, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("ferrule-migrate-test-{pid}-{n}"));
+        let mig = base.join("mig");
+        std::fs::create_dir_all(&mig).expect("create temp migrations dir");
+        let db = base.join("test.db");
+        TestDir { base, mig, db }
+    }
+
+    async fn engine(t: &TestDir) -> MigrationEngine {
+        let url = DatabaseUrl::parse(&format!("sqlite://{}", t.db.display()))
+            .expect("parse sqlite url");
+        let conn = crate::backends::sqlite::connect(&url, &ConnectOptions::default())
+            .await
+            .expect("connect sqlite");
+        MigrationEngine::new(Box::new(conn), t.mig.clone(), Dialect::Sqlite)
+    }
+
+    fn write_pair(t: &TestDir, stem: &str, up: &str, down: &str) {
+        std::fs::write(t.mig.join(format!("{stem}.up.sql")), up).expect("write up");
+        std::fs::write(t.mig.join(format!("{stem}.down.sql")), down).expect("write down");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_up_verify_down() {
+        let t = test_dir();
+        write_pair(
+            &t,
+            "20240101_users",
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n\
+             INSERT INTO users (name) VALUES ('a');\n",
+            "DROP TABLE users;\n",
+        );
+        let mut eng = engine(&t).await;
+        eng.ensure_migration_table().await.unwrap();
+
+        let pending = eng.pending_migrations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        eng.apply_up(&pending[0]).await.unwrap();
+
+        // Recorded, schema + data present, no drift, nothing left pending.
+        assert!(eng.applied_versions().await.unwrap().contains("20240101"));
+        let rows = eng.conn.query("SELECT name FROM users").await.unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        let all = eng.all_applied().await.unwrap();
+        assert!(eng.verify_applied(&all).await.unwrap().is_empty());
+        assert!(eng.pending_migrations().await.unwrap().is_empty());
+
+        // Roll back: tracking row gone and the table dropped.
+        let downs = eng.scan_dir(Direction::Down).unwrap();
+        eng.apply_down(&downs[0]).await.unwrap();
+        assert!(eng.applied_versions().await.unwrap().is_empty());
+        let tbls = eng
+            .conn
+            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            .await
+            .unwrap();
+        assert_eq!(tbls.rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn apply_up_rolls_back_on_failure() {
+        // Regression guard: the second statement fails, so the whole
+        // migration (the first statement + the tracking row) must roll back.
+        let t = test_dir();
+        write_pair(
+            &t,
+            "20240101_bad",
+            "CREATE TABLE keep_me (id INTEGER);\nCREATE TABLE keep_me (id INTEGER);\n",
+            "DROP TABLE keep_me;\n",
+        );
+        let mut eng = engine(&t).await;
+        eng.ensure_migration_table().await.unwrap();
+        let pending = eng.pending_migrations().await.unwrap();
+
+        assert!(
+            eng.apply_up(&pending[0]).await.is_err(),
+            "apply_up must fail on the duplicate CREATE"
+        );
+        let tbls = eng
+            .conn
+            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='keep_me'")
+            .await
+            .unwrap();
+        assert_eq!(tbls.rows.len(), 0, "partial schema must be rolled back");
+        assert!(
+            eng.applied_versions().await.unwrap().is_empty(),
+            "a failed migration must not be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_version_is_rejected() {
+        let t = test_dir();
+        write_pair(&t, "20240101_a", "CREATE TABLE a(x);\n", "DROP TABLE a;\n");
+        write_pair(&t, "20240101_b", "CREATE TABLE b(x);\n", "DROP TABLE b;\n");
+        let eng = engine(&t).await;
+        assert!(
+            eng.scan_dir(Direction::Up).is_err(),
+            "two files deriving the same version must be rejected up front"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_applied_detects_checksum_drift() {
+        let t = test_dir();
+        write_pair(&t, "20240101_e", "CREATE TABLE e(x);\n", "DROP TABLE e;\n");
+        let mut eng = engine(&t).await;
+        eng.ensure_migration_table().await.unwrap();
+        let pending = eng.pending_migrations().await.unwrap();
+        eng.apply_up(&pending[0]).await.unwrap();
+
+        // Edit the applied file: verify must flag the checksum drift.
+        std::fs::write(t.mig.join("20240101_e.up.sql"), "CREATE TABLE e(x, y);\n").unwrap();
+        let all = eng.all_applied().await.unwrap();
+        let drift = eng.verify_applied(&all).await.unwrap();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].version, "20240101");
+    }
+
+    #[tokio::test]
+    async fn verify_applied_detects_missing_file() {
+        let t = test_dir();
+        write_pair(&t, "20240101_g", "CREATE TABLE g(x);\n", "DROP TABLE g;\n");
+        let mut eng = engine(&t).await;
+        eng.ensure_migration_table().await.unwrap();
+        let pending = eng.pending_migrations().await.unwrap();
+        eng.apply_up(&pending[0]).await.unwrap();
+
+        // Delete the on-disk file: verify must report applied-but-missing drift.
+        std::fs::remove_file(t.mig.join("20240101_g.up.sql")).unwrap();
+        std::fs::remove_file(t.mig.join("20240101_g.down.sql")).unwrap();
+        let all = eng.all_applied().await.unwrap();
+        let drift = eng.verify_applied(&all).await.unwrap();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].version, "20240101");
+    }
 }
