@@ -1053,10 +1053,14 @@ pub async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
 ) -> Result<PostgresConnection, SqlError> {
-    let config = match url.raw().parse::<tokio_postgres::Config>() {
+    let mut config = match url.raw().parse::<tokio_postgres::Config>() {
         Ok(cfg) => cfg,
         Err(_) => build_config_from_url(url)?,
     };
+    // A caller-resolved secret takes precedence over the URL password.
+    if let Some(pwd) = opts.effective_password(url) {
+        config.password(pwd.expose_secret());
+    }
 
     let tls_connector = build_tls_connector(opts)
         .await
@@ -1095,10 +1099,14 @@ where
 {
     use tokio_postgres::tls::MakeTlsConnect;
 
-    let config = match url.raw().parse::<tokio_postgres::Config>() {
+    let mut config = match url.raw().parse::<tokio_postgres::Config>() {
         Ok(cfg) => cfg,
         Err(_) => build_config_from_url(url)?,
     };
+    // A caller-resolved secret takes precedence over the URL password.
+    if let Some(pwd) = opts.effective_password(url) {
+        config.password(pwd.expose_secret());
+    }
 
     let mut make_tls = build_tls_connector(opts)
         .await

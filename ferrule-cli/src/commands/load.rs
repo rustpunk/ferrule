@@ -99,6 +99,7 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
 
     let opts_conn = ConnectOptions {
         insecure: args.conn_flags.insecure,
+        password: None,
     };
     if opts_conn.insecure {
         eprintln!("Warning: --insecure disables TLS certificate verification.");

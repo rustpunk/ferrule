@@ -78,6 +78,7 @@ impl Repl {
         check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
         let opts = ConnectOptions {
             insecure: conn_flags.insecure,
+            password: None,
         };
         let backend = Backend::from_scheme(resolved.url.scheme()).ok_or_else(|| {
             CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
@@ -128,6 +129,7 @@ impl Repl {
         let new_url = resolved.url.clone();
         let opts = ConnectOptions {
             insecure: self.insecure,
+            password: None,
         };
         match connect_resolved(resolved, &opts).await {
             Ok(conn) => {

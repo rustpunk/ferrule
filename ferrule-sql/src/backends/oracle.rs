@@ -551,13 +551,14 @@ fn parse_uuid_hex(s: &str) -> Result<Vec<u8>, String> {
 
 pub async fn connect(
     url: &DatabaseUrl,
-    _opts: &ConnectOptions,
+    opts: &ConnectOptions,
 ) -> Result<OracleConnection, SqlError> {
     let host = url.host().unwrap_or("localhost").to_string();
     let port = url.port().unwrap_or(1521);
     let username = url.username().to_string();
-    let password = url
-        .password()
+    // A caller-resolved secret takes precedence over the URL password.
+    let password = opts
+        .effective_password(url)
         .map(|p| p.expose_secret().to_string())
         .unwrap_or_default();
     let service = url.database().to_string();

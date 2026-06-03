@@ -214,6 +214,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             resolved,
             &ConnectOptions {
                 insecure: opts.conn_flags.insecure,
+                password: None,
             },
         )
         .await

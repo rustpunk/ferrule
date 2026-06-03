@@ -92,6 +92,7 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
 
     let opts = ConnectOptions {
         insecure: args.conn_flags.insecure,
+        password: None,
     };
 
     // Capture the SQL dialect from the URL scheme before

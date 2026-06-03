@@ -92,6 +92,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
         resolved,
         &ConnectOptions {
             insecure: args.conn_flags.insecure,
+            password: None,
         },
     )
     .await?;

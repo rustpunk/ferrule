@@ -185,6 +185,7 @@ async fn cmd_run(
 
     let opts = ConnectOptions {
         insecure: conn_flags.insecure,
+        password: None,
     };
     if opts.insecure {
         eprintln!("Warning: --insecure disables TLS certificate verification.");

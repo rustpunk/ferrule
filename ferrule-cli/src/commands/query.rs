@@ -445,6 +445,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         }
         let opts = ConnectOptions {
             insecure: args.conn_flags.insecure,
+            password: None,
         };
         let mut conn = super::connect_resolved(resolved, &opts).await?;
         let result = conn.query(&wrapped).await.map_err(CliError::query)?;
@@ -472,6 +473,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
 
     let opts = ConnectOptions {
         insecure: args.conn_flags.insecure,
+        password: None,
     };
     if opts.insecure {
         eprintln!("Warning: --insecure disables TLS certificate verification.");
