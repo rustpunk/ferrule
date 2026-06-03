@@ -877,4 +877,111 @@ mod tests {
         assert_eq!(first.len(), 1);
         let _ = std::fs::remove_file(&path);
     }
+
+    // --- #91 size guards: fail fast instead of OOM (no container) ---
+
+    /// An oversized cell trips the `max_cell_bytes` guard on the eager
+    /// `query` path and fails fast with a structured
+    /// [`SqlError::CellTooLarge`] naming the offending column and cap —
+    /// rather than materializing the giant value into the result `Vec`.
+    #[test]
+    fn test_sqlite_query_cell_guard_fails_fast() {
+        let (mut conn, path) = fresh_conn();
+        conn.set_size_guards(crate::SizeGuards {
+            max_cell_bytes: 1024,
+            max_row_bytes: 0,
+            max_total_buffered_bytes: 0,
+        });
+        // A single ~8 KiB text cell, well over the 1 KiB cell cap.
+        let err = conn
+            .query("SELECT printf('%.*c', 8192, 'x') AS big")
+            .expect_err("oversized cell must fail fast, not OOM");
+        match err {
+            SqlError::CellTooLarge {
+                column, size, cap, ..
+            } => {
+                assert_eq!(column, "big");
+                assert_eq!(size, 8192);
+                assert_eq!(cap, 1024);
+            }
+            other => panic!("expected CellTooLarge, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same `max_cell_bytes` guard fires on the **streaming** path:
+    /// pulling an oversized cell through the cursor yields a structured
+    /// error item, so a pathological row cannot OOM a streaming ingest.
+    #[test]
+    fn test_sqlite_cursor_cell_guard_fails_fast() {
+        let (mut conn, path) = fresh_conn();
+        conn.set_size_guards(crate::SizeGuards {
+            max_cell_bytes: 1024,
+            max_row_bytes: 0,
+            max_total_buffered_bytes: 0,
+        });
+        let mut cursor = conn
+            .query_cursor("SELECT printf('%.*c', 8192, 'x') AS big")
+            .expect("cursor opens (guard fires per-row, not at open)");
+        let err = cursor
+            .next_batch(1)
+            .expect_err("streamed oversized cell must fail fast");
+        assert!(matches!(err, SqlError::CellTooLarge { ref column, .. } if column == "big"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The `max_total_buffered_bytes` guard caps the eager `query`'s
+    /// running tally: a result whose summed row bytes cross the cap
+    /// aborts with [`SqlError::BufferTooLarge`] instead of buffering an
+    /// unbounded `Vec<Row>`. This is the guard the CLI eager table path
+    /// relies on so a huge table is not collected whole.
+    #[test]
+    fn test_sqlite_query_total_buffer_guard_fails_fast() {
+        let (mut conn, path) = fresh_conn();
+        // 10k rows x ~256 bytes ~= 2.5 MiB; cap at 64 KiB so it trips
+        // partway through without ever buffering the full result.
+        conn.set_size_guards(crate::SizeGuards {
+            max_cell_bytes: 0,
+            max_row_bytes: 0,
+            max_total_buffered_bytes: 64 * 1024,
+        });
+        let cte = "WITH RECURSIVE seq(i) AS (\
+                       SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 10000\
+                   ) SELECT i, printf('%.*c', 256, 'y') AS pad FROM seq";
+        let err = conn
+            .query(cte)
+            .expect_err("total-buffer cap must trip before full materialization");
+        match err {
+            SqlError::BufferTooLarge { rows_buffered, cap } => {
+                assert_eq!(cap, 64 * 1024);
+                assert!(
+                    rows_buffered < 10_000,
+                    "guard tripped before buffering all rows ({rows_buffered})"
+                );
+            }
+            other => panic!("expected BufferTooLarge, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The **streaming** cursor is bounded by construction and so does
+    /// **not** apply the total-buffer cap — the same huge synthetic
+    /// result that trips the eager `query` total cap streams to
+    /// completion through the cursor under those guards.
+    #[test]
+    fn test_sqlite_cursor_ignores_total_buffer_cap() {
+        let (mut conn, path) = fresh_conn();
+        conn.set_size_guards(crate::SizeGuards {
+            max_cell_bytes: 0,
+            max_row_bytes: 0,
+            max_total_buffered_bytes: 64 * 1024,
+        });
+        let cte = "WITH RECURSIVE seq(i) AS (\
+                       SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 10000\
+                   ) SELECT i, printf('%.*c', 256, 'y') AS pad FROM seq";
+        let cursor = conn.query_cursor(cte).expect("cursor");
+        let count = cursor.into_iter().filter(|r| r.is_ok()).count();
+        assert_eq!(count, 10_000, "cursor streams past the total-buffer cap");
+        let _ = std::fs::remove_file(&path);
+    }
 }

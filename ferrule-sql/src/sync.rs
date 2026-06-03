@@ -16,6 +16,7 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
+use crate::guard::SizeGuards;
 use crate::stream::RowCursor;
 
 /// A blocking [`Connection`] backed by an async driver and a private
@@ -24,8 +25,10 @@ use crate::stream::RowCursor;
 /// **Blocking model.** Every method calls `self.rt.block_on(...)` on the
 /// owned runtime, so it blocks the calling thread until the driver
 /// future resolves. **Memory model.** [`query`](Connection::query)
-/// buffers the result; [`query_cursor`](Connection::query_cursor)
-/// streams it at bounded memory. **Reentrancy.** The runtime is
+/// buffers the result but is bounded by
+/// [`size_guards`](Connection::size_guards) — an oversized cell/row or a
+/// result past the total cap fails fast; [`query_cursor`](Connection::query_cursor)
+/// streams at bounded memory. **Reentrancy.** The runtime is
 /// current-thread; do not call from inside another `block_on` on the
 /// same thread (hop to a blocking thread first).
 pub struct SyncConnection {
@@ -36,6 +39,11 @@ pub struct SyncConnection {
     /// driver whose own `Drop` touches the runtime therefore stays sound;
     /// today none do, so the ordering is defensive but deliberate.
     inner: Box<dyn AsyncConnection>,
+    /// Per-cell / per-row / per-result byte ceilings applied to every
+    /// read (both the eager `query` and the streaming `query_cursor`).
+    /// Defaults to [`SizeGuards::default`]; override with
+    /// [`set_size_guards`](Connection::set_size_guards).
+    guards: SizeGuards,
     /// The private current-thread `tokio` runtime that drives every
     /// driver future via `block_on`. Declared **after** `inner` so it is
     /// dropped last, outliving the connection it powers.
@@ -50,7 +58,11 @@ impl SyncConnection {
     /// tasks keep being polled on later `block_on` calls.
     #[must_use]
     pub(crate) fn new(rt: tokio::runtime::Runtime, inner: Box<dyn AsyncConnection>) -> Self {
-        Self { rt, inner }
+        Self {
+            rt,
+            inner,
+            guards: SizeGuards::default(),
+        }
     }
 }
 
@@ -68,12 +80,31 @@ impl Connection for SyncConnection {
     /// server's cursor rather than pre-buffered by the driver.
     fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
         let inner = &mut self.inner;
+        let guards = self.guards;
         self.rt.block_on(async move {
             use futures_util::stream::StreamExt;
             let (columns, mut stream) = inner.query_stream(sql).await?;
             let mut rows = Vec::new();
+            let mut total: usize = 0;
+            let mut ordinal: u64 = 0;
             while let Some(item) = stream.next().await {
-                rows.push(item?);
+                let row = item?;
+                // Per-cell / per-row caps: fail fast before retaining the
+                // row. Total-buffer cap: bound the eager result so the
+                // CLI table path cannot collect an unbounded `Vec<Row>`.
+                guards.check_row(ordinal, &row, &columns)?;
+                if guards.caps_total() {
+                    let row_bytes: usize = row.iter().map(crate::value::Value::byte_size).sum();
+                    total = total.saturating_add(row_bytes);
+                    if total > guards.max_total_buffered_bytes {
+                        return Err(SqlError::BufferTooLarge {
+                            rows_buffered: ordinal,
+                            cap: guards.max_total_buffered_bytes,
+                        });
+                    }
+                }
+                ordinal += 1;
+                rows.push(row);
             }
             Ok(QueryResult { columns, rows })
         })
@@ -86,8 +117,17 @@ impl Connection for SyncConnection {
         // lifetime, which is why it exclusively borrows the connection.
         let rt = &self.rt;
         let inner = &mut self.inner;
+        let guards = self.guards;
         let (columns, stream) = rt.block_on(inner.query_stream(sql))?;
-        Ok(RowCursor::new(columns, rt, stream))
+        Ok(RowCursor::new(columns, rt, stream, guards))
+    }
+
+    fn size_guards(&self) -> SizeGuards {
+        self.guards
+    }
+
+    fn set_size_guards(&mut self, guards: SizeGuards) {
+        self.guards = guards;
     }
 
     fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {

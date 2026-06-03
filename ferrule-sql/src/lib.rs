@@ -19,6 +19,7 @@ pub mod connection;
 pub mod copy;
 pub mod dialect;
 pub mod error;
+pub mod guard;
 pub mod proxy;
 pub mod query_builder;
 pub mod render;
@@ -54,6 +55,7 @@ pub use copy::{
 };
 pub use dialect::Dialect;
 pub use error::SqlError;
+pub use guard::SizeGuards;
 pub use proxy::{is_no_proxy, resolve_proxy_from_env, ProxiedConnection, ProxyConfig};
 pub use query_builder::apply_paging;
 pub use render::{quote_string, render_value};

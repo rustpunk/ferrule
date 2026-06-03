@@ -26,8 +26,14 @@
 //! current-thread reentrancy rule as [`Connection`](crate::Connection)
 //! applies — never pull from a cursor inside another `block_on` on the
 //! same thread.
+//!
+//! **Size guards.** Each decoded row is checked against the connection's
+//! per-cell / per-row [`SizeGuards`](crate::SizeGuards) before it is
+//! retained, so a pathological cell fails fast with a structured error
+//! rather than OOMing a streaming ingest.
 
 use crate::error::SqlError;
+use crate::guard::SizeGuards;
 use crate::value::{ColumnInfo, Row};
 use futures_util::stream::{Stream, StreamExt};
 use std::pin::Pin;
@@ -61,6 +67,13 @@ pub struct RowCursor<'a> {
     /// owning connection; `block_on` on it advances the stream.
     rt: &'a tokio::runtime::Runtime,
     stream: BoxRowStream<'a>,
+    /// Per-cell / per-row size ceilings applied to every decoded row.
+    /// The streaming cursor does not apply the *total*-buffer cap (it is
+    /// bounded by design), only the per-cell and per-row caps.
+    guards: SizeGuards,
+    /// 0-based ordinal of the next row to be produced — threaded into the
+    /// [`SizeGuards`] diagnostics so an error names the real row.
+    row_ordinal: u64,
     /// Set once the underlying stream has yielded `None`, so subsequent
     /// pulls short-circuit without re-polling an exhausted stream.
     exhausted: bool,
@@ -74,11 +87,14 @@ impl<'a> RowCursor<'a> {
         columns: Vec<ColumnInfo>,
         rt: &'a tokio::runtime::Runtime,
         stream: BoxRowStream<'a>,
+        guards: SizeGuards,
     ) -> Self {
         Self {
             columns,
             rt,
             stream,
+            guards,
+            row_ordinal: 0,
             exhausted: false,
         }
     }
@@ -107,13 +123,23 @@ impl<'a> RowCursor<'a> {
         // `block_on` returns as soon as that batch is assembled — the
         // producer is never run ahead of the consumer beyond its own
         // bounded window.
+        let columns = &self.columns;
+        let guards = &self.guards;
         let stream = &mut self.stream;
+        let start_ordinal = self.row_ordinal;
         let cap = n.min(DEFAULT_CURSOR_CAPACITY);
         let result: Result<(Vec<Row>, bool), SqlError> = self.rt.block_on(async move {
             let mut out = Vec::with_capacity(cap);
+            let mut ordinal = start_ordinal;
             for _ in 0..n {
                 match stream.next().await {
-                    Some(Ok(row)) => out.push(row),
+                    Some(Ok(row)) => {
+                        // Size-check before retaining the row, so an
+                        // oversized cell fails fast instead of buffering.
+                        guards.check_row(ordinal, &row, columns)?;
+                        ordinal += 1;
+                        out.push(row);
+                    }
                     Some(Err(e)) => return Err(e),
                     None => return Ok((out, true)),
                 }
@@ -122,6 +148,7 @@ impl<'a> RowCursor<'a> {
         });
         match result {
             Ok((out, reached_end)) => {
+                self.row_ordinal += out.len() as u64;
                 self.exhausted = reached_end;
                 Ok(out)
             }

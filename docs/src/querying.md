@@ -50,6 +50,48 @@ Write to a file directly with `--output`:
 ferrule query demo "SELECT * FROM events" --format csv --output events.csv
 ```
 
+## Large results: size guards
+
+The default `table` / `json` rendering buffers the **whole** result in
+memory so it can lay out columns. To keep a pathological result from
+OOM-killing the process, `ferrule-sql` applies three constant-memory
+size guards to every read:
+
+| Guard | Default | What it caps |
+|-------|---------|--------------|
+| `max_cell_bytes` | 64 MiB | a single value (e.g. a giant `bytea` / `TEXT`) |
+| `max_row_bytes` | 256 MiB | one row's summed cell payloads |
+| `max_total_buffered_bytes` | 1 GiB | the running total an eager buffered render may accumulate |
+
+When a guard is exceeded, the query fails fast with a structured
+diagnostic naming the offending row / column and the cap, instead of
+allocating without bound. The error message points you at the options
+below.
+
+These are coarse ceilings, not an RSS budget — they are checked
+incrementally as rows decode, so the checker itself never allocates
+proportional to the data it inspects. Embedders tune them through
+`ferrule_sql::SizeGuards` on the connection; a `0` cap disables that
+dimension.
+
+### Working past the cap
+
+When a result legitimately exceeds the default ceilings you have two
+options:
+
+1. **Raise the relevant cap.** For a known-wide column or a deliberately
+   large export, lift `max_cell_bytes` / `max_row_bytes` /
+   `max_total_buffered_bytes` (embedders set these on the connection via
+   `ferrule_sql::SizeGuards`).
+2. **Ingest row-at-a-time instead of buffering.** Embedders that need to
+   process an unbounded result under a fixed memory budget use the
+   `Connection::query_cursor` streaming API, which pulls from a native
+   database cursor at `O(batch)` memory and never materializes the whole
+   result — the guards then apply per row, so a single oversized cell
+   still fails fast while the stream as a whole is unbounded in length.
+   The row-oriented `csv` / `jsonl` formats are the natural sink for that
+   streamed output.
+
 ## Paging
 
 `--limit` and `--offset` push paging down to the server when possible:
