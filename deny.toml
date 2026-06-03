@@ -1,0 +1,118 @@
+# cargo-deny configuration for the ferrule workspace.
+#
+# This file enforces the issue #67 "C-free firewall": the embeddable
+# `ferrule-sql` core and its C-free-capable backends must build with NO
+# cmake / cc-compiled C *system-library* linkage. The accepted vendored-static
+# floor is `ring` (the rustls crypto provider) and `zstd-sys` (a hard,
+# non-feature-gated dependency of mysql_common 0.34); the four crates that
+# pull a C system library or an alternate cc/cmake crypto stack are banned
+# (see [bans]). Dropping zstd-sys once mysql_common feature-gates it is
+# tracked in https://github.com/rustpunk/ferrule/issues/94.
+#
+# Graph scope (see [graph]): postgres + mysql + sqlite + oracle. Two opt-in,
+# OFF-by-default backends are intentionally excluded from the checked graph:
+#
+#   * mssql — tiberius 0.12's stable release only offers native-tls, so the
+#     `mssql` feature legitimately links OpenSSL. #67 designates mssql as an
+#     opt-in non-C-free backend; excluding it keeps the four C-free bans below
+#     a hard invariant instead of a list riddled with per-crate exceptions.
+#
+#   * ssh — the russh 0.60 line pins crates that currently carry RustSec
+#     advisories with no in-range fix (rsa Marvin-attack RUSTSEC-2023-0071,
+#     russh / russh-cryptovec unbounded-allocation advisories, a yanked `aes`
+#     0.9). Fixing them requires a russh major bump that is out of scope for
+#     the #67 TLS/C-free firewall. Rather than blanket-ignore real
+#     vulnerabilities in the workspace-wide gate, ssh is kept out of the
+#     checked graph; its pins are still ring-configured and C-free (verify
+#     with `cargo tree -p ferrule-sql --no-default-features --features ssh`).
+#
+# Oracle is in the graph for license/advisory coverage; its ODPI-C client is
+# dlopen'd at runtime, not linked at build time, so it adds no banned build-
+# time C dependency.
+
+[graph]
+# Resolve the C-free shipping surface. `no-default-features` drops the
+# ferrule-cli `default` feature (which would otherwise pull mssql -> native-tls
+# -> OpenSSL); the explicit feature list opts every clean C-free-capable
+# backend back in so its supply chain is checked for advisories, licenses,
+# and sources.
+no-default-features = true
+features = [
+    "ferrule-sql/postgres",
+    "ferrule-sql/mysql",
+    "ferrule-sql/sqlite",
+    "ferrule-sql/oracle",
+]
+targets = []
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # paste 1.0.15 (proc-macro pulled by the oracle driver) is no longer
+    # maintained. Informational only — no vulnerability, no safe upgrade
+    # available. Re-evaluate when the oracle crate drops the dependency.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained (informational); transitive via the oracle driver; no safe upgrade available." },
+    # rustls-pemfile 2.2.0 is unmaintained (now a thin wrapper around
+    # rustls-pki-types). Informational only; pulled transitively by
+    # mysql_async. Re-evaluate when mysql_async drops the dependency.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained (informational); transitive via mysql_async; no safe upgrade available." },
+]
+
+[licenses]
+# Permissive licenses only. Every entry below is present in the checked graph
+# (verify with `cargo deny check licenses`); SPDX OR-expressions pass when any
+# single member is allowed, so e.g. `UPL-1.0/Apache-2.0` (the oracle crates)
+# passes via Apache-2.0 and `MIT OR Apache-2.0 OR LGPL-2.1-or-later` passes via
+# MIT. webpki 0.22.4 ships its ISC terms in a LICENSE file with no SPDX
+# manifest key; the scanner auto-detects ISC (allowed below), so no clarify is
+# needed (it emits a benign `no-license-field` note, not an error).
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+# The C-free firewall. These crates either link a C *system* library
+# (openssl-sys, libz-sys), drag in an alternate cc/cmake-built crypto stack
+# (aws-lc-sys via aws-lc-rs), or wrap the platform TLS library (native-tls).
+# The ferrule-sql dependency pins keep all four out of the C-free graph:
+# rustls/tokio-rustls -> ring, mysql_async -> default-rustls-ring (ring crypto
+# + flate2's pure-Rust miniz_oxide backend), russh -> ring. The accepted
+# vendored-static floor that remains is `ring` + `zstd-sys`; zstd-sys removal
+# once an upstream mysql_common feature-gates it is tracked in issue #94.
+deny = [
+    { crate = "aws-lc-sys", reason = "cc/cmake-built alternate crypto stack; rustls/tokio-rustls/mysql_async/russh are pinned to the pure-Rust `ring` provider." },
+    { crate = "openssl-sys", reason = "links the system OpenSSL C library; the C-free backends use rustls/ring." },
+    { crate = "native-tls", reason = "wraps the platform system TLS (OpenSSL on Linux); the C-free backends use rustls." },
+    { crate = "libz-sys", reason = "links system zlib; mysql_async is pinned to flate2's pure-Rust miniz_oxide backend via default-rustls-ring." },
+]
+# Deliberately pinned SSH-feature crates (not present in the checked graph,
+# which excludes ssh — see the [graph] note): pkcs5 is held at the exact
+# release-candidate `=0.8.0-rc.13` required by the russh 0.60 line, and russh
+# 0.60.1 is the SSH tunnel transport, configured for the pure-Rust `ring`
+# crypto provider to stay C-free. Both are gated behind the opt-in `ssh`
+# feature and never leak into the default or postgres+mysql build. If ssh is
+# ever folded back into the checked graph, add `skip` entries for these two
+# pins here so duplicate-version detection records them as intentional.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
