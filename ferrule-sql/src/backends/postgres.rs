@@ -2034,4 +2034,128 @@ mod tests {
         let _ = src.execute(&format!("DROP TABLE {src_table}"));
         let _ = dst.execute(&format!("DROP TABLE {dst_table}"));
     }
+
+    // --- #65/#66 streaming + write against the gate DB (skip w/o container) ---
+
+    /// Stream a large synthetic result from Postgres via the native
+    /// `query_raw` cursor and assert batch-at-a-time pulling — bounded
+    /// memory against a real server, not just SQLite.
+    #[test]
+    fn test_postgres_cursor_streams_in_bounded_batches() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_cursor_streams_in_bounded_batches"
+            );
+            return;
+        };
+        const TOTAL: i64 = 50_000;
+        const BATCH: usize = 256;
+        let sql = format!("SELECT i, i * 2 AS doubled FROM generate_series(1, {TOTAL}) AS g(i)");
+        let mut cursor = conn.query_cursor(&sql).expect("open pg cursor");
+        assert_eq!(cursor.columns().len(), 2);
+        let mut total = 0u64;
+        let mut batches = 0u64;
+        loop {
+            let batch = cursor.next_batch(BATCH).expect("pull pg batch");
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= BATCH);
+            total += batch.len() as u64;
+            batches += 1;
+        }
+        assert_eq!(total, TOTAL as u64);
+        assert_eq!(batches, (TOTAL as u64).div_ceil(BATCH as u64));
+    }
+
+    /// Batched write into Postgres through the embeddable write path,
+    /// then read the rows back. Cleans up its own table.
+    #[test]
+    fn test_postgres_write_rows_round_trip() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_write_rows_round_trip"
+            );
+            return;
+        };
+        let _ = conn.execute("DROP TABLE IF EXISTS ferrule_write_test");
+        conn.execute("CREATE TABLE ferrule_write_test (id INT PRIMARY KEY, name TEXT)")
+            .expect("create write table");
+        let columns = vec![
+            crate::value::ColumnInfo {
+                name: "id".into(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            crate::value::ColumnInfo {
+                name: "name".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+        ];
+        let rows: Vec<crate::value::Row> = (1..=3000)
+            .map(|i| vec![Value::Int64(i), Value::String(format!("n{i}"))])
+            .collect();
+        let opts = crate::write::WriteOptions {
+            batch_size: 500,
+            ..Default::default()
+        };
+        let report = crate::write::write_rows(
+            &mut *conn,
+            crate::Backend::Postgres,
+            "ferrule_write_test",
+            &columns,
+            rows,
+            &opts,
+        )
+        .expect("write_rows");
+        assert_eq!(report.rows_written, 3000);
+        assert!(report.is_complete());
+        let back = conn
+            .query("SELECT COUNT(*) FROM ferrule_write_test")
+            .expect("count");
+        assert!(matches!(back.rows[0][0], Value::Int64(3000)));
+        let _ = conn.execute("DROP TABLE ferrule_write_test");
+    }
+
+    /// Per-batch partial-failure routing against Postgres: a duplicate
+    /// PK rejects its batch structurally while clean batches land.
+    #[test]
+    fn test_postgres_write_rows_partial_failure() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!(
+                "Postgres test container not available, skipping test_postgres_write_rows_partial_failure"
+            );
+            return;
+        };
+        let _ = conn.execute("DROP TABLE IF EXISTS ferrule_write_pf");
+        conn.execute("CREATE TABLE ferrule_write_pf (id INT PRIMARY KEY)")
+            .expect("create");
+        conn.execute("INSERT INTO ferrule_write_pf VALUES (5)")
+            .expect("seed");
+        let columns = vec![crate::value::ColumnInfo {
+            name: "id".into(),
+            type_hint: TypeHint::Int64,
+            nullable: false,
+        }];
+        // Batches of 4: [1,2,3,4] ok, [5,6,7,8] collides on 5.
+        let rows: Vec<crate::value::Row> = (1..=8).map(|i| vec![Value::Int64(i)]).collect();
+        let opts = crate::write::WriteOptions {
+            batch_size: 4,
+            ..Default::default()
+        };
+        let report = crate::write::write_rows(
+            &mut *conn,
+            crate::Backend::Postgres,
+            "ferrule_write_pf",
+            &columns,
+            rows,
+            &opts,
+        )
+        .expect("write_rows");
+        assert_eq!(report.rows_written, 4);
+        assert_eq!(report.rejected_batches.len(), 1);
+        assert_eq!(report.rejected_batches[0].batch_index, 1);
+        let _ = conn.execute("DROP TABLE ferrule_write_pf");
+    }
 }

@@ -28,6 +28,7 @@ pub mod transaction;
 pub mod tunnel;
 pub mod url;
 pub mod value;
+pub mod write;
 
 /// Per-backend driver modules, one feature-gated submodule per backend.
 ///
@@ -67,3 +68,7 @@ pub use tunnel::{
 };
 pub use url::DatabaseUrl;
 pub use value::{ColumnInfo, Row, TypeHint, Value};
+pub use write::{
+    write_rows, BatchOutcome, RejectedBatch, RejectedRow, WriteMode, WriteOptions, WriteReport,
+    DEFAULT_WRITE_BATCH,
+};
