@@ -310,27 +310,41 @@ mod tests {
     #[test]
     fn test_is_no_proxy_star() {
         let _guard = env_lock();
-        std::env::set_var("NO_PROXY", "*");
-        assert!(is_no_proxy("anything"));
-        std::env::remove_var("NO_PROXY");
+        // SAFETY: edition 2024 marks env mutation `unsafe` because it is
+        // not thread-safe. `env_lock()` serializes every env-touching test
+        // in this module, so no other thread reads or writes the
+        // environment concurrently with these calls.
+        unsafe {
+            std::env::set_var("NO_PROXY", "*");
+            assert!(is_no_proxy("anything"));
+            std::env::remove_var("NO_PROXY");
+        }
     }
 
     #[test]
     fn test_is_no_proxy_exact() {
         let _guard = env_lock();
-        std::env::set_var("NO_PROXY", "localhost");
-        assert!(is_no_proxy("localhost"));
-        assert!(!is_no_proxy("otherhost"));
-        std::env::remove_var("NO_PROXY");
+        // SAFETY: see `test_is_no_proxy_star` — `env_lock()` serializes all
+        // env-touching tests, so this mutation cannot race another thread.
+        unsafe {
+            std::env::set_var("NO_PROXY", "localhost");
+            assert!(is_no_proxy("localhost"));
+            assert!(!is_no_proxy("otherhost"));
+            std::env::remove_var("NO_PROXY");
+        }
     }
 
     #[test]
     fn test_is_no_proxy_suffix() {
         let _guard = env_lock();
-        std::env::set_var("NO_PROXY", ".example.com");
-        assert!(is_no_proxy("db.example.com"));
-        assert!(!is_no_proxy("example.com"));
-        std::env::remove_var("NO_PROXY");
+        // SAFETY: see `test_is_no_proxy_star` — `env_lock()` serializes all
+        // env-touching tests, so this mutation cannot race another thread.
+        unsafe {
+            std::env::set_var("NO_PROXY", ".example.com");
+            assert!(is_no_proxy("db.example.com"));
+            assert!(!is_no_proxy("example.com"));
+            std::env::remove_var("NO_PROXY");
+        }
     }
 
     #[test]

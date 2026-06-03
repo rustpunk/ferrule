@@ -566,10 +566,10 @@ mod pg_text_copy {
     /// locales and minor version wording changes.
     pub fn classify_copy_error(e: &tokio_postgres::Error) -> SqlError {
         use tokio_postgres::error::SqlState;
-        if let Some(code) = e.code() {
-            if *code == SqlState::WRONG_OBJECT_TYPE {
-                return SqlError::BulkUnavailable(format!("PG rejected COPY: {e}"));
-            }
+        if let Some(code) = e.code()
+            && *code == SqlState::WRONG_OBJECT_TYPE
+        {
+            return SqlError::BulkUnavailable(format!("PG rejected COPY: {e}"));
         }
         SqlError::QueryFailed(format!("COPY setup: {e}"))
     }
@@ -781,9 +781,9 @@ mod pg_binary_copy {
     use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
     use rust_decimal::Decimal;
     use std::str::FromStr;
+    use tokio_postgres::Client;
     use tokio_postgres::binary_copy::BinaryCopyInWriter;
     use tokio_postgres::types::{ToSql, Type};
-    use tokio_postgres::Client;
     use uuid::Uuid;
 
     /// Run a `COPY … WITH (FORMAT BINARY)` for the rows in `target`.
@@ -1747,7 +1747,7 @@ mod tests {
     #[test]
     fn test_postgres_copy_skip_then_upsert() {
         use crate::backend::Backend;
-        use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+        use crate::copy::{CopyOptions, CopySource, IfExists, copy_rows};
 
         let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(
@@ -1844,7 +1844,7 @@ mod tests {
     #[test]
     fn test_postgres_to_sqlite_all_tables_round_trip() {
         use crate::backend::Backend;
-        use crate::copy::{copy_all_tables, AllTablesOptions};
+        use crate::copy::{AllTablesOptions, copy_all_tables};
 
         let Some(mut src) = try_connect() else {
             eprintln!(
@@ -1924,7 +1924,7 @@ mod tests {
     #[test]
     fn test_postgres_binary_copy_round_trip_all_value_variants() {
         use crate::backend::Backend;
-        use crate::copy::{copy_rows, BulkMode, CopyFormat, CopyOptions, CopySource};
+        use crate::copy::{BulkMode, CopyFormat, CopyOptions, CopySource, copy_rows};
 
         let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(

@@ -30,7 +30,7 @@
 use crate::backend::Backend;
 use crate::connection::Connection;
 use crate::copy::{
-    backend_needs_explicit_commit, insert_batch, quote_identifier, BulkMode, CopyFormat, IfExists,
+    BulkMode, CopyFormat, IfExists, backend_needs_explicit_commit, insert_batch, quote_identifier,
 };
 use crate::error::SqlError;
 use crate::transaction::{begin_transaction, commit_transaction, rollback_transaction};

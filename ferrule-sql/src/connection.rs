@@ -224,7 +224,7 @@ pub trait AsyncConnection: Send {
 ///
 /// **Memory model.** [`query`](Self::query) buffers the full result set
 /// in memory (the `Vec<Row>` inside [`QueryResult`]) but is bounded by
-/// the connection's [`SizeGuards`](crate::SizeGuards): an oversized
+/// the connection's [`SizeGuards`]: an oversized
 /// cell/row or a result past the total cap fails fast with a structured
 /// error instead of OOMing. For an unbounded result use
 /// [`query_cursor`](Self::query_cursor), which streams from a native
@@ -251,7 +251,7 @@ pub trait Connection: Send {
     /// Use this — not [`query`](Self::query) — to ingest a large result
     /// under a fixed memory budget: the cursor never materializes the
     /// whole result, and it applies the connection's per-cell / per-row
-    /// [`SizeGuards`](crate::SizeGuards) as each row is decoded. The
+    /// [`SizeGuards`] as each row is decoded. The
     /// returned cursor borrows the connection for its
     /// lifetime (the async drivers' row stream is tied to the connection
     /// handle), so the connection cannot be used for another statement

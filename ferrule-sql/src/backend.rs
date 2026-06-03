@@ -289,7 +289,7 @@ async fn connect_with_tunnel_inner(
     proxy: Option<&crate::proxy::ProxyConfig>,
 ) -> Result<Box<dyn AsyncConnection>, SqlError> {
     use crate::tunnel::{
-        setup_tunnel, TunnelError, TunnelTransport, TunnelTransportResult, TunneledConnection,
+        TunnelError, TunnelTransport, TunnelTransportResult, TunneledConnection, setup_tunnel,
     };
 
     let backend = Backend::from_scheme(url.scheme())

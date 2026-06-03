@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime as ChronoDateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use secrecy::ExposeSecret;
 use tiberius::{
-    numeric::Numeric, Client, ColumnData, ColumnType, EncryptionLevel, IntoSql, TokenRow,
+    Client, ColumnData, ColumnType, EncryptionLevel, IntoSql, TokenRow, numeric::Numeric,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -775,10 +775,9 @@ pub(crate) async fn connect(
     if let Some(trust) = params
         .get("trust_server_certificate")
         .or_else(|| params.get("trustServerCertificate"))
+        && (trust == "true" || trust == "yes" || trust == "1")
     {
-        if trust == "true" || trust == "yes" || trust == "1" {
-            config.trust_cert();
-        }
+        config.trust_cert();
     }
 
     let tcp = tokio::net::TcpStream::connect(config.get_addr())
@@ -1549,7 +1548,7 @@ mod tests {
     #[test]
     fn test_mssql_copy_skip_then_upsert() {
         use crate::backend::Backend;
-        use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+        use crate::copy::{CopyOptions, CopySource, IfExists, copy_rows};
 
         let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(

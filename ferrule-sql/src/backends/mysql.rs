@@ -918,7 +918,9 @@ mod my_load_data {
             let out = enc1(Value::Bytes(raw), TypeHint::Bytes);
             assert_eq!(
                 out,
-                vec![0x01u8, b'\\', b't', 0xFF, b'\\', b'\\', b'\\', b'n', b'\\', b'0', b'Z']
+                vec![
+                    0x01u8, b'\\', b't', 0xFF, b'\\', b'\\', b'\\', b'n', b'\\', b'0', b'Z'
+                ]
             );
         }
 
@@ -1402,7 +1404,7 @@ mod tests {
     #[test]
     fn test_mysql_copy_skip_then_upsert() {
         use crate::backend::Backend;
-        use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+        use crate::copy::{CopyOptions, CopySource, IfExists, copy_rows};
 
         let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(

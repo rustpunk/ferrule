@@ -1,8 +1,13 @@
 [package]
 name = "ferrule-sql"
 version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
+# ferrule-sql tracks edition 2024 / MSRV 1.91 independently of the rest of
+# the workspace (still edition 2021): it is the crate published for external
+# embedders, who expect the current edition and a recent-but-not-bleeding-edge
+# MSRV. Edition is a per-crate setting, so this does not force the CLI/core
+# crates forward.
+edition = "2024"
+rust-version = "1.91"
 authors.workspace = true
 license.workspace = true
 
