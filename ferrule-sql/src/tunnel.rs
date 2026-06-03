@@ -5,15 +5,15 @@
 //! before opening their underlying connection.
 //!
 //! The russh-backed transport (session, channel, port forwarding,
-//! [`TunneledConnection`] wrapper) lives behind the `ssh` Cargo
+//! `TunneledConnection` wrapper) lives behind the `ssh` Cargo
 //! feature. The hybrid transport architecture is documented inline at
-//! [`TunnelTransport`]:
+//! `TunnelTransport`:
 //!
 //! - **`LocalListener`** — binds `127.0.0.1:0`, pumps bytes through
 //!   an SSH direct-tcpip channel. Used by every backend whose driver
 //!   does not expose a custom-stream injection API
 //!   (`mysql_async`, `tiberius`, `rusqlite`, `oracle`).
-//! - **`Stream`** — hands back a [`TunnelStream`] suitable for
+//! - **`Stream`** — hands back a `TunnelStream` suitable for
 //!   `tokio_postgres::Config::connect_raw`. Avoids the local TCP hop
 //!   for Postgres specifically.
 
@@ -50,7 +50,7 @@ mod ssh_impl {
     /// resolution stack collapses `--ssh-key`, profile entries,
     /// `FERRULE_<NAME>_SSH_KEY`, default identity files, and
     /// `SSH_AUTH_SOCK` into one of these variants before reaching
-    /// [`setup_tunnel`].
+    /// `setup_tunnel`.
     #[derive(Debug, Clone)]
     pub enum KeySource {
         /// A private key file on disk. The russh layer loads and (if
@@ -63,7 +63,7 @@ mod ssh_impl {
         Agent(PathBuf),
     }
 
-    /// Selects which transport [`setup_tunnel`] returns. See the
+    /// Selects which transport `setup_tunnel` returns. See the
     /// module-level docs for when to pick each.
     #[derive(Debug, Clone, Copy)]
     pub enum TunnelTransport {
@@ -201,7 +201,7 @@ mod ssh_impl {
         pub handle: std::sync::Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
     }
 
-    /// Outcome of [`setup_tunnel`]. The session is held alongside
+    /// Outcome of `setup_tunnel`. The session is held alongside
     /// the transport-specific resources so callers only need to
     /// keep one value alive — when [`TunnelHandle`] drops, the SSH
     /// session and (for path a) the forwarder task drop with it.
@@ -330,7 +330,7 @@ mod ssh_impl {
 
     /// russh client handler.
     ///
-    /// [`check_server_key`] compares the server's public key against
+    /// `check_server_key` compares the server's public key against
     /// the user's `~/.ssh/known_hosts` via russh's native parser.
     /// Match → silent accept; mismatch → fatal error; unknown →
     /// `Err(TunnelError::UnknownHost)` so the CLI layer can prompt
@@ -395,9 +395,9 @@ mod ssh_impl {
     ) -> Result<TunnelHandle, TunnelError> {
         use russh::client;
         use russh::client::AuthResult;
-        use russh::keys::agent::client::AgentClient;
         use russh::keys::agent::AgentIdentity;
-        use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg};
+        use russh::keys::agent::client::AgentClient;
+        use russh::keys::{HashAlg, PrivateKeyWithHashAlg, load_secret_key};
 
         let cfg = Arc::new(client::Config::default());
         let mut handle = if let Some(proxy) = proxy {
@@ -626,9 +626,9 @@ mod ssh_impl {
 pub(crate) use ssh_impl::setup_tunnel;
 #[cfg(feature = "ssh")]
 pub use ssh_impl::{
-    check_host_key, learn_host_key, ssh_key_needs_passphrase, ClientHandler, KeySource, SshSession,
-    TunnelError, TunnelHandle, TunnelStream, TunnelTransport, TunnelTransportResult,
-    TunneledConnection,
+    ClientHandler, KeySource, SshSession, TunnelError, TunnelHandle, TunnelStream, TunnelTransport,
+    TunnelTransportResult, TunneledConnection, check_host_key, learn_host_key,
+    ssh_key_needs_passphrase,
 };
 
 #[cfg(feature = "ssh")]

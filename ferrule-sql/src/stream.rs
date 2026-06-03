@@ -28,7 +28,7 @@
 //! same thread.
 //!
 //! **Size guards.** Each decoded row is checked against the connection's
-//! per-cell / per-row [`SizeGuards`](crate::SizeGuards) before it is
+//! per-cell / per-row [`SizeGuards`] before it is
 //! retained, so a pathological cell fails fast with a structured error
 //! rather than OOMing a streaming ingest.
 

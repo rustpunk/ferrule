@@ -3,13 +3,13 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
-use crate::stream::{channel_stream, BoxRowStream, DEFAULT_CURSOR_CAPACITY};
+use crate::stream::{BoxRowStream, DEFAULT_CURSOR_CAPACITY, channel_stream};
 use crate::url::DatabaseUrl;
 use crate::value::Row;
 use crate::value::{ColumnInfo, TypeHint, Value};
 use async_trait::async_trait;
-use rusqlite::types::Value as SqliteValue;
 use rusqlite::Connection as SqliteConn;
+use rusqlite::types::Value as SqliteValue;
 
 pub struct SqliteConnection {
     conn: std::sync::Arc<std::sync::Mutex<SqliteConn>>,

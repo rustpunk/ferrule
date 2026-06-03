@@ -3,7 +3,7 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
-use crate::stream::{channel_stream, BoxRowStream, DEFAULT_CURSOR_CAPACITY};
+use crate::stream::{BoxRowStream, DEFAULT_CURSOR_CAPACITY, channel_stream};
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
@@ -433,10 +433,10 @@ fn map_oracle_bulk_error(e: oracle::Error) -> SqlError {
     // Instant-Client-not-loaded structural error (see the connect
     // path at `map_oracle_error`). In practice this can't fire here
     // because we'd have failed at connect time, but defend in depth.
-    if let Some(code) = e.dpi_code() {
-        if code == 1047 || msg.contains("libclntsh") {
-            return SqlError::ConnectionFailed(format!("Oracle Instant Client not loaded: {msg}"));
-        }
+    if let Some(code) = e.dpi_code()
+        && (code == 1047 || msg.contains("libclntsh"))
+    {
+        return SqlError::ConnectionFailed(format!("Oracle Instant Client not loaded: {msg}"));
     }
     SqlError::QueryFailed(format!("Oracle bulk: {msg}"))
 }
@@ -1654,7 +1654,7 @@ mod tests {
     #[test]
     fn test_oracle_copy_skip_then_upsert() {
         use crate::backend::Backend;
-        use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
+        use crate::copy::{CopyOptions, CopySource, IfExists, copy_rows};
 
         let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(

@@ -1,6 +1,6 @@
 //! Cross-DB row copy: stream rows from one backend's table or query
 //! into another backend's table, translating types via the unified
-//! [`Value`](crate::value::Value) enum.
+//! [`Value`] enum.
 //!
 //! The default conflict policy is non-destructive — a copy into a
 //! non-empty existing target table errors out before any INSERT (or
@@ -130,7 +130,7 @@ pub enum CopyFormat {
     #[default]
     Text,
     /// `COPY … WITH (FORMAT BINARY)`. Streamed via
-    /// [`tokio_postgres::binary_copy::BinaryCopyInWriter`]; per-row
+    /// `tokio_postgres::binary_copy::BinaryCopyInWriter`; per-row
     /// values are bound through their `ToSql` impls.
     Binary,
 }
@@ -551,10 +551,10 @@ fn run_copy(
         }
     };
 
-    if first_len > 0 {
-        if let Some(cb) = &opts.progress {
-            cb(first_len);
-        }
+    if first_len > 0
+        && let Some(cb) = &opts.progress
+    {
+        cb(first_len);
     }
 
     let mut total = first_len;
@@ -2386,8 +2386,8 @@ mod tests {
         };
         use crate::error::SqlError;
         use async_trait::async_trait;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// What `bulk_insert_rows` should do on the destination wrapper.
         pub enum BulkBehaviour {
