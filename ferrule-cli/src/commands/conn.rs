@@ -38,6 +38,7 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
             super::check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
             let opts = ferrule_sql::connection::ConnectOptions {
                 insecure: conn_flags.insecure,
+                password: None,
             };
             if opts.insecure {
                 eprintln!("Warning: --insecure disables TLS certificate verification.");

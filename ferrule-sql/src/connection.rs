@@ -1,12 +1,47 @@
 use crate::error::SqlError;
 use crate::value::{ColumnInfo, Row};
 use async_trait::async_trait;
+use secrecy::SecretString;
 
 /// Backend-agnostic connection options.
+///
+/// `password` carries a credential the *caller* already resolved
+/// (env var, OS keyring, interactive prompt, or any host-supplied
+/// source). `ferrule-sql` performs no credential resolution itself —
+/// it has no dependency on `rpassword`, an OS keyring, or `dirs`. An
+/// embedded library consumer supplies the secret here rather than
+/// baking it into the connection URL.
+///
+/// When `password` is `Some`, it takes precedence over any password
+/// component embedded in the connection URL. When it is `None`, each
+/// backend falls back to the URL's password component, so callers
+/// that prefer to embed the password in the URL keep working.
+///
+/// The secret is wrapped in [`SecretString`] so it is redacted in
+/// `Debug` output and zeroized on drop.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
     /// Disable TLS certificate verification. Emits a warning on stderr.
     pub insecure: bool,
+    /// Caller-resolved credential. Takes precedence over the URL's
+    /// password component; `None` falls back to the URL.
+    pub password: Option<SecretString>,
+}
+
+impl ConnectOptions {
+    /// Resolve the effective password for this connection: the
+    /// caller-supplied [`ConnectOptions::password`] if present,
+    /// otherwise the password component of `url`.
+    ///
+    /// This is the single precedence rule every backend honors so the
+    /// "resolved secret wins, URL is the fallback" contract lives in
+    /// one place. The returned [`SecretString`] keeps the credential
+    /// redacted and zeroize-on-drop right up to the point each driver
+    /// consumes it via `expose_secret()`.
+    #[must_use]
+    pub fn effective_password(&self, url: &crate::url::DatabaseUrl) -> Option<SecretString> {
+        self.password.clone().or_else(|| url.password())
+    }
 }
 
 /// Result of a query — columns plus rows.
@@ -140,4 +175,45 @@ pub trait Connection: Send {
     /// wrapper is a bug we want to catch at compile time, not at
     /// runtime in the "just slow" form.
     async fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::url::DatabaseUrl;
+    use secrecy::ExposeSecret;
+
+    /// A caller-resolved secret in `ConnectOptions::password` wins over
+    /// the password embedded in the URL — this is the precedence rule
+    /// that lets an embedder hand ferrule-sql a credential it resolved
+    /// (keyring, prompt) instead of baking it into the URL.
+    #[test]
+    fn effective_password_prefers_opts_over_url() {
+        let url = DatabaseUrl::parse("postgres://user:url_pw@localhost/db").unwrap();
+        let opts = ConnectOptions {
+            password: Some(SecretString::new("resolved_pw".into())),
+            ..Default::default()
+        };
+        let got = opts.effective_password(&url).expect("a password");
+        assert_eq!(got.expose_secret(), "resolved_pw");
+    }
+
+    /// With no caller-supplied secret, ferrule-sql falls back to the
+    /// URL's password component, so the URL-embedded path keeps working.
+    #[test]
+    fn effective_password_falls_back_to_url() {
+        let url = DatabaseUrl::parse("postgres://user:url_pw@localhost/db").unwrap();
+        let opts = ConnectOptions::default();
+        let got = opts.effective_password(&url).expect("a password");
+        assert_eq!(got.expose_secret(), "url_pw");
+    }
+
+    /// No secret anywhere yields `None` — backends then connect without
+    /// a password (e.g. trust/peer auth or a passwordless local socket).
+    #[test]
+    fn effective_password_none_when_absent_everywhere() {
+        let url = DatabaseUrl::parse("postgres://user@localhost/db").unwrap();
+        let opts = ConnectOptions::default();
+        assert!(opts.effective_password(&url).is_none());
+    }
 }

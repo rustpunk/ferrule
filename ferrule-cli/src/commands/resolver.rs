@@ -14,14 +14,20 @@ pub struct SshTunnelInputs {
     pub key_source: KeySource,
 }
 
-/// Bundled output of [`resolve_connection`]: the URL (possibly with
-/// password injected from the credential stack) plus optional SSH
-/// tunnel inputs. When `ssh` is `Some`, the dispatch layer will set
-/// up the tunnel before connecting; when `None`, it connects
-/// directly.
+/// Bundled output of [`resolve_connection`]: the URL (with password
+/// injected from the credential stack) plus the same resolved
+/// credential surfaced as a standalone `secret`, and optional SSH
+/// tunnel inputs.
+///
+/// `secret` is what `connect_resolved` hands to
+/// `ferrule_sql::ConnectOptions::password` so the SQL core receives an
+/// already-resolved credential instead of resolving one itself. When
+/// `ssh` is `Some`, the dispatch layer sets up the tunnel before
+/// connecting; when `None`, it connects directly.
 #[derive(Debug, Clone)]
 pub struct ResolvedConnection {
     pub url: DatabaseUrl,
+    pub secret: Option<secrecy::SecretString>,
     pub ssh: Option<SshTunnelInputs>,
     pub proxy: Option<ferrule_sql::ProxyConfig>,
 }
@@ -69,6 +75,7 @@ pub async fn resolve_connection(
 
     Ok(ResolvedConnection {
         url: core_resolved.url,
+        secret: core_resolved.secret,
         ssh,
         proxy: core_resolved.proxy,
     })
@@ -105,11 +112,19 @@ pub async fn connect_resolved(
     resolved: ResolvedConnection,
     opts: &ferrule_sql::ConnectOptions,
 ) -> Result<Box<dyn ferrule_sql::Connection>, CliError> {
+    // Hand the SQL core the credential we already resolved (env var,
+    // keyring, prompt) via `ConnectOptions::password` instead of
+    // relying on the URL. The CLI owns credential resolution; the
+    // resolved secret wins over any URL password component.
+    let opts = ferrule_sql::ConnectOptions {
+        password: resolved.secret.clone(),
+        ..opts.clone()
+    };
     let proxy = resolved.proxy.as_ref();
     if let Some(ssh) = resolved.ssh {
-        return connect_via_ssh_tunnel(resolved.url, ssh, opts, proxy).await;
+        return connect_via_ssh_tunnel(resolved.url, ssh, &opts, proxy).await;
     }
-    ferrule_sql::connect(&resolved.url, opts, proxy)
+    ferrule_sql::connect(&resolved.url, &opts, proxy)
         .await
         .map_err(CliError::connection)
 }

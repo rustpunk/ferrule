@@ -677,8 +677,9 @@ pub async fn connect(
     config.port(url.port().unwrap_or(1433));
 
     if !url.username().is_empty() {
-        let password = url
-            .password()
+        // A caller-resolved secret takes precedence over the URL password.
+        let password = opts
+            .effective_password(url)
             .map(|p| p.expose_secret().to_string())
             .unwrap_or_default();
         config.authentication(tiberius::AuthMethod::sql_server(url.username(), password));

@@ -414,7 +414,8 @@ pub async fn connect(
     if !url.username().is_empty() {
         builder = builder.user(Some(url.username()));
     }
-    if let Some(pass) = url.password() {
+    // A caller-resolved secret takes precedence over the URL password.
+    if let Some(pass) = opts.effective_password(url) {
         builder = builder.pass(Some(pass.expose_secret()));
     }
     let db = url.database();
