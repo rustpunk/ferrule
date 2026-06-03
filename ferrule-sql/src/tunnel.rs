@@ -270,6 +270,15 @@ mod ssh_impl {
             self.inner.query(sql).await
         }
 
+        /// Forward the streaming cursor to the inner (tunneled)
+        /// connection; the tunnel adds no row buffering of its own.
+        async fn query_stream(
+            &mut self,
+            sql: &str,
+        ) -> Result<(Vec<crate::ColumnInfo>, crate::BoxRowStream<'_>), crate::SqlError> {
+            self.inner.query_stream(sql).await
+        }
+
         async fn execute_multi(
             &mut self,
             sql: &str,

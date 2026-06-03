@@ -2410,6 +2410,12 @@ mod tests {
             fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
                 self.inner.query(sql)
             }
+            fn query_cursor(
+                &mut self,
+                sql: &str,
+            ) -> Result<crate::stream::RowCursor<'_>, SqlError> {
+                self.inner.query_cursor(sql)
+            }
             fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
                 self.inner.execute_multi(sql)
             }

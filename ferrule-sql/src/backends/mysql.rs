@@ -3,6 +3,7 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
+use crate::stream::BoxRowStream;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
@@ -75,6 +76,62 @@ impl AsyncConnection for MySqlConnection {
             .collect();
 
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Stream rows from a MySQL `query_iter` result at bounded memory.
+    ///
+    /// `query_iter` is already lazy — it does not read rows from the
+    /// server until they are pulled. We keep that laziness by driving
+    /// `QueryResult::next` inside a `try_unfold` stream that owns the
+    /// `QueryResult` (which borrows `&mut self.conn`), so no row is read
+    /// ahead of the consumer and memory stays `O(1)` per pulled row.
+    /// Only the first result set is streamed (consistent with the eager
+    /// `query`); the connection is left ready for reuse once the stream
+    /// is fully drained or dropped.
+    async fn query_stream(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<ColumnInfo>, BoxRowStream<'_>), SqlError> {
+        // Pass an owned query so the resulting `QueryResult` borrows
+        // only `&mut self.conn` (not the `sql` argument), keeping the
+        // returned stream tied to the connection lifetime.
+        let result = self
+            .conn
+            .query_iter(sql.to_string())
+            .await
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+
+        let columns: Vec<ColumnInfo> = result
+            .columns_ref()
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name_str().to_string(),
+                type_hint: TypeHint::Other,
+                nullable: true,
+            })
+            .collect();
+
+        let stream = futures_util::stream::try_unfold(result, |mut result| async move {
+            match result.next().await {
+                Ok(Some(row)) => {
+                    let col_types: Vec<_> = row
+                        .columns_ref()
+                        .iter()
+                        .map(|c| (c.column_type(), c.column_length()))
+                        .collect();
+                    let values: Row = row
+                        .unwrap()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| mysql_to_value(v, col_types[i].0, col_types[i].1))
+                        .collect();
+                    Ok(Some((values, result)))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(SqlError::QueryFailed(e.to_string())),
+            }
+        });
+        Ok((columns, Box::pin(stream)))
     }
 
     async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {

@@ -16,16 +16,18 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
+use crate::stream::RowCursor;
 
 /// A blocking [`Connection`] backed by an async driver and a private
 /// current-thread runtime.
 ///
 /// **Blocking model.** Every method calls `self.rt.block_on(...)` on the
 /// owned runtime, so it blocks the calling thread until the driver
-/// future resolves. **Memory model.** Results are fully buffered (see
-/// [`Connection`]). **Reentrancy.** The runtime is current-thread; do
-/// not call from inside another `block_on` on the same thread (hop to a
-/// blocking thread first).
+/// future resolves. **Memory model.** [`query`](Connection::query)
+/// buffers the result; [`query_cursor`](Connection::query_cursor)
+/// streams it at bounded memory. **Reentrancy.** The runtime is
+/// current-thread; do not call from inside another `block_on` on the
+/// same thread (hop to a blocking thread first).
 pub struct SyncConnection {
     /// The wrapped async connection. Declared **before** `rt` so that
     /// Rust's declaration-order field drop tears this connection down —
@@ -58,9 +60,34 @@ impl Connection for SyncConnection {
         self.rt.block_on(inner.execute(sql))
     }
 
+    /// Eager read, routed through the **native cursor** and collected
+    /// into a fully-materialized [`QueryResult`]. Building the eager
+    /// result on top of the streaming producer keeps a single decode
+    /// path shared with [`query_cursor`](Self::query_cursor); for the
+    /// network backends it also means the rows are pulled from the
+    /// server's cursor rather than pre-buffered by the driver.
     fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
         let inner = &mut self.inner;
-        self.rt.block_on(inner.query(sql))
+        self.rt.block_on(async move {
+            use futures_util::stream::StreamExt;
+            let (columns, mut stream) = inner.query_stream(sql).await?;
+            let mut rows = Vec::new();
+            while let Some(item) = stream.next().await {
+                rows.push(item?);
+            }
+            Ok(QueryResult { columns, rows })
+        })
+    }
+
+    fn query_cursor(&mut self, sql: &str) -> Result<RowCursor<'_>, SqlError> {
+        // Split-borrow the disjoint fields: the stream borrows `inner`,
+        // the cursor drives it through `rt`. No self-referential storage
+        // and no `unsafe` — `RowCursor` holds both borrows for its
+        // lifetime, which is why it exclusively borrows the connection.
+        let rt = &self.rt;
+        let inner = &mut self.inner;
+        let (columns, stream) = rt.block_on(inner.query_stream(sql))?;
+        Ok(RowCursor::new(columns, rt, stream))
     }
 
     fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {

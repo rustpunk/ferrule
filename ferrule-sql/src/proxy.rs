@@ -208,6 +208,15 @@ impl crate::connection::AsyncConnection for ProxiedConnection {
         self.inner.query(sql).await
     }
 
+    /// Forward the streaming cursor to the inner connection; the proxy is
+    /// a transparent byte forwarder and adds no buffering of its own.
+    async fn query_stream(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<crate::ColumnInfo>, crate::BoxRowStream<'_>), crate::SqlError> {
+        self.inner.query_stream(sql).await
+    }
+
     async fn execute_multi(
         &mut self,
         sql: &str,

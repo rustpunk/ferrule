@@ -8,15 +8,15 @@ license.workspace = true
 
 [features]
 default = []
-postgres = ["dep:tokio-postgres","dep:tokio-postgres-rustls","dep:tokio-rustls","dep:webpki-roots","dep:uuid","dep:rust_decimal","dep:rustls","dep:bytes","dep:futures-util"]
-mysql = ["dep:mysql_async","dep:bytes","dep:futures-util"]
+postgres = ["dep:tokio-postgres","dep:tokio-postgres-rustls","dep:tokio-rustls","dep:webpki-roots","dep:uuid","dep:rust_decimal","dep:rustls","dep:bytes"]
+mysql = ["dep:mysql_async","dep:bytes"]
 mssql = ["dep:tiberius","dep:tokio-util"]
 sqlite = ["dep:rusqlite"]
 oracle = ["dep:oracle"]
 ssh = ["dep:russh","dep:pkcs5"]
 
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -41,7 +41,7 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 webpki-roots = { version = "0.26", optional = true }
 uuid = { workspace = true, optional = true }
 bytes = { version = "1", optional = true }
-futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink","alloc"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink","alloc"] }
 # default-rustls-ring selects flate2's pure-Rust backend (drops libz-sys) and the
 # ring rustls provider (drops aws-lc-sys); default-features=false suppresses
 # mysql_async's own `default`, which would re-enable the aws-lc-rs provider.

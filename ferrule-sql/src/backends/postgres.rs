@@ -3,6 +3,7 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
+use crate::stream::BoxRowStream;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
@@ -66,6 +67,58 @@ impl AsyncConnection for PostgresConnection {
             columns,
             rows: data_rows,
         })
+    }
+
+    /// Stream rows from a Postgres server-side row stream at bounded
+    /// memory via the extended-protocol `query_raw`.
+    ///
+    /// `query_raw` returns a `RowStream` that the driver feeds from the
+    /// server in bounded portions as it is polled, so memory stays
+    /// `O(in-flight rows)` rather than buffering the whole result (which
+    /// the eager `query` did via `client.query`). The stream borrows
+    /// `&self.client`, so it is tied to this connection's lifetime — the
+    /// public cursor holds the connection until dropped.
+    async fn query_stream(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<ColumnInfo>, BoxRowStream<'_>), SqlError> {
+        use futures_util::stream::TryStreamExt;
+        // Prepare first so the column metadata is known up front — the
+        // `RowStream` itself does not expose columns before the first
+        // row. The prepared `Statement` carries the row description.
+        let statement = self
+            .client
+            .prepare(sql)
+            .await
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+        let columns: Vec<ColumnInfo> = statement
+            .columns()
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name().to_string(),
+                type_hint: pg_type_to_hint(c.type_()),
+                nullable: true,
+            })
+            .collect();
+        let ncols = columns.len();
+
+        // Empty, explicitly-typed parameter list — query_raw is generic
+        // over the param iterator, so it needs a concrete element type.
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
+        let row_stream = self
+            .client
+            .query_raw(&statement, params)
+            .await
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+
+        let mapped = row_stream
+            .map_ok(move |row| {
+                (0..ncols)
+                    .map(|i| pg_to_value(&row, i, row.columns()[i].type_()))
+                    .collect::<Row>()
+            })
+            .map_err(|e| SqlError::QueryFailed(e.to_string()));
+        Ok((columns, Box::pin(mapped)))
     }
 
     async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {

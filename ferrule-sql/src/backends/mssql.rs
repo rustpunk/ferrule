@@ -3,6 +3,7 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
+use crate::stream::BoxRowStream;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
@@ -75,6 +76,76 @@ impl AsyncConnection for MssqlConnection {
             columns,
             rows: data_rows,
         })
+    }
+
+    /// Stream rows from a tiberius `QueryStream` at bounded memory.
+    ///
+    /// tiberius hands back a token stream whose first item is the
+    /// `Metadata` describing the result columns, followed by one `Row`
+    /// item per row, pulled from the server only as the stream is
+    /// advanced. We read the leading metadata for the column shape, then
+    /// drive the remaining rows through a `try_unfold` that owns the
+    /// `QueryStream` (borrowing `&mut self.client`). Only the first
+    /// result set is streamed, matching the eager `query`'s
+    /// `into_first_result` contract; a metadata token for a later result
+    /// set terminates the stream. Memory stays `O(1)` per pulled row.
+    async fn query_stream(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<ColumnInfo>, BoxRowStream<'_>), SqlError> {
+        use futures_util::stream::{StreamExt, TryStreamExt};
+        use tiberius::QueryItem;
+
+        let mut query_stream = self
+            .client
+            .query(sql, &[])
+            .await
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+
+        // The first token of a tiberius result is the Metadata that
+        // carries the column shape for the first result set.
+        let (columns, col_types) = match query_stream.try_next().await {
+            Ok(Some(QueryItem::Metadata(meta))) => {
+                let columns: Vec<ColumnInfo> = meta
+                    .columns()
+                    .iter()
+                    .map(|c| ColumnInfo {
+                        name: c.name().to_string(),
+                        type_hint: mssql_type_to_hint(c.column_type()),
+                        nullable: true,
+                    })
+                    .collect();
+                let col_types: Vec<ColumnType> =
+                    meta.columns().iter().map(|c| c.column_type()).collect();
+                (columns, col_types)
+            }
+            // A row before any metadata should not happen; treat it (and
+            // an empty stream) as a zero-column result for safety.
+            Ok(Some(QueryItem::Row(_))) | Ok(None) => (Vec::new(), Vec::new()),
+            Err(e) => return Err(SqlError::QueryFailed(e.to_string())),
+        };
+
+        let stream = futures_util::stream::try_unfold(
+            (query_stream, col_types),
+            |(mut query_stream, col_types)| async move {
+                match query_stream.try_next().await {
+                    Ok(Some(QueryItem::Row(row))) => {
+                        let values: Row = col_types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, col_type)| mssql_to_value(&row, i, *col_type))
+                            .collect();
+                        Ok(Some((values, (query_stream, col_types))))
+                    }
+                    // A second result set's metadata ends the first set;
+                    // an empty stream ends iteration.
+                    Ok(Some(QueryItem::Metadata(_))) | Ok(None) => Ok(None),
+                    Err(e) => Err(SqlError::QueryFailed(e.to_string())),
+                }
+            },
+        )
+        .boxed();
+        Ok((columns, stream))
     }
 
     async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
