@@ -123,7 +123,7 @@ END;"#
     /// recorded-but-partial or applied-but-untracked. On MySQL and Oracle,
     /// DDL implicitly commits, so the two steps run best-effort and a
     /// failure in the middle can leave the schema partially applied — see
-    /// [`MigrationEngine::apply_atomic`] for the per-dialect details.
+    /// `apply_atomic` for the per-dialect details.
     pub fn apply_up(&mut self, file: &MigrationFile) -> Result<(), SqlError> {
         let sql = std::fs::read_to_string(&file.path).map_err(|e| {
             SqlError::QueryFailed(format!(
@@ -151,7 +151,7 @@ END;"#
     /// down script succeeds, so a mid-script failure can never leave the
     /// schema half-rolled-back while the row still marks the migration
     /// applied. On MySQL and Oracle, DDL implicitly commits, so the two
-    /// steps run best-effort — see [`MigrationEngine::apply_atomic`].
+    /// steps run best-effort — see `apply_atomic`.
     pub fn apply_down(&mut self, file: &MigrationFile) -> Result<(), SqlError> {
         let sql = std::fs::read_to_string(&file.path).map_err(|e| {
             SqlError::QueryFailed(format!(
@@ -562,7 +562,7 @@ mod tests {
     //!
     //! SQLite needs no external container, so these exercise the real
     //! apply/rollback/verify code paths end-to-end (including the
-    //! transactional-atomicity batch in [`MigrationEngine::apply_atomic`]).
+    //! transactional-atomicity batch in `apply_atomic`).
 
     use super::*;
     use ferrule_sql::ConnectOptions;
