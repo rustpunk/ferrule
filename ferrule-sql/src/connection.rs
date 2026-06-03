@@ -109,12 +109,12 @@ pub struct ForeignKey {
 /// [`Connection`], whose wrapper [`crate::sync::SyncConnection`] drives
 /// these futures to completion on a private current-thread runtime.
 ///
-/// Embedders never name this trait. It is `pub` only so the per-backend
-/// modules (which are `pub` for their concrete connect constructors) can
-/// implement it; it is deliberately **not** re-exported from the crate
-/// root.
+/// Embedders never name this trait. It is `pub(crate)` so the
+/// per-backend modules implement it in-crate while it stays absent from
+/// the public API — no `async fn` / `Future` is reachable through it
+/// from outside the crate.
 #[async_trait]
-pub trait AsyncConnection: Send {
+pub(crate) trait AsyncConnection: Send {
     /// Execute a statement that may not return rows (INSERT, UPDATE, CREATE, etc.).
     async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError>;
 
