@@ -27,12 +27,17 @@ use crate::error::SqlError;
 /// not call from inside another `block_on` on the same thread (hop to a
 /// blocking thread first).
 pub struct SyncConnection {
-    /// The private runtime that drives every driver future. Declared
-    /// before `inner` so that, on drop, the inner connection (and its
-    /// spawned background tasks) is torn down before the runtime that
-    /// hosts them.
-    rt: tokio::runtime::Runtime,
+    /// The wrapped async connection. Declared **before** `rt` so that
+    /// Rust's declaration-order field drop tears this connection down —
+    /// together with any background I/O task it spawned on the runtime —
+    /// while the runtime is still alive, and only then drops `rt`. A
+    /// driver whose own `Drop` touches the runtime therefore stays sound;
+    /// today none do, so the ordering is defensive but deliberate.
     inner: Box<dyn AsyncConnection>,
+    /// The private current-thread `tokio` runtime that drives every
+    /// driver future via `block_on`. Declared **after** `inner` so it is
+    /// dropped last, outliving the connection it powers.
+    rt: tokio::runtime::Runtime,
 }
 
 impl SyncConnection {
