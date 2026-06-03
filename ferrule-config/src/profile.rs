@@ -182,7 +182,7 @@ fn default_history_max_rows() -> u64 {
 
 /// Slow-query log configuration (P5 / #16). Default off — recording
 /// every slow query to a side file is opinionated enough to warrant an
-/// explicit opt-in. When enabled, the [`HistoryDb::record`] hook also
+/// explicit opt-in. When enabled, the `HistoryDb::record` hook also
 /// appends a tab-separated line to `path` for every run whose
 /// `duration_ms >= threshold_ms`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,36 +283,24 @@ fn default_cache_max_rows() -> u64 {
     10_000
 }
 
-/// Parse a `humantime`-style duration into milliseconds, or accept a
-/// bare integer of milliseconds. Lives here (not in `humantime` itself)
-/// because pulling in a workspace dep for one parse felt heavier than
-/// the function body. Recognises `s`, `ms`, `m`, `h`, `d`; rejects
-/// anything else.
+/// Resolve a `[slow_log] threshold` string to milliseconds.
+///
+/// A bare integer is the slow-log-specific shorthand for milliseconds
+/// (`"500"` → 500 ms); that quirk is handled here. Everything with a unit
+/// suffix delegates to the shared [`crate::parse::parse_duration`] so the
+/// recognised units stay in lock-step with `ferrule history --since`.
 fn parse_threshold_ms(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("threshold is empty".into());
     }
+    // Slow-log-specific quirk: a bare integer means milliseconds.
     if let Ok(ms) = s.parse::<u64>() {
         return Ok(ms);
     }
-    let split = s
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| format!("threshold '{s}' has no unit suffix"))?;
-    let (num, unit) = s.split_at(split);
-    let n: u64 = num
-        .parse()
-        .map_err(|_| format!("threshold '{s}': invalid number"))?;
-    let unit = unit.trim();
-    let ms = match unit {
-        "ms" => n,
-        "s" | "sec" | "secs" => n.saturating_mul(1_000),
-        "m" | "min" | "mins" => n.saturating_mul(60_000),
-        "h" | "hr" | "hrs" => n.saturating_mul(3_600_000),
-        "d" | "day" | "days" => n.saturating_mul(86_400_000),
-        other => return Err(format!("threshold '{s}': unknown unit '{other}'")),
-    };
-    Ok(ms)
+    crate::parse::parse_duration(s)
+        .map(|d| d.num_milliseconds() as u64)
+        .map_err(|e| format!("threshold: {e}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
