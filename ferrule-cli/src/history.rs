@@ -86,6 +86,14 @@ pub struct HistoryDb {
     slow: Option<SlowSink>,
 }
 
+impl std::fmt::Debug for HistoryDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryDb")
+            .field("slow", &self.slow.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl HistoryDb {
     /// Open (and migrate) the history database at `path`. Creates parent
     /// directories as needed.
@@ -95,8 +103,16 @@ impl HistoryDb {
         }
         let conn = Connection::open(path)
             .map_err(|e| CliError::usage(format!("history: failed to open {path:?}: {e}")))?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| CliError::usage(format!("history: migration failed: {e}")))?;
+        // #58: bake in busy_timeout so a second concurrent ferrule
+        // invocation's record()/prune() doesn't surface as a spurious
+        // SQLITE_BUSY failure. Set before migrate so the schema setup
+        // itself is covered. Mirrors `cache.rs`.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| CliError::usage(format!("history: busy_timeout: {e}")))?;
+        // #57: explicit PRAGMA user_version migration scaffold instead of
+        // a bare CREATE TABLE IF NOT EXISTS. Refuses to clobber a forward-
+        // compatible file written by a newer binary. Mirrors `cache.rs`.
+        migrate(&conn)?;
         Ok(Self { conn, slow: None })
     }
 
@@ -395,7 +411,7 @@ fn glob_inner(pat: &[char], s: &[char]) -> bool {
     pi == pat.len()
 }
 
-const SCHEMA: &str = r#"
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS history (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           TEXT    NOT NULL,
@@ -410,6 +426,43 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE INDEX IF NOT EXISTS history_ts_idx       ON history(ts);
 CREATE INDEX IF NOT EXISTS history_duration_idx ON history(duration_ms);
 "#;
+
+const LATEST_VERSION: u32 = 1;
+
+/// Versioned schema migrations. Append new tuples; never edit historical
+/// ones. The migrator runs every entry whose version is strictly greater
+/// than the current `PRAGMA user_version`. Mirrors `cache.rs::MIGRATIONS`.
+///
+/// Note on existing files: a pre-scaffold `history.db` (written by a
+/// ferrule that ran the bare schema and never set `user_version`) reports
+/// `user_version = 0`, so v1 re-runs — harmlessly, because the v1 SQL is
+/// all `CREATE … IF NOT EXISTS` — and stamps the file to 1. No data loss.
+const MIGRATIONS: &[(u32, &str)] = &[(1, SCHEMA_V1)];
+
+/// #57: `PRAGMA user_version` migration scaffold. A downgrade — a newer
+/// ferrule binary wrote a higher `user_version`, an older binary opens it —
+/// is a hard usage error, not a silent re-migration that would clobber a
+/// forward-compatible file. Mirrors `cache.rs::migrate`.
+fn migrate(conn: &Connection) -> Result<(), CliError> {
+    let current: u32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| CliError::usage(format!("history: read user_version: {e}")))?
+        as u32;
+    if current > LATEST_VERSION {
+        return Err(CliError::usage(format!(
+            "history: history.db user_version={current} is newer than this \
+             binary supports (max {LATEST_VERSION}). Downgrade detected — \
+             refusing to clobber. Delete history.db or upgrade ferrule."
+        )));
+    }
+    for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v > current) {
+        conn.execute_batch(sql)
+            .map_err(|e| CliError::usage(format!("history: migration v{v} failed: {e}")))?;
+        conn.execute_batch(&format!("PRAGMA user_version = {v}"))
+            .map_err(|e| CliError::usage(format!("history: bump user_version to {v}: {e}")))?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -430,7 +483,7 @@ mod tests {
 
     fn open_memory() -> HistoryDb {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
         HistoryDb { conn, slow: None }
     }
 
@@ -593,7 +646,7 @@ mod tests {
 
     fn open_memory_with_slow(path: &std::path::Path, threshold_ms: u64) -> HistoryDb {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
         let file = OpenOptions::new()
             .append(true)
             .create(true)
@@ -655,5 +708,98 @@ mod tests {
         let rows = db2.query(&HistoryFilter::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sql.as_deref(), Some("durable"));
+    }
+
+    // #57: the migration scaffold stamps a fresh file to LATEST_VERSION and
+    // is idempotent across reopens.
+    #[test]
+    fn migrate_stamps_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.db");
+        let db1 = HistoryDb::open(&path).unwrap();
+        let v1: i64 = db1
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v1, i64::from(LATEST_VERSION));
+        drop(db1);
+        // Reopen: user_version already current, no migration re-runs.
+        let db2 = HistoryDb::open(&path).unwrap();
+        let v2: i64 = db2
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v2, i64::from(LATEST_VERSION));
+    }
+
+    // #57: a pre-scaffold history.db (user_version never set, i.e. 0) with
+    // existing rows upgrades cleanly — the idempotent CREATE … IF NOT EXISTS
+    // preserves the data and the file is stamped to LATEST_VERSION.
+    #[test]
+    fn migrate_upgrades_pre_scaffold_file_without_data_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.db");
+        // Simulate an old file: schema applied, user_version left at 0.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO history (ts, command, duration_ms, exit_code) \
+                 VALUES ('2020-01-01T00:00:00Z', 'query', 1, 0)",
+                [],
+            )
+            .unwrap();
+            let v: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 0, "precondition: legacy file is at user_version 0");
+        }
+        let db = HistoryDb::open(&path).unwrap();
+        let v: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, i64::from(LATEST_VERSION), "legacy file stamped forward");
+        assert_eq!(
+            db.query(&HistoryFilter::default()).unwrap().len(),
+            1,
+            "pre-existing row survived the upgrade"
+        );
+    }
+
+    // #57: a file written by a newer binary (user_version > LATEST_VERSION)
+    // is a hard error, not a silent re-migration.
+    #[test]
+    fn migrate_rejects_future_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 99").unwrap();
+        }
+        let err = HistoryDb::open(&path).expect_err("downgrade must be rejected");
+        let msg = match err {
+            CliError::Usage(m) => m,
+            other => panic!("expected CliError::Usage, got {other:?}"),
+        };
+        assert!(
+            msg.contains("user_version=99"),
+            "missing version in msg: {msg}"
+        );
+        assert!(msg.contains("Downgrade"), "missing downgrade label: {msg}");
+    }
+
+    // #58: busy_timeout is set so concurrent ferrule processes don't fail
+    // instantly on SQLITE_BUSY.
+    #[test]
+    fn busy_timeout_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.db");
+        let db = HistoryDb::open(&path).unwrap();
+        let bt: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bt, 5_000, "busy_timeout must be 5s in ms");
     }
 }
