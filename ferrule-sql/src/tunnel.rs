@@ -250,14 +250,14 @@ mod ssh_impl {
     /// the matching `impl<C> AsyncConnection for Box<C>` (which
     /// `async_trait` doesn't synthesize).
     pub struct TunneledConnection {
-        pub inner: Box<dyn crate::connection::AsyncConnection>,
+        pub(crate) inner: Box<dyn crate::connection::AsyncConnection>,
         /// Held for `Drop` only — lifetime guard for the SSH session.
-        pub session: SshSession,
+        pub(crate) session: SshSession,
         /// `Some` for the LocalListener transport, `None` for the
         /// Stream transport (Postgres feeds the stream directly into
         /// `tokio_postgres::Connection`'s task, no separate
         /// forwarder needed).
-        pub forwarder: Option<tokio::task::JoinHandle<()>>,
+        pub(crate) forwarder: Option<tokio::task::JoinHandle<()>>,
     }
 
     #[async_trait::async_trait]

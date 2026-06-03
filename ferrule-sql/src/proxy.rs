@@ -194,8 +194,8 @@ pub(crate) async fn http_connect(
 /// When this struct is dropped, the listener is dropped and the
 /// forwarder task exits naturally.
 pub struct ProxiedConnection {
-    pub inner: Box<dyn crate::connection::AsyncConnection>,
-    pub forwarder: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) inner: Box<dyn crate::connection::AsyncConnection>,
+    pub(crate) forwarder: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[async_trait::async_trait]
