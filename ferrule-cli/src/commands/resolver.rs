@@ -38,7 +38,7 @@ pub struct ResolvedConnection {
 /// `ssh_tunnel` and `ssh_key` are the optional `--ssh-tunnel` and
 /// `--ssh-key` CLI flag values; pass `None`/`None` from call sites
 /// that don't expose those flags (e.g. `conn list`).
-pub async fn resolve_connection(
+pub fn resolve_connection(
     connection: &str,
     password: Option<String>,
     ssh_tunnel: Option<&str>,
@@ -70,7 +70,6 @@ pub async fn resolve_connection(
         proxy_url,
         global_config,
     )
-    .await
     .map_err(CliError::connection)?;
 
     Ok(ResolvedConnection {
@@ -108,7 +107,7 @@ pub fn check_daemon_ssh_compat(
 /// [`ResolvedConnection`]. Routes through the SSH tunnel when
 /// `resolved.ssh` is `Some` (gated behind the `ssh` feature; without
 /// it, this returns a "compiled without SSH support" diagnostic).
-pub async fn connect_resolved(
+pub fn connect_resolved(
     resolved: ResolvedConnection,
     opts: &ferrule_sql::ConnectOptions,
 ) -> Result<Box<dyn ferrule_sql::Connection>, CliError> {
@@ -122,15 +121,13 @@ pub async fn connect_resolved(
     };
     let proxy = resolved.proxy.as_ref();
     if let Some(ssh) = resolved.ssh {
-        return connect_via_ssh_tunnel(resolved.url, ssh, &opts, proxy).await;
+        return connect_via_ssh_tunnel(resolved.url, ssh, &opts, proxy);
     }
-    ferrule_sql::connect(&resolved.url, &opts, proxy)
-        .await
-        .map_err(CliError::connection)
+    ferrule_sql::connect(&resolved.url, &opts, proxy).map_err(CliError::connection)
 }
 
 #[cfg(feature = "ssh")]
-async fn connect_via_ssh_tunnel(
+fn connect_via_ssh_tunnel(
     url: DatabaseUrl,
     ssh: SshTunnelInputs,
     opts: &ferrule_sql::ConnectOptions,
@@ -149,15 +146,10 @@ async fn connect_via_ssh_tunnel(
                         path.display()
                     )));
                 }
-                let cloned = path.clone();
-                let passphrase = tokio::task::spawn_blocking(move || {
-                    rpassword::prompt_password(format!(
-                        "Enter passphrase for SSH key {}: ",
-                        cloned.display()
-                    ))
-                })
-                .await
-                .map_err(|e| CliError::usage(format!("Passphrase prompt failed: {e}")))?
+                let passphrase = rpassword::prompt_password(format!(
+                    "Enter passphrase for SSH key {}: ",
+                    path.display()
+                ))
                 .map_err(CliError::Io)?;
                 ferrule_sql::KeySource::File(
                     path.clone(),
@@ -168,7 +160,7 @@ async fn connect_via_ssh_tunnel(
         },
         KeySource::Agent(path) => ferrule_sql::KeySource::Agent(path.clone()),
     };
-    match ferrule_sql::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy).await {
+    match ferrule_sql::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy) {
         Ok(conn) => Ok(conn),
         Err(ferrule_sql::SqlError::SshUnknownHost {
             host,
@@ -193,7 +185,7 @@ async fn connect_via_ssh_tunnel(
             let mut answer = String::new();
             std::io::stdin()
                 .read_line(&mut answer)
-                .map_err(|e| CliError::Io(e))?;
+                .map_err(CliError::Io)?;
             let trimmed = answer.trim().to_ascii_lowercase();
             if trimmed != "yes" && trimmed != "y" {
                 return Err(CliError::usage(format!(
@@ -205,7 +197,6 @@ async fn connect_via_ssh_tunnel(
             })?;
             // Retry once after writing the key.
             ferrule_sql::connect_with_tunnel(&url, opts, &ssh.config, &key_source, proxy)
-                .await
                 .map_err(CliError::connection)
         }
         Err(ferrule_sql::SqlError::SshHostKeyMismatch { host, port }) => Err(CliError::connection(
@@ -222,7 +213,7 @@ async fn connect_via_ssh_tunnel(
 }
 
 #[cfg(not(feature = "ssh"))]
-async fn connect_via_ssh_tunnel(
+fn connect_via_ssh_tunnel(
     _url: DatabaseUrl,
     ssh: SshTunnelInputs,
     _opts: &ferrule_sql::ConnectOptions,

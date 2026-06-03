@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Protocol types
@@ -63,7 +63,7 @@ struct PooledConnection {
 
 type Pool = Arc<DashMap<String, PooledConnection>>;
 
-async fn get_or_connect(pool: &Pool, url: &DatabaseUrl, insecure: bool) -> Result<(), String> {
+fn get_or_connect(pool: &Pool, url: &DatabaseUrl, insecure: bool) -> Result<(), String> {
     let key = url.raw().to_string();
 
     if pool.contains_key(&key) {
@@ -77,9 +77,7 @@ async fn get_or_connect(pool: &Pool, url: &DatabaseUrl, insecure: bool) -> Resul
         insecure,
         password: None,
     };
-    let conn = ferrule_sql::backend::connect(url, &opts, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    let conn = ferrule_sql::connect(url, &opts, None).map_err(|e| e.to_string())?;
 
     pool.insert(
         key,
@@ -95,7 +93,7 @@ async fn get_or_connect(pool: &Pool, url: &DatabaseUrl, insecure: bool) -> Resul
 // Request handling
 // ---------------------------------------------------------------------------
 
-async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Response {
+fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Response {
     match req {
         Request::Ping => Response::Ok {
             payload: "pong".into(),
@@ -143,30 +141,28 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
 
             let fmt = OutputFormat::parse(&format).unwrap_or(OutputFormat::Json);
 
-            if let Err(e) = get_or_connect(pool, &db_url, insecure).await {
+            if let Err(e) = get_or_connect(pool, &db_url, insecure) {
                 return Response::Err { message: e };
             }
 
             let entry = pool.get(db_url.raw()).expect("pool entry");
-            let mut guard = entry.conn.lock().await;
+            let mut guard = entry.conn.lock().unwrap();
 
-            let results = match guard.query(&paged_sql).await {
+            let results = match guard.query(&paged_sql) {
                 Ok(qr) => vec![StatementResult::Query(qr)],
-                Err(ferrule_sql::SqlError::QueryFailed(_)) => {
-                    match guard.execute(&paged_sql).await {
-                        Ok(summary) => {
-                            vec![StatementResult::Summary(summary)]
-                        }
-                        Err(_) => match guard.execute_multi(&paged_sql).await {
-                            Ok(res) => res,
-                            Err(e) => {
-                                return Response::Err {
-                                    message: e.to_string(),
-                                };
-                            }
-                        },
+                Err(ferrule_sql::SqlError::QueryFailed(_)) => match guard.execute(&paged_sql) {
+                    Ok(summary) => {
+                        vec![StatementResult::Summary(summary)]
                     }
-                }
+                    Err(_) => match guard.execute_multi(&paged_sql) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            return Response::Err {
+                                message: e.to_string(),
+                            };
+                        }
+                    },
+                },
                 Err(e) => {
                     return Response::Err {
                         message: e.to_string(),
@@ -204,14 +200,14 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
                 }
             };
 
-            if let Err(e) = get_or_connect(pool, &db_url, insecure).await {
+            if let Err(e) = get_or_connect(pool, &db_url, insecure) {
                 return Response::Err { message: e };
             }
 
             let entry = pool.get(db_url.raw()).expect("pool entry");
-            let mut guard = entry.conn.lock().await;
+            let mut guard = entry.conn.lock().unwrap();
 
-            let summary = match guard.execute(&sql).await {
+            let summary = match guard.execute(&sql) {
                 Ok(s) => s,
                 Err(e) => {
                     return Response::Err {
@@ -241,14 +237,14 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
                 }
             };
 
-            if let Err(e) = get_or_connect(pool, &db_url, insecure).await {
+            if let Err(e) = get_or_connect(pool, &db_url, insecure) {
                 return Response::Err { message: e };
             }
 
             let entry = pool.get(db_url.raw()).expect("pool entry");
-            let mut guard = entry.conn.lock().await;
+            let mut guard = entry.conn.lock().unwrap();
 
-            let names = match guard.list_tables(schema.as_deref()).await {
+            let names = match guard.list_tables(schema.as_deref()) {
                 Ok(n) => n,
                 Err(e) => {
                     return Response::Err {
@@ -279,14 +275,14 @@ async fn handle_request(req: Request, pool: &Pool, stop_flag: &AtomicBool) -> Re
                 }
             };
 
-            if let Err(e) = get_or_connect(pool, &db_url, insecure).await {
+            if let Err(e) = get_or_connect(pool, &db_url, insecure) {
                 return Response::Err { message: e };
             }
 
             let entry = pool.get(db_url.raw()).expect("pool entry");
-            let mut guard = entry.conn.lock().await;
+            let mut guard = entry.conn.lock().unwrap();
 
-            let result = match guard.describe_table(schema.as_deref(), &table).await {
+            let result = match guard.describe_table(schema.as_deref(), &table) {
                 Ok(r) => r,
                 Err(e) => {
                     return Response::Err {
@@ -506,7 +502,11 @@ async fn handle_client(
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let req = read_json_line(&mut reader).await?;
-    let resp = handle_request(req, &pool, &stop_flag).await;
+    // `handle_request` is synchronous and blocks on the pooled
+    // ferrule-sql connection (each connection owns a private runtime).
+    // Run it on a blocking thread so that inner `block_on` never nests
+    // inside the daemon's own runtime.
+    let resp = tokio::task::spawn_blocking(move || handle_request(req, &pool, &stop_flag)).await?;
     write_json_response(&mut write, &resp).await?;
     Ok(())
 }
@@ -520,7 +520,9 @@ async fn handle_client(
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let req = read_json_line(&mut reader).await?;
-    let resp = handle_request(req, &pool, &stop_flag).await;
+    // See the unix arm: run the blocking, runtime-owning request
+    // handler off the daemon runtime via spawn_blocking.
+    let resp = tokio::task::spawn_blocking(move || handle_request(req, &pool, &stop_flag)).await?;
     write_json_response(&mut write, &resp).await?;
     Ok(())
 }
@@ -575,11 +577,34 @@ async fn send_request(req: &Request) -> Result<Response, CliError> {
 }
 
 // ---------------------------------------------------------------------------
+// Sync client wrappers
+//
+// The daemon *client* does only socket / filesystem I/O — it never opens
+// a ferrule-sql connection — so it is safe to drive on a short-lived
+// local current-thread runtime. This keeps the daemon transport async
+// (tokio UnixStream / TcpStream) while the command layer that calls it
+// stays synchronous (#64).
+// ---------------------------------------------------------------------------
+
+/// Build a throwaway current-thread runtime for one client round-trip.
+fn client_runtime() -> Result<tokio::runtime::Runtime, CliError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(CliError::Io)
+}
+
+/// Blocking wrapper over [`send_request`].
+fn send_request_blocking(req: &Request) -> Result<Response, CliError> {
+    client_runtime()?.block_on(send_request(req))
+}
+
+// ---------------------------------------------------------------------------
 // Public API used by commands/conn.rs
 // ---------------------------------------------------------------------------
 
-pub async fn start_daemon(background: bool) -> Result<(), CliError> {
-    if is_daemon_running().await {
+pub fn start_daemon(background: bool) -> Result<(), CliError> {
+    if is_daemon_running() {
         println!("Daemon is already running.");
         return Ok(());
     }
@@ -596,21 +621,24 @@ pub async fn start_daemon(background: bool) -> Result<(), CliError> {
         println!("Daemon started (PID {}).", child.id());
     } else {
         println!("Starting daemon in foreground... Press Ctrl-C to stop.");
-        run_daemon_server().await?;
+        // Foreground server runs its own async event loop on a dedicated
+        // runtime; it creates pooled ferrule-sql connections only inside
+        // spawn_blocking, so there is no nested-runtime hazard.
+        client_runtime()?.block_on(run_daemon_server())?;
     }
     Ok(())
 }
 
-pub async fn stop_daemon() -> Result<(), CliError> {
+pub fn stop_daemon() -> Result<(), CliError> {
     // Try graceful shutdown via IPC first
-    match send_request(&Request::Stop).await {
+    match send_request_blocking(&Request::Stop) {
         Ok(Response::Ok { .. }) => {
             println!("Daemon stopped.");
         }
         _ => {
             // Fallback: kill via PID file
             if let Some(pid_path) = pid_file() {
-                if let Ok(pid_str) = tokio::fs::read_to_string(&pid_path).await {
+                if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
                     if let Ok(pid) = pid_str.trim().parse::<u32>() {
                         #[cfg(unix)]
                         {
@@ -633,14 +661,14 @@ pub async fn stop_daemon() -> Result<(), CliError> {
             // Clean up stale files
             #[cfg(unix)]
             if let Some(path) = socket_path() {
-                let _ = tokio::fs::remove_file(path).await;
+                let _ = std::fs::remove_file(path);
             }
             #[cfg(not(unix))]
             if let Some(path) = port_file() {
-                let _ = tokio::fs::remove_file(path).await;
+                let _ = std::fs::remove_file(path);
             }
             if let Some(path) = pid_file() {
-                let _ = tokio::fs::remove_file(path).await;
+                let _ = std::fs::remove_file(path);
             }
             println!("Daemon stopped (fallback).");
         }
@@ -648,8 +676,8 @@ pub async fn stop_daemon() -> Result<(), CliError> {
     Ok(())
 }
 
-pub async fn daemon_status() -> Result<(), CliError> {
-    match send_request(&Request::Ping).await {
+pub fn daemon_status() -> Result<(), CliError> {
+    match send_request_blocking(&Request::Ping) {
         Ok(Response::Ok { payload }) => {
             println!("Daemon is running. Response: {}", payload);
         }
@@ -663,12 +691,15 @@ pub async fn daemon_status() -> Result<(), CliError> {
     Ok(())
 }
 
-pub async fn is_daemon_running() -> bool {
-    matches!(send_request(&Request::Ping).await, Ok(Response::Ok { .. }))
+pub fn is_daemon_running() -> bool {
+    matches!(
+        send_request_blocking(&Request::Ping),
+        Ok(Response::Ok { .. })
+    )
 }
 
 /// Execute a query through the daemon, returning the formatted payload.
-pub async fn daemon_query(
+pub fn daemon_query(
     sql: &str,
     url: &DatabaseUrl,
     insecure: bool,
@@ -684,13 +715,13 @@ pub async fn daemon_query(
         limit,
         offset,
     };
-    match send_request(&req).await? {
+    match send_request_blocking(&req)? {
         Response::Ok { payload } => Ok(payload),
         Response::Err { message } => Err(CliError::usage(message)),
     }
 }
 
-pub async fn daemon_tables(
+pub fn daemon_tables(
     url: &DatabaseUrl,
     insecure: bool,
     schema: Option<&str>,
@@ -700,13 +731,13 @@ pub async fn daemon_tables(
         insecure,
         schema: schema.map(|s| s.to_string()),
     };
-    match send_request(&req).await? {
+    match send_request_blocking(&req)? {
         Response::Ok { payload } => Ok(payload),
         Response::Err { message } => Err(CliError::usage(message)),
     }
 }
 
-pub async fn daemon_describe(
+pub fn daemon_describe(
     url: &DatabaseUrl,
     insecure: bool,
     schema: Option<&str>,
@@ -718,7 +749,7 @@ pub async fn daemon_describe(
         schema: schema.map(|s| s.to_string()),
         table: table.into(),
     };
-    match send_request(&req).await? {
+    match send_request_blocking(&req)? {
         Response::Ok { payload } => Ok(payload),
         Response::Err { message } => Err(CliError::usage(message)),
     }

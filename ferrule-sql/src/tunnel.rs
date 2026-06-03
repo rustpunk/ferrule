@@ -100,7 +100,9 @@ mod ssh_impl {
             port: u16,
             algorithm: String,
             fingerprint: String,
-            key: russh::keys::ssh_key::PublicKey,
+            /// Boxed to keep `TunnelError` (and the `Result`s that carry
+            /// it) small now that the tunnel setup path is synchronous.
+            key: Box<russh::keys::ssh_key::PublicKey>,
         },
         #[error("SSH session error: {0}")]
         Session(String),
@@ -235,18 +237,20 @@ mod ssh_impl {
         Stream { stream: Box<TunnelStream> },
     }
 
-    /// Wraps a backend [`Connection`](crate::Connection) plus the
+    /// Wraps a backend [`AsyncConnection`](crate::connection::AsyncConnection)
+    /// plus the
     /// SSH session (and, for the LocalListener transport, the
     /// forwarder task) so the entire stack drops together.
     ///
-    /// Why this is non-generic: dispatch returns `Box<dyn
-    /// Connection>` regardless of backend, so an outer wrapper that
-    /// already holds the inner as `Box<dyn Connection>` saves us
-    /// from adding a blanket `impl<C: Connection> Connection for
-    /// TunneledConnection<C>` and the matching `impl<C> Connection
-    /// for Box<C>` (which `async_trait` doesn't synthesize).
+    /// Why this is non-generic: the connect dispatcher returns
+    /// `Box<dyn AsyncConnection>` regardless of backend, so an outer
+    /// wrapper that already holds the inner as `Box<dyn
+    /// AsyncConnection>` saves us from adding a blanket `impl<C:
+    /// AsyncConnection> AsyncConnection for TunneledConnection<C>` and
+    /// the matching `impl<C> AsyncConnection for Box<C>` (which
+    /// `async_trait` doesn't synthesize).
     pub struct TunneledConnection {
-        pub inner: Box<dyn crate::Connection>,
+        pub inner: Box<dyn crate::connection::AsyncConnection>,
         /// Held for `Drop` only — lifetime guard for the SSH session.
         pub session: SshSession,
         /// `Some` for the LocalListener transport, `None` for the
@@ -257,7 +261,7 @@ mod ssh_impl {
     }
 
     #[async_trait::async_trait]
-    impl crate::Connection for TunneledConnection {
+    impl crate::connection::AsyncConnection for TunneledConnection {
         async fn execute(&mut self, sql: &str) -> Result<crate::ExecutionSummary, crate::SqlError> {
             self.inner.execute(sql).await
         }
@@ -350,7 +354,7 @@ mod ssh_impl {
                         port: self.port,
                         algorithm: server_public_key.algorithm().to_string(),
                         fingerprint,
-                        key: server_public_key.clone(),
+                        key: Box::new(server_public_key.clone()),
                     })
                 }
             }
@@ -606,11 +610,16 @@ mod ssh_impl {
     }
 }
 
+// Async tunnel-transport primitives are crate-internal: the public,
+// blocking connection API (`connect_with_tunnel`) is the only sanctioned
+// entry point, so embedders never await `setup_tunnel` directly.
+#[cfg(feature = "ssh")]
+pub(crate) use ssh_impl::setup_tunnel;
 #[cfg(feature = "ssh")]
 pub use ssh_impl::{
-    check_host_key, learn_host_key, setup_tunnel, ssh_key_needs_passphrase, ClientHandler,
-    KeySource, SshSession, TunnelError, TunnelHandle, TunnelStream, TunnelTransport,
-    TunnelTransportResult, TunneledConnection,
+    check_host_key, learn_host_key, ssh_key_needs_passphrase, ClientHandler, KeySource, SshSession,
+    TunnelError, TunnelHandle, TunnelStream, TunnelTransport, TunnelTransportResult,
+    TunneledConnection,
 };
 
 #[cfg(feature = "ssh")]

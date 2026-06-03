@@ -98,9 +98,21 @@ pub struct ForeignKey {
     pub on_delete: Option<String>,
 }
 
-/// Trait implemented by every backend connection.
+/// Internal async backend trait — implemented by every driver.
+///
+/// This is **not** part of `ferrule-sql`'s public surface: it is the
+/// async machinery the synchronous [`Connection`] trait is built on top
+/// of. Each backend (`postgres`, `mysql`, …) implements
+/// `AsyncConnection`; the public sync API is reached exclusively through
+/// [`Connection`], whose wrapper [`crate::sync::SyncConnection`] drives
+/// these futures to completion on a private current-thread runtime.
+///
+/// Embedders never name this trait. It is `pub` only so the per-backend
+/// modules (which are `pub` for their concrete connect constructors) can
+/// implement it; it is deliberately **not** re-exported from the crate
+/// root.
 #[async_trait]
-pub trait Connection: Send {
+pub trait AsyncConnection: Send {
     /// Execute a statement that may not return rows (INSERT, UPDATE, CREATE, etc.).
     async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError>;
 
@@ -175,6 +187,118 @@ pub trait Connection: Send {
     /// wrapper is a bug we want to catch at compile time, not at
     /// runtime in the "just slow" form.
     async fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError>;
+}
+
+/// A synchronous, blocking database connection — `ferrule-sql`'s public
+/// connection API.
+///
+/// Every method **blocks the calling thread** until the database
+/// responds; there is no `async fn` / `Future` anywhere on this trait.
+/// Embedders that have no async runtime of their own (the motivating
+/// case: a single-threaded synchronous host) call these directly.
+///
+/// **Runtime model.** The async drivers (`tokio-postgres`,
+/// `mysql_async`, `tiberius`) are still used underneath, driven by a
+/// private current-thread `tokio` runtime that the concrete handle
+/// ([`crate::sync::SyncConnection`]) owns. That runtime is an
+/// implementation detail — it never surfaces in the public API. SQLite
+/// and Oracle are natively synchronous and call straight through.
+///
+/// **Memory model.** These methods buffer the full result set in memory
+/// (the `Vec<Row>` inside [`QueryResult`]); they are not a streaming
+/// cursor. Bounded-memory streaming reads land in a later wave behind a
+/// separate cursor API.
+///
+/// **Reentrancy.** Because the private runtime is current-thread, do not
+/// call these methods from inside another `block_on` on the same thread
+/// — that nests runtimes and panics. Async embedders must hop to a
+/// blocking thread (`tokio::task::spawn_blocking` or a dedicated OS
+/// thread) before using a `Connection`.
+pub trait Connection: Send {
+    /// Execute a statement that may not return rows (INSERT, UPDATE, CREATE, etc.).
+    /// Blocks until the statement completes.
+    fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError>;
+
+    /// Execute a SELECT-like query and return all rows. Blocks until the
+    /// full result set is buffered in memory.
+    fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError>;
+
+    /// Execute one or more statements, one result per statement. Backends
+    /// that natively support multi-resultsets (Postgres, MSSQL) split the
+    /// batch; others fall back to single-statement behavior. Blocks until
+    /// the batch completes.
+    fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError>;
+
+    /// Test connectivity (ping / `SELECT 1`). Blocks on a round-trip.
+    fn ping(&mut self) -> Result<(), SqlError>;
+
+    /// List tables in the given schema (or default schema if `None`).
+    fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError>;
+
+    /// Describe the columns of a single table.
+    fn describe_table(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<QueryResult, SqlError>;
+
+    /// Return the column names of `table`'s primary key, in key position
+    /// order. Returns an empty `Vec` when the table has no declared PK.
+    /// Must not infer a PK from unique indexes — only declared
+    /// primary-key constraints.
+    fn primary_key(&mut self, schema: Option<&str>, table: &str) -> Result<Vec<String>, SqlError>;
+
+    /// Return every foreign-key edge in `schema` (or the default schema
+    /// if `None`). Used by schema-level copy to order tables — parents
+    /// before children.
+    fn list_foreign_keys(&mut self, schema: Option<&str>) -> Result<Vec<ForeignKey>, SqlError>;
+
+    /// Insert `target.rows` into `target.table` using the backend's
+    /// native bulk loader. Returns the number of rows accepted, or
+    /// [`SqlError::BulkUnavailable`] when the backend has no native loader
+    /// so the caller can fall back to the generic INSERT path. Blocks
+    /// until the whole batch has streamed to the server.
+    fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError>;
+}
+
+/// Forwarding impl so a boxed connection is itself a [`Connection`].
+///
+/// Lets call sites pass `&mut Box<dyn Connection>` where a `&mut dyn
+/// Connection` is expected (the cross-backend copy path and the test
+/// helpers both hold owned `Box<dyn Connection>` handles). Each method
+/// simply delegates to the boxed value.
+impl Connection for Box<dyn Connection> {
+    fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
+        (**self).execute(sql)
+    }
+    fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
+        (**self).query(sql)
+    }
+    fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
+        (**self).execute_multi(sql)
+    }
+    fn ping(&mut self) -> Result<(), SqlError> {
+        (**self).ping()
+    }
+    fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
+        (**self).list_tables(schema)
+    }
+    fn describe_table(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<QueryResult, SqlError> {
+        (**self).describe_table(schema, table)
+    }
+    fn primary_key(&mut self, schema: Option<&str>, table: &str) -> Result<Vec<String>, SqlError> {
+        (**self).primary_key(schema, table)
+    }
+    fn list_foreign_keys(&mut self, schema: Option<&str>) -> Result<Vec<ForeignKey>, SqlError> {
+        (**self).list_foreign_keys(schema)
+    }
+    fn bulk_insert_rows(&mut self, target: BulkInsert<'_>) -> Result<usize, SqlError> {
+        (**self).bulk_insert_rows(target)
+    }
 }
 
 #[cfg(test)]

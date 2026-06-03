@@ -50,7 +50,7 @@ pub struct WatchArgs {
     pub password: Option<String>,
 }
 
-pub async fn run(args: WatchArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: WatchArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     if args.interval == 0 {
         return Err(CliError::usage("--interval must be at least 1 second"));
     }
@@ -93,16 +93,28 @@ pub async fn run(args: WatchArgs, global_config: &GlobalConfig) -> Result<(), Cl
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
 
+    // Ctrl-C handling lives on a dedicated background thread that owns a
+    // tiny current-thread runtime solely to await the signal. When it
+    // fires it flips `running`, which the synchronous `watch_loop`
+    // observes at its next sleep boundary. Keeping the signal wait off
+    // the main thread lets the loop create ferrule-sql connections
+    // (each owning a private runtime) without nesting runtimes.
     let r = running.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(async {
+                tokio::signal::ctrl_c().await.ok();
+            });
+        }
         r.store(false, Ordering::Relaxed);
     });
 
-    watch_loop(&opts, &running).await?;
+    watch_loop(&opts, &running)?;
 
     {
         let _guard = print_lock.lock();

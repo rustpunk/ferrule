@@ -60,7 +60,7 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub async fn new(
+    pub fn new(
         connection_str: &str,
         output: OutputFlags,
         conn_flags: ConnectionFlags,
@@ -73,8 +73,7 @@ impl Repl {
             conn_flags.ssh_key.as_deref(),
             conn_flags.proxy_url.as_deref(),
             global_config,
-        )
-        .await?;
+        )?;
         check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
         let opts = ConnectOptions {
             insecure: conn_flags.insecure,
@@ -84,7 +83,7 @@ impl Repl {
             CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme()))
         })?;
         let url = resolved.url.clone();
-        let conn = connect_resolved(resolved, &opts).await?;
+        let conn = connect_resolved(resolved, &opts)?;
 
         let format = output.resolve_format(global_config);
         let limit = output.resolve_limit(global_config);
@@ -109,7 +108,7 @@ impl Repl {
     /// Switch to a different connection. Inherits the SSH bits from
     /// the original session — a bastion-attached REPL stays on that
     /// bastion across `\conn`.
-    pub async fn switch_connection(&mut self, name_or_url: &str) {
+    pub fn switch_connection(&mut self, name_or_url: &str) {
         let resolved = match resolve_connection(
             name_or_url,
             None,
@@ -117,9 +116,7 @@ impl Repl {
             self.conn_flags.ssh_key.as_deref(),
             self.conn_flags.proxy_url.as_deref(),
             &self.global_config,
-        )
-        .await
-        {
+        ) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Could not resolve connection: {e}");
@@ -131,7 +128,7 @@ impl Repl {
             insecure: self.insecure,
             password: None,
         };
-        match connect_resolved(resolved, &opts).await {
+        match connect_resolved(resolved, &opts) {
             Ok(conn) => {
                 if let Some(b) = Backend::from_scheme(new_url.scheme()) {
                     self.backend = b;
@@ -147,7 +144,7 @@ impl Repl {
     }
 
     /// Run a single SQL statement (or multi-statement batch).
-    pub fn execute_sql(&mut self, sql: &str, rt: &tokio::runtime::Handle) {
+    pub fn execute_sql(&mut self, sql: &str) {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         if trimmed.is_empty() {
             return;
@@ -167,7 +164,7 @@ impl Repl {
         }
 
         // Verify connection is alive.
-        if let Err(e) = rt.block_on(self.conn.ping()) {
+        if let Err(e) = self.conn.ping() {
             eprintln!("Connection lost: {e}. Use \\conn to reconnect.");
             return;
         }
@@ -201,25 +198,19 @@ impl Repl {
                         return;
                     }
                 };
-            rt.block_on(async {
-                match self.conn.query(&wrapped).await {
-                    Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
-                    Err(e) => Err(e),
-                }
-            })
+            match self.conn.query(&wrapped) {
+                Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
+                Err(e) => Err(e),
+            }
         } else {
-            rt.block_on(async {
-                match self.conn.query(&paged).await {
-                    Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
-                    Err(ferrule_sql::SqlError::QueryFailed(_)) => {
-                        match self.conn.execute(&paged).await {
-                            Ok(summary) => Ok(vec![StatementResult::Summary(summary)]),
-                            Err(_) => self.conn.execute_multi(&paged).await,
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
-            })
+            match self.conn.query(&paged) {
+                Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
+                Err(ferrule_sql::SqlError::QueryFailed(_)) => match self.conn.execute(&paged) {
+                    Ok(summary) => Ok(vec![StatementResult::Summary(summary)]),
+                    Err(_) => self.conn.execute_multi(&paged),
+                },
+                Err(e) => Err(e),
+            }
         };
 
         let query_time = query_start.elapsed();
@@ -332,7 +323,7 @@ fn render_single_result(
 // Meta-command dispatch
 // ---------------------------------------------------------------------------
 
-pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle) -> bool {
+pub fn handle_meta_line(repl: &mut Repl, line: &str) -> bool {
     let inner = line.strip_prefix('\\').unwrap_or(line).trim();
     let mut parts = inner.split_whitespace();
     let cmd = match parts.next() {
@@ -347,24 +338,22 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
     match cmd {
         "q" | "quit" | "exit" => return true,
         "conn" => {
-            rt.block_on(async {
-                if args.is_empty() {
-                    println!("Current connection: {}", repl.url.redacted());
-                } else {
-                    repl.switch_connection(args[0]).await;
-                }
-            });
+            if args.is_empty() {
+                println!("Current connection: {}", repl.url.redacted());
+            } else {
+                repl.switch_connection(args[0]);
+            }
         }
         "d" => {
             if args.is_empty() {
                 // List tables when no argument given (psql-style convenience)
-                cmd_list_tables(repl, None, rt);
+                cmd_list_tables(repl, None);
             } else {
-                cmd_describe_table(repl, args[0], rt);
+                cmd_describe_table(repl, args[0]);
             }
         }
         "dt" => {
-            cmd_list_tables(repl, args.first().copied(), rt);
+            cmd_list_tables(repl, args.first().copied());
         }
         "format" => {
             if args.is_empty() {
@@ -448,7 +437,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                             let name = args[1];
                             let params: Vec<String> =
                                 args[2..].iter().map(|s| s.to_string()).collect();
-                            cmd_bookmark_run(repl, name, &params, rt);
+                            cmd_bookmark_run(repl, name, &params);
                         }
                     }
                     "delete" => {
@@ -503,7 +492,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
             } else {
                 let table = args[0];
                 let fmt = args.get(1).copied();
-                cmd_dump(repl, table, fmt, rt);
+                cmd_dump(repl, table, fmt);
             }
         }
         "load" => {
@@ -513,7 +502,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 let file = args[0];
                 let table = args[2];
                 let create_table = args.contains(&"--create-table");
-                cmd_load(repl, file, table, create_table, rt);
+                cmd_load(repl, file, table, create_table);
             }
         }
         "g" => {
@@ -521,7 +510,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 eprintln!("\\g takes no arguments (server-side cursor paging not yet supported)");
             } else {
                 match repl.state.last_sql.clone() {
-                    Some(sql) => repl.execute_sql(&sql, rt),
+                    Some(sql) => repl.execute_sql(&sql),
                     None => eprintln!("No previous SQL to run."),
                 }
             }
@@ -553,7 +542,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                     }
                     _ => {
                         let sql = args.join(" ");
-                        cmd_explain(repl, &sql, rt);
+                        cmd_explain(repl, &sql);
                     }
                 }
             }
@@ -563,9 +552,9 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                 let watch_sql = repl.state.watch_sql.clone();
                 let last_sql = repl.state.last_sql.clone();
                 if let Some(sql) = watch_sql {
-                    cmd_watch(repl, &sql, 5, rt);
+                    cmd_watch(repl, &sql, 5);
                 } else if let Some(sql) = last_sql {
-                    cmd_watch(repl, &sql, 5, rt);
+                    cmd_watch(repl, &sql, 5);
                 } else {
                     eprintln!("No SQL to watch. Run a query first.");
                 }
@@ -574,7 +563,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
                     eprintln!("\\watch interval must be at least 1 second");
                 } else {
                     match repl.state.last_sql.clone() {
-                        Some(sql) => cmd_watch(repl, &sql, secs, rt),
+                        Some(sql) => cmd_watch(repl, &sql, secs),
                         None => eprintln!("No SQL to watch. Run a query first."),
                     }
                 }
@@ -585,7 +574,7 @@ pub fn handle_meta_line(repl: &mut Repl, line: &str, rt: &tokio::runtime::Handle
             } else {
                 let sql = args.join(" ");
                 repl.state.watch_sql = Some(sql.clone());
-                cmd_watch(repl, &sql, 5, rt);
+                cmd_watch(repl, &sql, 5);
             }
         }
         "help" | "h" | "?" => print_help(),
@@ -621,8 +610,8 @@ fn print_help() {
     println!("  \\help                 Show this help");
 }
 
-fn cmd_describe_table(repl: &mut Repl, table: &str, rt: &tokio::runtime::Handle) {
-    let result = rt.block_on(async { repl.conn.describe_table(None, table).await });
+fn cmd_describe_table(repl: &mut Repl, table: &str) {
+    let result = repl.conn.describe_table(None, table);
     match result {
         Ok(qr) => match render_query_result(&qr, repl.state.format, None, None) {
             Ok(text) => println!("{text}"),
@@ -632,8 +621,8 @@ fn cmd_describe_table(repl: &mut Repl, table: &str, rt: &tokio::runtime::Handle)
     }
 }
 
-fn cmd_list_tables(repl: &mut Repl, schema: Option<&str>, rt: &tokio::runtime::Handle) {
-    let result = rt.block_on(async { repl.conn.list_tables(schema).await });
+fn cmd_list_tables(repl: &mut Repl, schema: Option<&str>) {
+    let result = repl.conn.list_tables(schema);
     match result {
         Ok(names) => {
             let qr = QueryResult {
@@ -739,7 +728,7 @@ fn cmd_bookmark_list() {
     }
 }
 
-fn cmd_bookmark_run(repl: &mut Repl, name: &str, params: &[String], rt: &tokio::runtime::Handle) {
+fn cmd_bookmark_run(repl: &mut Repl, name: &str, params: &[String]) {
     let store = match BookmarkStore::load() {
         Ok(s) => s,
         Err(e) => {
@@ -758,7 +747,7 @@ fn cmd_bookmark_run(repl: &mut Repl, name: &str, params: &[String], rt: &tokio::
     if sql != bookmark.sql {
         eprintln!("[ferrule] resolved SQL: {}", sql);
     }
-    repl.execute_sql(&sql, rt);
+    repl.execute_sql(&sql);
 }
 
 fn cmd_bookmark_delete(name: &str) {
@@ -781,7 +770,7 @@ fn cmd_bookmark_delete(name: &str) {
     }
 }
 
-fn cmd_explain(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
+fn cmd_explain(repl: &mut Repl, sql: &str) {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         eprintln!("No SQL to explain.");
@@ -805,7 +794,7 @@ fn cmd_explain(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
     if repl.state.verbose {
         eprintln!("[ferrule] explain SQL: {wrapped}");
     }
-    let result = rt.block_on(async { repl.conn.query(&wrapped).await });
+    let result = repl.conn.query(&wrapped);
     match result {
         Ok(qr) => match format_result(&qr, repl.state.format) {
             Ok(text) => println!("{text}"),
@@ -815,7 +804,7 @@ fn cmd_explain(repl: &mut Repl, sql: &str, rt: &tokio::runtime::Handle) {
     }
 }
 
-fn cmd_watch(repl: &mut Repl, sql: &str, interval_secs: u64, rt: &tokio::runtime::Handle) {
+fn cmd_watch(repl: &mut Repl, sql: &str, interval_secs: u64) {
     use crate::watch::{watch_loop, WatchOptions};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -873,17 +862,26 @@ fn cmd_watch(repl: &mut Repl, sql: &str, interval_secs: u64, rt: &tokio::runtime
         print_lock: print_lock.clone(),
     };
 
+    // Ctrl-C handling on a dedicated background thread with a tiny
+    // runtime solely to await the signal; it flips `running`, which the
+    // synchronous `watch_loop` observes between polls. This keeps the
+    // signal wait off the thread that drives the (synchronous) DB calls.
     let r = running.clone();
-    rt.spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(async {
+                tokio::signal::ctrl_c().await.ok();
+            });
+        }
         r.store(false, Ordering::Relaxed);
     });
 
-    rt.block_on(async {
-        if let Err(e) = watch_loop(&opts, &running).await {
-            eprintln!("[watch] error: {e}");
-        }
-    });
+    if let Err(e) = watch_loop(&opts, &running) {
+        eprintln!("[watch] error: {e}");
+    }
 
     {
         let _guard = print_lock.lock();
@@ -891,7 +889,7 @@ fn cmd_watch(repl: &mut Repl, sql: &str, interval_secs: u64, rt: &tokio::runtime
     }
 }
 
-fn cmd_dump(repl: &mut Repl, table: &str, fmt: Option<&str>, rt: &tokio::runtime::Handle) {
+fn cmd_dump(repl: &mut Repl, table: &str, fmt: Option<&str>) {
     let format = fmt
         .and_then(ferrule_core::DumpFormat::parse)
         .unwrap_or(ferrule_core::DumpFormat::Csv);
@@ -899,22 +897,14 @@ fn cmd_dump(repl: &mut Repl, table: &str, fmt: Option<&str>, rt: &tokio::runtime
         format,
         ..ferrule_core::DumpOptions::default()
     };
-    let result = rt.block_on(async {
-        ferrule_core::dump_table(repl.conn.as_mut(), table, repl.backend, &opts).await
-    });
+    let result = ferrule_core::dump_table(repl.conn.as_mut(), table, repl.backend, &opts);
     match result {
         Ok(text) => println!("{text}"),
         Err(e) => eprintln!("Dump failed: {e}"),
     }
 }
 
-fn cmd_load(
-    repl: &mut Repl,
-    file: &str,
-    table: &str,
-    create_table: bool,
-    rt: &tokio::runtime::Handle,
-) {
+fn cmd_load(repl: &mut Repl, file: &str, table: &str, create_table: bool) {
     let data = match std::fs::read_to_string(file) {
         Ok(d) => d,
         Err(e) => {
@@ -939,9 +929,7 @@ fn cmd_load(
         create_table,
         ..ferrule_core::LoadOptions::default()
     };
-    let result = rt.block_on(async {
-        ferrule_core::load_data(repl.conn.as_mut(), &data, repl.backend, &opts).await
-    });
+    let result = ferrule_core::load_data(repl.conn.as_mut(), &data, repl.backend, &opts);
     match result {
         Ok(n) => println!("Loaded {} rows into '{}'.", n, table),
         Err(e) => eprintln!("Load failed: {e}"),
@@ -952,7 +940,7 @@ fn cmd_load(
 // ---------------------------------------------------------------------------
 
 /// Run the interactive REPL loop. Returns when the user exits.
-pub fn run_repl_loop(repl: &mut Repl, rt: &tokio::runtime::Handle) -> Result<(), CliError> {
+pub fn run_repl_loop(repl: &mut Repl) -> Result<(), CliError> {
     let history_path = dirs::cache_dir().map(|d| d.join("ferrule").join("history"));
     if let Some(ref path) = history_path {
         if let Some(parent) = path.parent() {
@@ -989,7 +977,7 @@ pub fn run_repl_loop(repl: &mut Repl, rt: &tokio::runtime::Handle) -> Result<(),
 
                 // Meta-command detection
                 if trimmed.starts_with('\\') && !in_multiline {
-                    let should_quit = handle_meta_line(repl, trimmed, rt);
+                    let should_quit = handle_meta_line(repl, trimmed);
                     if should_quit {
                         break;
                     }
@@ -1009,14 +997,14 @@ pub fn run_repl_loop(repl: &mut Repl, rt: &tokio::runtime::Handle) -> Result<(),
                     }
                     buffer.push_str(line.trim_end());
                     if buffer.trim_end().ends_with(';') {
-                        repl.execute_sql(&buffer, rt);
+                        repl.execute_sql(&buffer);
                         in_multiline = false;
                         buffer.clear();
                     }
                 } else {
                     let line_trimmed = line.trim_end();
                     if line_trimmed.ends_with(';') {
-                        repl.execute_sql(line_trimmed, rt);
+                        repl.execute_sql(line_trimmed);
                         let _ = rl.add_history_entry(line_trimmed);
                     } else if !trimmed.is_empty() {
                         buffer.push_str(line_trimmed);

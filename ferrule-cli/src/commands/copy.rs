@@ -16,7 +16,7 @@ use is_terminal::IsTerminal;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     // --- arg validation ------------------------------------------------
     // Surface the most specific error first: --include / --exclude /
     // --no-fk-check are only meaningful in --all-tables mode.
@@ -159,8 +159,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
         src_ssh_key.as_deref(),
         src_proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     let resolved_dst = super::resolve_connection(
         &args.dest,
         args.password_dst,
@@ -168,8 +167,7 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
         dst_ssh_key.as_deref(),
         dst_proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved_src)?;
     super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved_dst)?;
 
@@ -212,8 +210,8 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
         eprintln!("Warning: TLS certificate verification disabled on destination.");
     }
 
-    let mut conn_src = super::connect_resolved(resolved_src, &conn_opts_src).await?;
-    let mut conn_dst = super::connect_resolved(resolved_dst, &conn_opts_dst).await?;
+    let mut conn_src = super::connect_resolved(resolved_src, &conn_opts_src)?;
+    let mut conn_dst = super::connect_resolved(resolved_dst, &conn_opts_dst)?;
 
     let started = std::time::Instant::now();
     let copied = if args.all_tables {
@@ -238,7 +236,6 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
             backend_dst,
             &all_opts,
         )
-        .await
         .map_err(CliError::query)?
     } else {
         // --- progress callback (stderr, every batch) ------------------
@@ -274,7 +271,6 @@ pub async fn run(args: CopyArgs, global_config: &GlobalConfig) -> Result<(), Cli
             backend_dst,
             &opts,
         )
-        .await
         .map_err(CliError::query)?
     };
     let elapsed = started.elapsed();

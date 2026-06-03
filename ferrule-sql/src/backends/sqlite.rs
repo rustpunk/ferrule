@@ -1,5 +1,5 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
     StatementResult,
 };
 use crate::error::SqlError;
@@ -14,7 +14,7 @@ pub struct SqliteConnection {
 }
 
 #[async_trait]
-impl Connection for SqliteConnection {
+impl AsyncConnection for SqliteConnection {
     async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
         let sql = sql.to_string();
         let conn = self.conn.clone();
@@ -288,7 +288,7 @@ impl Connection for SqliteConnection {
     }
 }
 
-pub async fn connect(
+pub(crate) async fn connect(
     _url: &DatabaseUrl,
     _opts: &ConnectOptions,
 ) -> Result<SqliteConnection, SqlError> {
@@ -415,18 +415,17 @@ mod tests {
 
     /// Connect to a fresh on-disk SQLite database, returning the connection
     /// and the path so the caller can clean up.
-    async fn fresh_conn() -> (SqliteConnection, std::path::PathBuf) {
+    fn fresh_conn() -> (Box<dyn crate::Connection>, std::path::PathBuf) {
         let (raw_url, path) = fresh_test_url();
         let url = DatabaseUrl::parse(&raw_url).expect("parse sqlite URL");
-        let conn = connect(&url, &ConnectOptions::default())
-            .await
-            .expect("connect should succeed");
+        let conn =
+            crate::connect(&url, &ConnectOptions::default(), None).expect("connect should succeed");
         (conn, path)
     }
 
     /// Seed the standard test_users table; mirrors the schemas used for the
     /// other backends (see CLAUDE.md "How to Test").
-    async fn seed_test_users(conn: &mut SqliteConnection) {
+    fn seed_test_users(conn: &mut dyn crate::Connection) {
         conn.execute(
             "CREATE TABLE test_users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -437,43 +436,38 @@ mod tests {
                 meta TEXT
             )",
         )
-        .await
         .expect("create table");
         conn.execute("INSERT INTO test_users (name, age, score, active, meta) VALUES ('Alice', 30, 99.5, 1, '{\"role\":\"admin\"}')")
-            .await
             .expect("insert alice");
         conn.execute("INSERT INTO test_users (name, age, score, active, meta) VALUES ('Bob', 25, 88.25, 0, '{\"role\":\"user\"}')")
-            .await
             .expect("insert bob");
     }
 
-    #[tokio::test]
-    async fn test_sqlite_ping() {
-        let (mut conn, path) = fresh_conn().await;
-        conn.ping().await.expect("ping should succeed");
+    #[test]
+    fn test_sqlite_ping() {
+        let (mut conn, path) = fresh_conn();
+        conn.ping().expect("ping should succeed");
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_query() {
-        let (mut conn, path) = fresh_conn().await;
-        seed_test_users(&mut conn).await;
+    #[test]
+    fn test_sqlite_query() {
+        let (mut conn, path) = fresh_conn();
+        seed_test_users(&mut conn);
         let result = conn
             .query("SELECT * FROM test_users ORDER BY id")
-            .await
             .expect("query should succeed");
         assert_eq!(result.columns.len(), 6, "expected 6 columns");
         assert_eq!(result.rows.len(), 2, "expected 2 seeded rows");
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_execute() {
-        let (mut conn, path) = fresh_conn().await;
-        seed_test_users(&mut conn).await;
+    #[test]
+    fn test_sqlite_execute() {
+        let (mut conn, path) = fresh_conn();
+        seed_test_users(&mut conn);
         let summary = conn
             .execute("INSERT INTO test_users (name, age) VALUES ('Charlie', 35)")
-            .await
             .expect("execute should succeed");
         assert_eq!(
             summary.rows_affected,
@@ -483,27 +477,23 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_list_tables() {
-        let (mut conn, path) = fresh_conn().await;
-        seed_test_users(&mut conn).await;
+    #[test]
+    fn test_sqlite_list_tables() {
+        let (mut conn, path) = fresh_conn();
+        seed_test_users(&mut conn);
         conn.execute("CREATE TABLE other (id INTEGER)")
-            .await
             .expect("create other");
-        let tables = conn.list_tables(None).await.expect("list_tables");
+        let tables = conn.list_tables(None).expect("list_tables");
         assert!(tables.contains(&"test_users".to_string()));
         assert!(tables.contains(&"other".to_string()));
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_describe_table() {
-        let (mut conn, path) = fresh_conn().await;
-        seed_test_users(&mut conn).await;
-        let result = conn
-            .describe_table(None, "test_users")
-            .await
-            .expect("describe");
+    #[test]
+    fn test_sqlite_describe_table() {
+        let (mut conn, path) = fresh_conn();
+        seed_test_users(&mut conn);
+        let result = conn.describe_table(None, "test_users").expect("describe");
         // PRAGMA table_info returns one row per column: cid, name, type, notnull, dflt_value, pk.
         assert!(
             result.rows.len() >= 6,
@@ -513,9 +503,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_type_mapping() {
-        let (mut conn, path) = fresh_conn().await;
+    #[test]
+    fn test_sqlite_type_mapping() {
+        let (mut conn, path) = fresh_conn();
         // Build a row that exercises each SqliteValue branch in sqlite_to_value.
         conn.execute(
             "CREATE TABLE typed (
@@ -526,15 +516,12 @@ mod tests {
                 n INTEGER
             )",
         )
-        .await
         .expect("create typed");
         conn.execute("INSERT INTO typed VALUES (42, 2.5, 'hi', x'deadbeef', NULL)")
-            .await
             .expect("insert typed");
 
         let result = conn
             .query("SELECT i, r, t, b, n FROM typed")
-            .await
             .expect("query typed");
         let row = &result.rows[0];
         assert!(matches!(row[0], Value::Int64(42)), "i should be Int64(42)");
@@ -554,9 +541,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_execute_multi() {
-        let (mut conn, path) = fresh_conn().await;
+    #[test]
+    fn test_sqlite_execute_multi() {
+        let (mut conn, path) = fresh_conn();
         let results = conn
             .execute_multi(
                 "CREATE TABLE m (id INTEGER); \
@@ -564,7 +551,6 @@ mod tests {
                  INSERT INTO m VALUES (2); \
                  SELECT COUNT(*) AS c FROM m;",
             )
-            .await
             .expect("execute_multi");
         assert_eq!(results.len(), 4, "expected 4 statement results");
         match results.last().unwrap() {
@@ -583,21 +569,18 @@ mod tests {
         assert_eq!(escape_sqlite_identifier("a\"b"), "\"a\"\"b\"");
     }
 
-    #[tokio::test]
-    async fn test_sqlite_primary_key() {
-        let (mut conn, path) = fresh_conn().await;
-        seed_test_users(&mut conn).await;
-        let pk = conn
-            .primary_key(None, "test_users")
-            .await
-            .expect("primary_key");
+    #[test]
+    fn test_sqlite_primary_key() {
+        let (mut conn, path) = fresh_conn();
+        seed_test_users(&mut conn);
+        let pk = conn.primary_key(None, "test_users").expect("primary_key");
         assert_eq!(pk, vec!["id".to_string()]);
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_primary_key_composite_in_order() {
-        let (mut conn, path) = fresh_conn().await;
+    #[test]
+    fn test_sqlite_primary_key_composite_in_order() {
+        let (mut conn, path) = fresh_conn();
         // SQLite uses the column order in the PRIMARY KEY clause for
         // the `pk` ordinal: tenant first, then resource.
         conn.execute(
@@ -608,31 +591,26 @@ mod tests {
                 PRIMARY KEY (tenant, resource)
             )",
         )
-        .await
         .expect("create membership");
-        let pk = conn
-            .primary_key(None, "membership")
-            .await
-            .expect("primary_key");
+        let pk = conn.primary_key(None, "membership").expect("primary_key");
         assert_eq!(pk, vec!["tenant".to_string(), "resource".to_string()]);
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_primary_key_none() {
-        let (mut conn, path) = fresh_conn().await;
+    #[test]
+    fn test_sqlite_primary_key_none() {
+        let (mut conn, path) = fresh_conn();
         conn.execute("CREATE TABLE no_pk (a INTEGER, b TEXT)")
-            .await
             .expect("create no_pk");
-        let pk = conn.primary_key(None, "no_pk").await.expect("primary_key");
+        let pk = conn.primary_key(None, "no_pk").expect("primary_key");
         assert!(pk.is_empty(), "expected no PK columns, got {pk:?}");
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_list_foreign_keys() {
-        let (mut conn, path) = fresh_conn().await;
-        seed_test_users(&mut conn).await;
+    #[test]
+    fn test_sqlite_list_foreign_keys() {
+        let (mut conn, path) = fresh_conn();
+        seed_test_users(&mut conn);
         conn.execute(
             "CREATE TABLE test_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -640,12 +618,8 @@ mod tests {
                 total REAL
             )",
         )
-        .await
         .expect("create test_orders");
-        let fks = conn
-            .list_foreign_keys(None)
-            .await
-            .expect("list_foreign_keys");
+        let fks = conn.list_foreign_keys(None).expect("list_foreign_keys");
         assert_eq!(fks.len(), 1, "expected one FK edge, got {fks:?}");
         let fk = &fks[0];
         assert_eq!(fk.child_table, "test_orders");
@@ -656,16 +630,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn test_sqlite_list_foreign_keys_composite() {
-        let (mut conn, path) = fresh_conn().await;
+    #[test]
+    fn test_sqlite_list_foreign_keys_composite() {
+        let (mut conn, path) = fresh_conn();
         conn.execute(
             "CREATE TABLE parent (
                 a INTEGER, b INTEGER,
                 PRIMARY KEY (a, b)
             )",
         )
-        .await
         .expect("create parent");
         conn.execute(
             "CREATE TABLE child (
@@ -673,12 +646,8 @@ mod tests {
                 FOREIGN KEY (x, y) REFERENCES parent(a, b)
             )",
         )
-        .await
         .expect("create child");
-        let fks = conn
-            .list_foreign_keys(None)
-            .await
-            .expect("list_foreign_keys");
+        let fks = conn.list_foreign_keys(None).expect("list_foreign_keys");
         assert_eq!(fks.len(), 1);
         assert_eq!(fks[0].child_columns, vec!["x".to_string(), "y".to_string()]);
         assert_eq!(

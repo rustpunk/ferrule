@@ -11,8 +11,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::time::Duration;
-use tokio::time::Instant;
+use std::time::Duration;
+use std::time::Instant;
 
 /// Options that drive a single watch loop.
 pub struct WatchOptions {
@@ -35,13 +35,22 @@ pub struct WatchOptions {
 }
 
 /// Run the watch loop until the `running` flag is cleared.
-pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(), CliError> {
+/// Run the synchronous watch loop until `running` is cleared.
+///
+/// **Blocking:** this loop owns the calling thread. Each iteration
+/// resolves + connects synchronously (each ferrule-sql connection owns
+/// its own private runtime) and sleeps with `std::thread::sleep` between
+/// polls. Ctrl-C handling is delegated to the caller, which flips
+/// `running` from a background signal task; the loop observes it at each
+/// sleep boundary. File-change watching uses a `std::sync::mpsc` channel
+/// fed by the `notify` callback.
+pub fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(), CliError> {
     let mut iteration = 0u64;
     let mut prev_output: Option<String> = None;
     let is_tty = std::io::stdout().is_terminal();
 
     // Set up file watcher if watching a file
-    let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (watch_tx, watch_rx) = std::sync::mpsc::channel::<()>();
     let _watcher = if let Some(ref path) = opts.file_path {
         let path = path.clone();
         let tx = watch_tx.clone();
@@ -52,7 +61,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                         event.kind,
                         EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
                     ) {
-                        let _ = tx.try_send(());
+                        let _ = tx.send(());
                     }
                 }
             })
@@ -75,31 +84,35 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             }
         }
 
-        // If watching a file, wait for a change; otherwise use interval
+        // If watching a file, wait for a change (Ctrl-C flips `running`
+        // from the background signal task, observed at the recv timeout);
+        // otherwise sleep the poll interval in short slices so a Ctrl-C
+        // mid-interval is noticed promptly.
         if opts.file_path.is_some() {
-            let timeout = tokio::time::Duration::from_secs(600); // 10 min fallback
-            tokio::select! {
-                _ = tokio::time::sleep(timeout) => {
-                    // Timeout — just re-run on interval as fallback
+            // 10-minute fallback re-run if no event arrives.
+            match watch_rx.recv_timeout(Duration::from_secs(600)) {
+                Ok(()) => {
+                    // File changed — debounce slightly.
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                _ = watch_rx.recv() => {
-                    // File changed — debounce slightly
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Timeout — re-run as fallback.
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    let _guard = opts.print_lock.lock();
-                    println!("\n[watch] stopped.");
-                    break;
-                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if !running.load(Ordering::Relaxed) {
+                break;
             }
         } else {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(opts.interval_secs.load(Ordering::Relaxed))) => {}
-                _ = tokio::signal::ctrl_c() => {
-                    let _guard = opts.print_lock.lock();
-                    println!("\n[watch] stopped.");
+            let secs = opts.interval_secs.load(Ordering::Relaxed);
+            for _ in 0..secs {
+                if !running.load(Ordering::Relaxed) {
                     break;
                 }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            if !running.load(Ordering::Relaxed) {
+                break;
             }
         }
 
@@ -113,12 +126,12 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
 
         // Re-read SQL from file if watching a file
         let sql = if let Some(ref path) = opts.file_path {
-            match tokio::fs::read_to_string(path).await {
+            match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(e) => {
                     let _guard = opts.print_lock.lock();
                     eprintln!("[watch] read file error: {e}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
             }
@@ -130,7 +143,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
         if trimmed.is_empty() {
             let _guard = opts.print_lock.lock();
             eprintln!("[watch] SQL is empty, skipping.");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            std::thread::sleep(Duration::from_secs(1));
             continue;
         }
 
@@ -145,9 +158,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
             opts.conn_flags.ssh_key.as_deref(),
             opts.conn_flags.proxy_url.as_deref(),
             &opts.global_config,
-        )
-        .await
-        {
+        ) {
             Ok(r) => r,
             Err(e) => {
                 let _guard = opts.print_lock.lock();
@@ -157,7 +168,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                         format!("watch connection error: {e}"),
                     )));
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
@@ -169,7 +180,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                     format!("watch daemon/ssh compatibility: {e}"),
                 )));
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            std::thread::sleep(Duration::from_secs(1));
             continue;
         }
 
@@ -184,7 +195,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                         resolved.url.scheme()
                     )));
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
@@ -199,7 +210,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                         format!("watch paging error: {e}"),
                     )));
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
@@ -216,9 +227,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                 insecure: opts.conn_flags.insecure,
                 password: None,
             },
-        )
-        .await
-        {
+        ) {
             Ok(c) => c,
             Err(e) => {
                 let _guard = opts.print_lock.lock();
@@ -228,18 +237,18 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                         format!("watch connection failed: {e}"),
                     )));
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
         let conn_time = conn_start.elapsed();
 
         let query_start = Instant::now();
-        let results = match conn.query(&sql).await {
+        let results = match conn.query(&sql) {
             Ok(qr) => vec![StatementResult::Query(qr)],
-            Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql).await {
+            Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql) {
                 Ok(summary) => vec![StatementResult::Summary(summary)],
-                Err(_) => match conn.execute_multi(&sql).await {
+                Err(_) => match conn.execute_multi(&sql) {
                     Ok(r) => r,
                     Err(e) => {
                         let _guard = opts.print_lock.lock();
@@ -249,7 +258,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                                 format!("watch query error: {e}"),
                             )));
                         }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        std::thread::sleep(Duration::from_secs(1));
                         continue;
                     }
                 },
@@ -262,7 +271,7 @@ pub async fn watch_loop(opts: &WatchOptions, running: &AtomicBool) -> Result<(),
                         format!("watch query error: {e}"),
                     )));
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };

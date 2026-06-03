@@ -40,19 +40,19 @@ impl Default for LoadOptions {
 }
 
 /// Load data from a reader (CSV or JSON) into a table.
-pub async fn load_data(
+pub fn load_data(
     conn: &mut dyn Connection,
     data: &str,
     backend: Backend,
     opts: &LoadOptions,
 ) -> Result<usize, SqlError> {
     match opts.format {
-        LoadFormat::Csv => load_csv(conn, data, backend, opts).await,
-        LoadFormat::Json => load_json(conn, data, backend, opts).await,
+        LoadFormat::Csv => load_csv(conn, data, backend, opts),
+        LoadFormat::Json => load_json(conn, data, backend, opts),
     }
 }
 
-async fn load_csv(
+fn load_csv(
     conn: &mut dyn Connection,
     data: &str,
     backend: Backend,
@@ -83,7 +83,7 @@ async fn load_csv(
                 "INSERT INTO {quoted_table} ({cols}) VALUES {};",
                 batch.join(", ")
             );
-            conn.execute(&sql).await?;
+            conn.execute(&sql)?;
             total += batch.len();
             batch.clear();
         }
@@ -93,13 +93,13 @@ async fn load_csv(
             "INSERT INTO {quoted_table} ({cols}) VALUES {};",
             batch.join(", ")
         );
-        conn.execute(&sql).await?;
+        conn.execute(&sql)?;
         total += batch.len();
     }
     Ok(total)
 }
 
-async fn load_json(
+fn load_json(
     conn: &mut dyn Connection,
     data: &str,
     backend: Backend,
@@ -123,7 +123,7 @@ async fn load_json(
     if opts.create_table {
         let schema = infer_schema(&arr, backend);
         let create = build_create_table(&opts.table, &schema, backend);
-        conn.execute(&create).await?;
+        conn.execute(&create)?;
     }
 
     let mut total = 0usize;
@@ -143,7 +143,7 @@ async fn load_json(
                     "INSERT INTO {quoted_table} ({cols}) VALUES {};",
                     batch.join(", ")
                 );
-                conn.execute(&sql).await?;
+                conn.execute(&sql)?;
                 total += batch.len();
                 batch.clear();
             }
@@ -154,7 +154,7 @@ async fn load_json(
             "INSERT INTO {quoted_table} ({cols}) VALUES {};",
             batch.join(", ")
         );
-        conn.execute(&sql).await?;
+        conn.execute(&sql)?;
         total += batch.len();
     }
     Ok(total)

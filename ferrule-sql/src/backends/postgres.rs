@@ -1,5 +1,5 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
     StatementResult,
 };
 use crate::error::SqlError;
@@ -17,7 +17,7 @@ pub struct PostgresConnection {
 }
 
 #[async_trait]
-impl Connection for PostgresConnection {
+impl AsyncConnection for PostgresConnection {
     async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
         let rows_affected = self
             .client
@@ -1049,7 +1049,7 @@ mod pg_binary_copy {
     }
 }
 
-pub async fn connect(
+pub(crate) async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
 ) -> Result<PostgresConnection, SqlError> {
@@ -1089,7 +1089,7 @@ pub async fn connect(
 /// Reuses the same TLS connector logic as [`connect`], so a URL like
 /// `postgres://app:pwd@db/myapp?sslmode=require` gets SSH transport
 /// (or proxy) AND TLS to the database — the two layers compose.
-pub async fn connect_with_stream<S>(
+pub(crate) async fn connect_with_stream<S>(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
     stream: S,
@@ -1355,44 +1355,42 @@ mod tests {
     const TEST_POSTGRES_URL: &str =
         "postgres://ferrule:ferrule@127.0.0.1:15432/ferrule?sslmode=disable";
 
-    async fn try_connect() -> Option<PostgresConnection> {
+    fn try_connect() -> Option<Box<dyn crate::Connection>> {
         let url = DatabaseUrl::parse(TEST_POSTGRES_URL).ok()?;
-        let conn = connect(&url, &ConnectOptions::default()).await.ok()?;
+        let conn = crate::connect(&url, &ConnectOptions::default(), None).ok()?;
         Some(conn)
     }
 
-    #[tokio::test]
-    async fn test_postgres_ping() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_ping() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("Postgres test container not available, skipping test_postgres_ping");
             return;
         };
-        conn.ping().await.expect("ping should succeed");
+        conn.ping().expect("ping should succeed");
     }
 
-    #[tokio::test]
-    async fn test_postgres_query() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_query() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("Postgres test container not available, skipping test_postgres_query");
             return;
         };
         let result = conn
             .query("SELECT * FROM test_users")
-            .await
             .expect("query should succeed");
         assert!(!result.columns.is_empty(), "should have columns");
         assert!(!result.rows.is_empty(), "should have rows");
     }
 
-    #[tokio::test]
-    async fn test_postgres_execute() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_execute() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("Postgres test container not available, skipping test_postgres_execute");
             return;
         };
         let summary = conn
             .execute("INSERT INTO test_users (name, age) VALUES ('TestUser', 99)")
-            .await
             .expect("execute should succeed");
         assert!(
             summary.rows_affected.is_some_and(|n| n > 0),
@@ -1400,25 +1398,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_postgres_list_tables() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_list_tables() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("Postgres test container not available, skipping test_postgres_list_tables");
             return;
         };
-        let tables = conn
-            .list_tables(None)
-            .await
-            .expect("list_tables should succeed");
+        let tables = conn.list_tables(None).expect("list_tables should succeed");
         assert!(
             tables.contains(&"test_users".to_string()),
             "should contain test_users, got: {tables:?}"
         );
     }
 
-    #[tokio::test]
-    async fn test_postgres_describe_table() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_describe_table() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "Postgres test container not available, skipping test_postgres_describe_table"
             );
@@ -1426,7 +1421,6 @@ mod tests {
         };
         let result = conn
             .describe_table(None, "test_users")
-            .await
             .expect("describe_table should succeed");
         assert_eq!(result.columns.len(), 6, "should return 6 metadata columns");
         let col_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
@@ -1449,9 +1443,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_postgres_type_mapping() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_type_mapping() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("Postgres test container not available, skipping test_postgres_type_mapping");
             return;
         };
@@ -1460,7 +1454,6 @@ mod tests {
                 "SELECT name, age, score, active, meta, uid FROM test_users \
                  WHERE name = 'Alice'",
             )
-            .await
             .expect("query should succeed");
         assert_eq!(result.rows.len(), 1, "expected exactly Alice");
         let row = &result.rows[0];
@@ -1478,9 +1471,9 @@ mod tests {
         assert!(matches!(row[5], Value::Uuid(_)), "uid should be Uuid");
     }
 
-    #[tokio::test]
-    async fn test_postgres_timestamptz_mapping() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_timestamptz_mapping() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "Postgres test container not available, skipping test_postgres_timestamptz_mapping"
             );
@@ -1488,7 +1481,6 @@ mod tests {
         };
         let result = conn
             .query("SELECT created_at FROM test_users WHERE name = 'Alice'")
-            .await
             .expect("query should succeed");
         assert_eq!(result.rows.len(), 1);
         assert!(
@@ -1501,9 +1493,9 @@ mod tests {
     /// End-to-end check that `bulk_insert_rows` actually streams
     /// through `COPY ... FROM STDIN`. Creates a scratch table per
     /// test invocation so seeded `test_users` rows are untouched.
-    #[tokio::test]
-    async fn test_postgres_bulk_insert_rows_round_trip() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_bulk_insert_rows_round_trip() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "Postgres test container not available, skipping test_postgres_bulk_insert_rows_round_trip"
             );
@@ -1512,7 +1504,7 @@ mod tests {
 
         let pid = std::process::id();
         let table = format!("ferrule_bulk_test_{pid}");
-        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}")).await;
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}"));
         conn.execute(&format!(
             "CREATE TABLE {table} (\
                id BIGINT, \
@@ -1523,7 +1515,6 @@ mod tests {
                tricky TEXT\
              )"
         ))
-        .await
         .expect("CREATE TABLE");
 
         let columns = vec![
@@ -1612,20 +1603,17 @@ mod tests {
                 rows: &rows,
                 copy_format: crate::copy::CopyFormat::Text,
             })
-            .await
             .expect("bulk_insert_rows");
         assert_eq!(n, 5, "bulk should return rows-accepted = 5");
 
         // Verify count + a couple of the tricky values made the round trip.
         let count = conn
             .query(&format!("SELECT count(*)::bigint FROM {table}"))
-            .await
             .unwrap();
         assert!(matches!(count.rows[0][0], Value::Int64(5)));
 
         let r3 = conn
             .query(&format!("SELECT name, tricky FROM {table} WHERE id = 3"))
-            .await
             .unwrap();
         assert_eq!(r3.rows.len(), 1);
         if let Value::String(name) = &r3.rows[0][0] {
@@ -1648,34 +1636,29 @@ mod tests {
         // Row 4 — all NULL columns except id.
         let r4 = conn
             .query(&format!("SELECT name, active FROM {table} WHERE id = 4"))
-            .await
             .unwrap();
         assert!(matches!(r4.rows[0][0], Value::Null));
         assert!(matches!(r4.rows[0][1], Value::Null));
 
         // Cleanup.
         conn.execute(&format!("DROP TABLE {table}"))
-            .await
             .expect("DROP TABLE");
     }
 
-    #[tokio::test]
-    async fn test_postgres_primary_key() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_primary_key() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("Postgres test container not available, skipping test_postgres_primary_key");
             return;
         };
         // `test_users` seeded with `id SERIAL PRIMARY KEY`.
-        let pk = conn
-            .primary_key(None, "test_users")
-            .await
-            .expect("primary_key");
+        let pk = conn.primary_key(None, "test_users").expect("primary_key");
         assert_eq!(pk, vec!["id".to_string()]);
     }
 
-    #[tokio::test]
-    async fn test_postgres_list_foreign_keys() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_postgres_list_foreign_keys() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "Postgres test container not available, skipping test_postgres_list_foreign_keys"
             );
@@ -1683,20 +1666,16 @@ mod tests {
         };
         let pid = std::process::id();
         let child = format!("ferrule_fk_test_orders_{pid}");
-        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {child}")).await;
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {child}"));
         conn.execute(&format!(
             "CREATE TABLE {child} (\
                id SERIAL PRIMARY KEY, \
                user_id INT REFERENCES test_users(id) ON DELETE CASCADE\
              )"
         ))
-        .await
         .expect("CREATE TABLE");
 
-        let fks = conn
-            .list_foreign_keys(None)
-            .await
-            .expect("list_foreign_keys");
+        let fks = conn.list_foreign_keys(None).expect("list_foreign_keys");
         let matching: Vec<_> = fks.iter().filter(|fk| fk.child_table == child).collect();
         assert_eq!(matching.len(), 1, "expected 1 FK from {child}, got {fks:?}");
         let fk = matching[0];
@@ -1706,19 +1685,18 @@ mod tests {
         assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
 
         conn.execute(&format!("DROP TABLE {child}"))
-            .await
             .expect("DROP TABLE");
     }
 
     /// End-to-end `--if-exists skip` then `upsert` round-trip against
     /// Postgres. Single container, two pooled connections, two unique
     /// per-pid tables.
-    #[tokio::test]
-    async fn test_postgres_copy_skip_then_upsert() {
+    #[test]
+    fn test_postgres_copy_skip_then_upsert() {
         use crate::backend::Backend;
         use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
 
-        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+        let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(
                 "Postgres test container not available, skipping test_postgres_copy_skip_then_upsert"
             );
@@ -1728,29 +1706,21 @@ mod tests {
         let pid = std::process::id();
         let src_table = format!("ferrule_pg_skip_src_{pid}");
         let dst_table = format!("ferrule_pg_skip_dst_{pid}");
-        let _ = src
-            .execute(&format!("DROP TABLE IF EXISTS {src_table}"))
-            .await;
-        let _ = dst
-            .execute(&format!("DROP TABLE IF EXISTS {dst_table}"))
-            .await;
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}"));
+        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}"));
         src.execute(&format!(
             "CREATE TABLE {src_table} (id INT PRIMARY KEY, name TEXT, val INT)"
         ))
-        .await
         .expect("CREATE src");
         dst.execute(&format!(
             "CREATE TABLE {dst_table} (id INT PRIMARY KEY, name TEXT, val INT)"
         ))
-        .await
         .expect("CREATE dst");
         src.execute(&format!(
             "INSERT INTO {src_table} VALUES (1, 'new-1', 10), (2, 'new-2', 20)"
         ))
-        .await
         .expect("seed src");
         dst.execute(&format!("INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"))
-            .await
             .expect("seed dst");
 
         // --- Skip: id=1 preserved as 'old-1' / 99; id=2 inserted. ----------
@@ -1769,14 +1739,12 @@ mod tests {
             Backend::Postgres,
             &opts,
         )
-        .await
         .expect("copy_rows skip");
 
         let out = dst
             .query(&format!(
                 "SELECT id, name, val FROM {dst_table} ORDER BY id"
             ))
-            .await
             .expect("verify skip");
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "old-1"));
@@ -1798,14 +1766,12 @@ mod tests {
             Backend::Postgres,
             &opts,
         )
-        .await
         .expect("copy_rows upsert");
 
         let out = dst
             .query(&format!(
                 "SELECT id, name, val FROM {dst_table} ORDER BY id"
             ))
-            .await
             .expect("verify upsert");
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
@@ -1813,8 +1779,8 @@ mod tests {
         assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
 
         // Cleanup.
-        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+        let _ = src.execute(&format!("DROP TABLE {src_table}"));
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}"));
     }
 
     /// PG → SQLite `--all-tables` round-trip. Two related PG tables
@@ -1822,13 +1788,12 @@ mod tests {
     /// FK-respecting order; we verify both tables exist on the
     /// destination with the expected row counts.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn test_postgres_to_sqlite_all_tables_round_trip() {
+    #[test]
+    fn test_postgres_to_sqlite_all_tables_round_trip() {
         use crate::backend::Backend;
-        use crate::backends::sqlite::connect as sqlite_connect;
         use crate::copy::{copy_all_tables, AllTablesOptions};
 
-        let Some(mut src) = try_connect().await else {
+        let Some(mut src) = try_connect() else {
             eprintln!(
                 "Postgres test container not available, skipping test_postgres_to_sqlite_all_tables_round_trip"
             );
@@ -1838,39 +1803,34 @@ mod tests {
         let pid = std::process::id();
         let parent = format!("ferrule_all_parent_{pid}");
         let child = format!("ferrule_all_child_{pid}");
-        let _ = src.execute(&format!("DROP TABLE IF EXISTS {child}")).await;
-        let _ = src.execute(&format!("DROP TABLE IF EXISTS {parent}")).await;
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {child}"));
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {parent}"));
         src.execute(&format!(
             "CREATE TABLE {parent} (id INT PRIMARY KEY, name TEXT)"
         ))
-        .await
         .expect("CREATE parent");
         src.execute(&format!(
             "CREATE TABLE {child} (id INT PRIMARY KEY, \
                                    parent_id INT REFERENCES {parent}(id), \
                                    note TEXT)"
         ))
-        .await
         .expect("CREATE child");
         src.execute(&format!(
             "INSERT INTO {parent} VALUES (1, 'one'), (2, 'two')"
         ))
-        .await
         .expect("seed parent");
         src.execute(&format!(
             "INSERT INTO {child} VALUES (10, 1, 'first'), (11, 2, 'second')"
         ))
-        .await
         .expect("seed child");
 
         // Fresh on-disk SQLite destination.
         let dst_path = std::env::temp_dir().join(format!("ferrule-pg-all-tables-{pid}.db"));
         let _ = std::fs::remove_file(&dst_path);
         let dst_url = DatabaseUrl::parse(&format!("sqlite://{}", dst_path.display())).unwrap();
-        let mut dst = sqlite_connect(&dst_url, &ConnectOptions::default())
-            .await
-            .expect("connect sqlite dst");
-        dst.execute("PRAGMA foreign_keys = ON").await.unwrap();
+        let mut dst =
+            crate::connect(&dst_url, &ConnectOptions::default(), None).expect("connect sqlite dst");
+        dst.execute("PRAGMA foreign_keys = ON").unwrap();
 
         let opts = AllTablesOptions {
             include: vec![format!("ferrule_all_*_{pid}")],
@@ -1884,24 +1844,21 @@ mod tests {
             Backend::Sqlite,
             &opts,
         )
-        .await
         .expect("copy_all_tables PG -> SQLite");
         assert_eq!(copied, 4, "2 parent rows + 2 child rows expected");
 
         let p = dst
             .query(&format!("SELECT count(*) FROM {parent}"))
-            .await
             .expect("verify parent");
         let c = dst
             .query(&format!("SELECT count(*) FROM {child}"))
-            .await
             .expect("verify child");
         assert!(matches!(&p.rows[0][0], Value::Int64(2)));
         assert!(matches!(&c.rows[0][0], Value::Int64(2)));
 
         // Cleanup PG side.
-        let _ = src.execute(&format!("DROP TABLE {child}")).await;
-        let _ = src.execute(&format!("DROP TABLE {parent}")).await;
+        let _ = src.execute(&format!("DROP TABLE {child}"));
+        let _ = src.execute(&format!("DROP TABLE {parent}"));
         let _ = std::fs::remove_file(&dst_path);
     }
 
@@ -1911,12 +1868,12 @@ mod tests {
     /// (source SELECT → ferrule Value → BinaryCopyInWriter → PG
     /// binary frame → readback) is byte-equivalent for the canonical
     /// PG types.
-    #[tokio::test]
-    async fn test_postgres_binary_copy_round_trip_all_value_variants() {
+    #[test]
+    fn test_postgres_binary_copy_round_trip_all_value_variants() {
         use crate::backend::Backend;
         use crate::copy::{copy_rows, BulkMode, CopyFormat, CopyOptions, CopySource};
 
-        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+        let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(
                 "Postgres test container not available, skipping test_postgres_binary_copy_round_trip_all_value_variants"
             );
@@ -1926,12 +1883,8 @@ mod tests {
         let pid = std::process::id();
         let src_table = format!("ferrule_pg_bin_src_{pid}");
         let dst_table = format!("ferrule_pg_bin_dst_{pid}");
-        let _ = src
-            .execute(&format!("DROP TABLE IF EXISTS {src_table}"))
-            .await;
-        let _ = dst
-            .execute(&format!("DROP TABLE IF EXISTS {dst_table}"))
-            .await;
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}"));
+        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}"));
         // One column per TypeHint that maps to a concrete PG type in
         // pg_type_for_hint. Order matches the binary writer's expected
         // shape: any mismatch surfaces as a wire error during write().
@@ -1951,9 +1904,8 @@ mod tests {
                u UUID\
              )"
         );
-        src.execute(&create).await.expect("CREATE src");
+        src.execute(&create).expect("CREATE src");
         dst.execute(&create.replace(&src_table, &dst_table))
-            .await
             .expect("CREATE dst");
         // Two rows: one fully populated, one all-NULL except the
         // PK-less identity (just the boolean).
@@ -1970,7 +1922,6 @@ mod tests {
                NULL, NULL, NULL, NULL, NULL, NULL\
              )"
         ))
-        .await
         .expect("seed src");
 
         // Drive the copy via copy_rows so we exercise the dispatcher
@@ -1991,7 +1942,6 @@ mod tests {
             Backend::Postgres,
             &opts,
         )
-        .await
         .expect("copy_rows binary COPY");
         assert_eq!(copied, 2);
 
@@ -2002,7 +1952,6 @@ mod tests {
                         dttz::text, j::text, u::text \
                  FROM {dst_table} ORDER BY i NULLS LAST"
             ))
-            .await
             .expect("read back");
         assert_eq!(out.rows.len(), 2);
         // First (fully populated) row.
@@ -2029,7 +1978,7 @@ mod tests {
             assert!(matches!(col, Value::Null), "expected NULL, got {col:?}");
         }
 
-        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+        let _ = src.execute(&format!("DROP TABLE {src_table}"));
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}"));
     }
 }

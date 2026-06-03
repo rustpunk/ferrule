@@ -1,5 +1,5 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
     StatementResult,
 };
 use crate::error::SqlError;
@@ -17,7 +17,7 @@ pub struct MySqlConnection {
 }
 
 #[async_trait]
-impl Connection for MySqlConnection {
+impl AsyncConnection for MySqlConnection {
     async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
         self.conn
             .query_drop(sql)
@@ -403,7 +403,7 @@ impl Connection for MySqlConnection {
     }
 }
 
-pub async fn connect(
+pub(crate) async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
 ) -> Result<MySqlConnection, SqlError> {
@@ -948,44 +948,42 @@ mod tests {
 
     const TEST_MYSQL_URL: &str = "mysql://root:ferrule@127.0.0.1:13306/ferrule";
 
-    async fn try_connect() -> Option<MySqlConnection> {
+    fn try_connect() -> Option<Box<dyn crate::Connection>> {
         let url = DatabaseUrl::parse(TEST_MYSQL_URL).ok()?;
-        let conn = connect(&url, &ConnectOptions::default()).await.ok()?;
+        let conn = crate::connect(&url, &ConnectOptions::default(), None).ok()?;
         Some(conn)
     }
 
-    #[tokio::test]
-    async fn test_mysql_ping() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_ping() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_ping");
             return;
         };
-        conn.ping().await.expect("ping should succeed");
+        conn.ping().expect("ping should succeed");
     }
 
-    #[tokio::test]
-    async fn test_mysql_query() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_query() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_query");
             return;
         };
         let result = conn
             .query("SELECT * FROM test_users")
-            .await
             .expect("query should succeed");
         assert!(!result.columns.is_empty(), "should have columns");
         assert!(!result.rows.is_empty(), "should have rows");
     }
 
-    #[tokio::test]
-    async fn test_mysql_execute() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_execute() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_execute");
             return;
         };
         let summary = conn
             .execute("INSERT INTO test_users (name, age) VALUES ('TestUser', 99)")
-            .await
             .expect("execute should succeed");
         assert!(
             summary.rows_affected.is_some_and(|n| n > 0),
@@ -993,31 +991,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_mysql_list_tables() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_list_tables() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_list_tables");
             return;
         };
-        let tables = conn
-            .list_tables(None)
-            .await
-            .expect("list_tables should succeed");
+        let tables = conn.list_tables(None).expect("list_tables should succeed");
         assert!(
             tables.contains(&"test_users".to_string()),
             "should contain test_users"
         );
     }
 
-    #[tokio::test]
-    async fn test_mysql_describe_table() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_describe_table() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_describe_table");
             return;
         };
         let result = conn
             .describe_table(None, "test_users")
-            .await
             .expect("describe_table should succeed");
         assert_eq!(result.columns.len(), 6, "should return 6 metadata columns");
         let col_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
@@ -1034,19 +1028,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_mysql_execute_multi() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_execute_multi() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_execute_multi");
             return;
         };
         // Clean up any previous test row
-        let _ = conn
-            .execute("DELETE FROM test_users WHERE name = 'MultiUser'")
-            .await;
+        let _ = conn.execute("DELETE FROM test_users WHERE name = 'MultiUser'");
         let results = conn
             .execute_multi("INSERT INTO test_users (name, age) VALUES ('MultiUser', 42); SELECT COUNT(*) FROM test_users;")
-            .await
             .expect("execute_multi should succeed");
         assert_eq!(results.len(), 2, "should have two result sets");
         // First result: DML summary
@@ -1061,15 +1052,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_mysql_type_mapping() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_type_mapping() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_type_mapping");
             return;
         };
         let result = conn
             .query("SELECT name, age, score, active, meta FROM test_users WHERE name = 'Alice'")
-            .await
             .expect("query should succeed");
         assert_eq!(result.rows.len(), 1);
         let row = &result.rows[0];
@@ -1093,9 +1083,9 @@ mod tests {
     /// INFILE and verify the rows round-trip. Includes a row with
     /// backslash/tab/newline payloads, an all-NULLs row, and a BLOB
     /// with non-UTF-8 bytes to exercise the binary path.
-    #[tokio::test]
-    async fn test_mysql_bulk_insert_rows_round_trip() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_bulk_insert_rows_round_trip() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "MySQL test container not available, skipping test_mysql_bulk_insert_rows_round_trip"
             );
@@ -1110,7 +1100,7 @@ mod tests {
         // this test. If the user doesn't have SUPER, the SET fails
         // and we degrade by skipping the test (rather than the bulk
         // path silently failing).
-        if conn.execute("SET GLOBAL local_infile = ON").await.is_err() {
+        if conn.execute("SET GLOBAL local_infile = ON").is_err() {
             eprintln!(
                 "MySQL test container does not allow toggling local_infile; \
                  skipping test_mysql_bulk_insert_rows_round_trip"
@@ -1120,7 +1110,7 @@ mod tests {
 
         let pid = std::process::id();
         let table = format!("ferrule_bulk_test_{pid}");
-        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}")).await;
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}"));
         conn.execute(&format!(
             "CREATE TABLE {table} (\
                id BIGINT NOT NULL, \
@@ -1131,7 +1121,6 @@ mod tests {
                tricky TEXT NULL\
              ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
         ))
-        .await
         .expect("CREATE TABLE");
 
         let columns = vec![
@@ -1201,7 +1190,6 @@ mod tests {
                 rows: &rows,
                 copy_format: crate::copy::CopyFormat::Text,
             })
-            .await
             .expect("bulk_insert_rows");
         assert_eq!(n, 3);
 
@@ -1209,7 +1197,6 @@ mod tests {
             .query(&format!(
                 "SELECT id, name, active, blob_data, tricky FROM {table} ORDER BY id"
             ))
-            .await
             .unwrap();
         assert_eq!(result.rows.len(), 3);
 
@@ -1243,7 +1230,6 @@ mod tests {
 
         // Cleanup.
         conn.execute(&format!("DROP TABLE {table}"))
-            .await
             .expect("DROP TABLE");
     }
 
@@ -1253,9 +1239,9 @@ mod tests {
     /// only present during a bulk_insert_rows call. mysql_async
     /// raises `LocalInfileError::NoHandler` in that case, which
     /// `MySqlConnection::execute` surfaces as a `QueryFailed`.
-    #[tokio::test]
-    async fn test_mysql_load_data_without_bulk_in_progress_rejected() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_load_data_without_bulk_in_progress_rejected() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "MySQL test container not available, skipping test_mysql_load_data_without_bulk_in_progress_rejected"
             );
@@ -1265,7 +1251,7 @@ mod tests {
         // Enable server-side local_infile so the *server* is willing
         // to ask the client for the file. We need that step to fail
         // here, not the server config, to prove the client refused.
-        if conn.execute("SET GLOBAL local_infile = ON").await.is_err() {
+        if conn.execute("SET GLOBAL local_infile = ON").is_err() {
             eprintln!(
                 "MySQL test container does not allow toggling local_infile; \
                  skipping test_mysql_load_data_without_bulk_in_progress_rejected"
@@ -1275,20 +1261,17 @@ mod tests {
 
         let pid = std::process::id();
         let table = format!("ferrule_bulk_security_test_{pid}");
-        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}")).await;
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}"));
         conn.execute(&format!(
             "CREATE TABLE {table} (id INT, line TEXT) ENGINE=InnoDB"
         ))
-        .await
         .expect("CREATE TABLE");
 
         // Try to coerce the client into shipping /etc/passwd.
-        let result = conn
-            .execute(&format!(
-                "LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE {table} \
+        let result = conn.execute(&format!(
+            "LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE {table} \
                  FIELDS TERMINATED BY ':' (id, line)"
-            ))
-            .await;
+        ));
 
         // The client refuses because no infile handler is
         // installed at this point. mysql_async raises a query
@@ -1308,38 +1291,34 @@ mod tests {
         // Sanity: confirm nothing landed in the table.
         let count = conn
             .query(&format!("SELECT COUNT(*) FROM {table}"))
-            .await
             .unwrap();
         match &count.rows[0][0] {
             Value::Int64(n) => assert_eq!(*n, 0, "no rows should have been inserted"),
             other => panic!("unexpected count shape: {other:?}"),
         }
 
-        let _ = conn.execute(&format!("DROP TABLE {table}")).await;
+        let _ = conn.execute(&format!("DROP TABLE {table}"));
     }
 
-    #[tokio::test]
-    async fn test_mysql_primary_key() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_primary_key() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_primary_key");
             return;
         };
-        let pk = conn
-            .primary_key(None, "test_users")
-            .await
-            .expect("primary_key");
+        let pk = conn.primary_key(None, "test_users").expect("primary_key");
         assert_eq!(pk, vec!["id".to_string()]);
     }
 
-    #[tokio::test]
-    async fn test_mysql_list_foreign_keys() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_mysql_list_foreign_keys() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("MySQL test container not available, skipping test_mysql_list_foreign_keys");
             return;
         };
         let pid = std::process::id();
         let child = format!("ferrule_fk_test_orders_{pid}");
-        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {child}")).await;
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {child}"));
         conn.execute(&format!(
             "CREATE TABLE {child} (\
                id INT AUTO_INCREMENT PRIMARY KEY, \
@@ -1347,13 +1326,9 @@ mod tests {
                FOREIGN KEY (user_id) REFERENCES test_users(id) ON DELETE CASCADE\
              )"
         ))
-        .await
         .expect("CREATE TABLE");
 
-        let fks = conn
-            .list_foreign_keys(None)
-            .await
-            .expect("list_foreign_keys");
+        let fks = conn.list_foreign_keys(None).expect("list_foreign_keys");
         let matching: Vec<_> = fks.iter().filter(|fk| fk.child_table == child).collect();
         assert_eq!(matching.len(), 1, "expected 1 FK from {child}, got {fks:?}");
         let fk = matching[0];
@@ -1362,17 +1337,17 @@ mod tests {
         assert_eq!(fk.parent_columns, vec!["id".to_string()]);
         assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
 
-        let _ = conn.execute(&format!("DROP TABLE {child}")).await;
+        let _ = conn.execute(&format!("DROP TABLE {child}"));
     }
 
     /// End-to-end `--if-exists skip` then `upsert` round-trip against
     /// MySQL. Uses `INSERT IGNORE` and `ON DUPLICATE KEY UPDATE`.
-    #[tokio::test]
-    async fn test_mysql_copy_skip_then_upsert() {
+    #[test]
+    fn test_mysql_copy_skip_then_upsert() {
         use crate::backend::Backend;
         use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
 
-        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+        let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(
                 "MySQL test container not available, skipping test_mysql_copy_skip_then_upsert"
             );
@@ -1382,29 +1357,21 @@ mod tests {
         let pid = std::process::id();
         let src_table = format!("ferrule_my_skip_src_{pid}");
         let dst_table = format!("ferrule_my_skip_dst_{pid}");
-        let _ = src
-            .execute(&format!("DROP TABLE IF EXISTS {src_table}"))
-            .await;
-        let _ = dst
-            .execute(&format!("DROP TABLE IF EXISTS {dst_table}"))
-            .await;
+        let _ = src.execute(&format!("DROP TABLE IF EXISTS {src_table}"));
+        let _ = dst.execute(&format!("DROP TABLE IF EXISTS {dst_table}"));
         src.execute(&format!(
             "CREATE TABLE {src_table} (id INT PRIMARY KEY, name VARCHAR(64), val INT)"
         ))
-        .await
         .expect("CREATE src");
         dst.execute(&format!(
             "CREATE TABLE {dst_table} (id INT PRIMARY KEY, name VARCHAR(64), val INT)"
         ))
-        .await
         .expect("CREATE dst");
         src.execute(&format!(
             "INSERT INTO {src_table} VALUES (1, 'new-1', 10), (2, 'new-2', 20)"
         ))
-        .await
         .expect("seed src");
         dst.execute(&format!("INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"))
-            .await
             .expect("seed dst");
 
         // --- Skip ---------------------------------------------------------
@@ -1417,14 +1384,12 @@ mod tests {
             ..Default::default()
         };
         copy_rows(&mut src, Backend::MySql, &mut dst, Backend::MySql, &opts)
-            .await
             .expect("copy_rows skip");
 
         let out = dst
             .query(&format!(
                 "SELECT id, name, val FROM {dst_table} ORDER BY id"
             ))
-            .await
             .expect("verify skip");
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "old-1"));
@@ -1440,21 +1405,19 @@ mod tests {
             ..Default::default()
         };
         copy_rows(&mut src, Backend::MySql, &mut dst, Backend::MySql, &opts)
-            .await
             .expect("copy_rows upsert");
 
         let out = dst
             .query(&format!(
                 "SELECT id, name, val FROM {dst_table} ORDER BY id"
             ))
-            .await
             .expect("verify upsert");
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
         assert!(matches!(&out.rows[0][2], Value::Int64(10)));
         assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
 
-        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+        let _ = src.execute(&format!("DROP TABLE {src_table}"));
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}"));
     }
 }

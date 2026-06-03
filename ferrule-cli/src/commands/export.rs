@@ -70,7 +70,7 @@ impl ExportFormat {
     }
 }
 
-pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = ExportFormat::parse(&args.format)
         .ok_or_else(|| CliError::usage(format!("Unknown export format: {}", args.format)))?;
 
@@ -81,8 +81,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     let backend = Backend::from_scheme(resolved.url.scheme())
@@ -94,8 +93,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
             insecure: args.conn_flags.insecure,
             password: None,
         },
-    )
-    .await?;
+    )?;
 
     // Set up output writer
     let mut stdout_guard;
@@ -127,7 +125,7 @@ pub async fn run(args: ExportArgs, global_config: &GlobalConfig) -> Result<(), C
         let paged = ferrule_sql::apply_paging(sql, Some(args.page_size), Some(offset), backend)
             .map_err(|e| CliError::usage(e.to_string()))?;
 
-        let result = conn.query(&paged).await.map_err(CliError::query)?;
+        let result = conn.query(&paged).map_err(CliError::query)?;
         if result.rows.is_empty() {
             break;
         }

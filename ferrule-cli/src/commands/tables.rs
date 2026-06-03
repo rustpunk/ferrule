@@ -5,7 +5,7 @@ use ferrule_core::formatter::format_result;
 use ferrule_sql::connection::{ConnectOptions, QueryResult};
 use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
 
-pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);
     let limit = args.output.resolve_limit(global_config);
     let offset = args.output.offset;
@@ -19,8 +19,7 @@ pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), C
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     if args.output.verbose {
@@ -30,8 +29,7 @@ pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), C
     // Route through daemon if requested
     if args.conn_flags.daemon {
         eprintln!("[ferrule] Routing via daemon...");
-        let payload =
-            crate::daemon::daemon_tables(&resolved.url, args.conn_flags.insecure, None).await?;
+        let payload = crate::daemon::daemon_tables(&resolved.url, args.conn_flags.insecure, None)?;
         println!("{}", payload);
         return Ok(());
     }
@@ -45,11 +43,11 @@ pub async fn run(args: TablesArgs, global_config: &GlobalConfig) -> Result<(), C
     }
 
     let conn_start = std::time::Instant::now();
-    let mut conn = super::connect_resolved(resolved, &opts).await?;
+    let mut conn = super::connect_resolved(resolved, &opts)?;
     let conn_time = conn_start.elapsed();
 
     let query_start = std::time::Instant::now();
-    let names = conn.list_tables(None).await.map_err(CliError::query)?;
+    let names = conn.list_tables(None).map_err(CliError::query)?;
     let query_time = query_start.elapsed();
 
     let mut result = QueryResult {

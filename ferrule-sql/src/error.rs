@@ -57,7 +57,11 @@ pub enum SqlError {
         port: u16,
         algorithm: String,
         fingerprint: String,
-        key: russh::keys::ssh_key::PublicKey,
+        /// Boxed so this (otherwise large) variant doesn't inflate the
+        /// whole `SqlError` enum — every synchronous backend method
+        /// returns `Result<_, SqlError>` by value, so an oversized error
+        /// variant would bloat every `Ok` path too.
+        key: Box<russh::keys::ssh_key::PublicKey>,
     },
 
     #[error("timeout")]

@@ -30,7 +30,7 @@ pub struct LoadArgs {
     pub conn_flags: ConnectionFlags,
 }
 
-pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let path = Path::new(&args.file);
 
     let format = if let Some(f) = args.format {
@@ -64,8 +64,7 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
         ));
     }
 
-    let data = tokio::fs::read_to_string(path)
-        .await
+    let data = std::fs::read_to_string(path)
         .map_err(|e| CliError::usage(format!("Cannot read file '{}': {}", args.file, e)))?;
 
     let resolved = resolve_connection(
@@ -75,8 +74,7 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     let backend = ferrule_sql::Backend::from_scheme(resolved.url.scheme())
@@ -105,11 +103,10 @@ pub async fn run(args: LoadArgs, global_config: &GlobalConfig) -> Result<(), Cli
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let mut conn = connect_resolved(resolved, &opts_conn).await?;
+    let mut conn = connect_resolved(resolved, &opts_conn)?;
 
-    let loaded = ferrule_core::load_data(conn.as_mut(), &data, backend, &opts)
-        .await
-        .map_err(CliError::query)?;
+    let loaded =
+        ferrule_core::load_data(conn.as_mut(), &data, backend, &opts).map_err(CliError::query)?;
 
     println!("Loaded {} rows into '{}'.", loaded, opts.table);
     Ok(())
