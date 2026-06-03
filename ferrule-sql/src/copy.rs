@@ -478,7 +478,7 @@ fn resolve_conflict_key(
 /// at the end of a successful copy (when no outer transaction is in
 /// play). Currently only Oracle behaves this way; every other
 /// supported backend defaults to autocommit.
-fn backend_needs_explicit_commit(backend: Backend) -> bool {
+pub(crate) fn backend_needs_explicit_commit(backend: Backend) -> bool {
     #[cfg(feature = "oracle")]
     {
         if matches!(backend, Backend::Oracle) {
@@ -644,7 +644,7 @@ fn run_truncate_and_first_batch(
 /// (first batch) and the streaming loop, so a single copy never
 /// mixes the two paths within one run.
 #[allow(clippy::too_many_arguments)]
-fn insert_batch(
+pub(crate) fn insert_batch(
     dst: &mut dyn Connection,
     target_table: &str,
     columns: &[ColumnInfo],
@@ -2409,6 +2409,12 @@ mod tests {
             }
             fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
                 self.inner.query(sql)
+            }
+            fn query_cursor(
+                &mut self,
+                sql: &str,
+            ) -> Result<crate::stream::RowCursor<'_>, SqlError> {
+                self.inner.query_cursor(sql)
             }
             fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
                 self.inner.execute_multi(sql)

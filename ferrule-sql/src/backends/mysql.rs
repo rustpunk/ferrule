@@ -3,6 +3,7 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
+use crate::stream::BoxRowStream;
 use crate::url::DatabaseUrl;
 use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
@@ -75,6 +76,62 @@ impl AsyncConnection for MySqlConnection {
             .collect();
 
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Stream rows from a MySQL `query_iter` result at bounded memory.
+    ///
+    /// `query_iter` is already lazy — it does not read rows from the
+    /// server until they are pulled. We keep that laziness by driving
+    /// `QueryResult::next` inside a `try_unfold` stream that owns the
+    /// `QueryResult` (which borrows `&mut self.conn`), so no row is read
+    /// ahead of the consumer and memory stays `O(1)` per pulled row.
+    /// Only the first result set is streamed (consistent with the eager
+    /// `query`); the connection is left ready for reuse once the stream
+    /// is fully drained or dropped.
+    async fn query_stream(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<ColumnInfo>, BoxRowStream<'_>), SqlError> {
+        // Pass an owned query so the resulting `QueryResult` borrows
+        // only `&mut self.conn` (not the `sql` argument), keeping the
+        // returned stream tied to the connection lifetime.
+        let result = self
+            .conn
+            .query_iter(sql.to_string())
+            .await
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+
+        let columns: Vec<ColumnInfo> = result
+            .columns_ref()
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name_str().to_string(),
+                type_hint: TypeHint::Other,
+                nullable: true,
+            })
+            .collect();
+
+        let stream = futures_util::stream::try_unfold(result, |mut result| async move {
+            match result.next().await {
+                Ok(Some(row)) => {
+                    let col_types: Vec<_> = row
+                        .columns_ref()
+                        .iter()
+                        .map(|c| (c.column_type(), c.column_length()))
+                        .collect();
+                    let values: Row = row
+                        .unwrap()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| mysql_to_value(v, col_types[i].0, col_types[i].1))
+                        .collect();
+                    Ok(Some((values, result)))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(SqlError::QueryFailed(e.to_string())),
+            }
+        });
+        Ok((columns, Box::pin(stream)))
     }
 
     async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
@@ -1419,5 +1476,150 @@ mod tests {
 
         let _ = src.execute(&format!("DROP TABLE {src_table}"));
         let _ = dst.execute(&format!("DROP TABLE {dst_table}"));
+    }
+
+    // --- #65/#66 streaming + write against the gate DB (skip w/o container) ---
+
+    /// Stream a synthetic result from MySQL via the lazy `query_iter`
+    /// cursor and assert batch-at-a-time pulling against a real server.
+    #[test]
+    fn test_mysql_cursor_streams_in_bounded_batches() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!(
+                "MySQL test container not available, skipping test_mysql_cursor_streams_in_bounded_batches"
+            );
+            return;
+        };
+        // MySQL has no generate_series; build a numbers table on the fly.
+        let _ = conn.execute("DROP TABLE IF EXISTS ferrule_stream_src");
+        conn.execute("CREATE TABLE ferrule_stream_src (i INT PRIMARY KEY)")
+            .expect("create src");
+        // The default cte_max_recursion_depth is 1000; raise it so the
+        // 5000-row generator CTE below runs to completion.
+        conn.execute("SET SESSION cte_max_recursion_depth = 100000")
+            .expect("raise cte depth");
+        conn.execute(
+            "INSERT INTO ferrule_stream_src (i) \
+             WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM seq WHERE i < 5000) \
+             SELECT i FROM seq",
+        )
+        .expect("seed src");
+        const BATCH: usize = 128;
+        let mut cursor = conn
+            .query_cursor("SELECT i, i * 2 AS doubled FROM ferrule_stream_src ORDER BY i")
+            .expect("open mysql cursor");
+        let mut total = 0u64;
+        loop {
+            let batch = cursor.next_batch(BATCH).expect("pull mysql batch");
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= BATCH);
+            total += batch.len() as u64;
+        }
+        assert_eq!(total, 5000);
+        drop(cursor);
+        let _ = conn.execute("DROP TABLE ferrule_stream_src");
+    }
+
+    /// Batched write into MySQL through the embeddable write path, read
+    /// back, and clean up.
+    #[test]
+    fn test_mysql_write_rows_round_trip() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!(
+                "MySQL test container not available, skipping test_mysql_write_rows_round_trip"
+            );
+            return;
+        };
+        let _ = conn.execute("DROP TABLE IF EXISTS ferrule_write_test");
+        conn.execute("CREATE TABLE ferrule_write_test (id INT PRIMARY KEY, name VARCHAR(64))")
+            .expect("create write table");
+        let columns = vec![
+            crate::value::ColumnInfo {
+                name: "id".into(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            crate::value::ColumnInfo {
+                name: "name".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+        ];
+        let rows: Vec<crate::value::Row> = (1..=2000)
+            .map(|i| vec![Value::Int64(i), Value::String(format!("n{i}"))])
+            .collect();
+        let opts = crate::write::WriteOptions {
+            batch_size: 250,
+            ..Default::default()
+        };
+        let report = crate::write::write_rows(
+            &mut *conn,
+            crate::Backend::MySql,
+            "ferrule_write_test",
+            &columns,
+            rows,
+            &opts,
+        )
+        .expect("write_rows");
+        assert_eq!(report.rows_written, 2000);
+        assert!(report.is_complete());
+        let back = conn
+            .query("SELECT COUNT(*) FROM ferrule_write_test")
+            .expect("count");
+        assert!(matches!(back.rows[0][0], Value::Int64(2000)));
+        let _ = conn.execute("DROP TABLE ferrule_write_test");
+    }
+
+    /// Upsert into MySQL via the write path's ON DUPLICATE KEY UPDATE
+    /// builder reuse.
+    #[test]
+    fn test_mysql_write_rows_upsert() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!("MySQL test container not available, skipping test_mysql_write_rows_upsert");
+            return;
+        };
+        let _ = conn.execute("DROP TABLE IF EXISTS ferrule_write_up");
+        conn.execute("CREATE TABLE ferrule_write_up (id INT PRIMARY KEY, v VARCHAR(32))")
+            .expect("create");
+        conn.execute("INSERT INTO ferrule_write_up VALUES (1, 'old')")
+            .expect("seed");
+        let columns = vec![
+            crate::value::ColumnInfo {
+                name: "id".into(),
+                type_hint: TypeHint::Int64,
+                nullable: false,
+            },
+            crate::value::ColumnInfo {
+                name: "v".into(),
+                type_hint: TypeHint::String,
+                nullable: true,
+            },
+        ];
+        let rows: Vec<crate::value::Row> = vec![
+            vec![Value::Int64(1), Value::String("new".into())],
+            vec![Value::Int64(2), Value::String("two".into())],
+        ];
+        let opts = crate::write::WriteOptions {
+            mode: crate::write::WriteMode::Upsert,
+            key_columns: vec!["id".into()],
+            ..Default::default()
+        };
+        let report = crate::write::write_rows(
+            &mut *conn,
+            crate::Backend::MySql,
+            "ferrule_write_up",
+            &columns,
+            rows,
+            &opts,
+        )
+        .expect("write_rows upsert");
+        assert!(report.is_complete());
+        let v1 = conn
+            .query("SELECT v FROM ferrule_write_up WHERE id = 1")
+            .expect("read back");
+        assert!(matches!(&v1.rows[0][0], Value::String(s) if s == "new"));
+        let _ = conn.execute("DROP TABLE ferrule_write_up");
     }
 }

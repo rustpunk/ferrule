@@ -67,6 +67,54 @@ pub enum SqlError {
     #[error("timeout")]
     Timeout,
 
+    /// A single cell exceeded the configured `max_cell_bytes` guard.
+    ///
+    /// Raised by the read paths (streaming cursor and eager `query`)
+    /// **before** the offending value is retained, so the guard caps
+    /// peak memory at one over-budget cell rather than letting a
+    /// pathological `bytea` / `TEXT` blow the heap. `row` is the
+    /// 0-based row ordinal within the current result; `column` names the
+    /// offending column; `size` and `cap` are byte counts.
+    #[error(
+        "cell too large: row {row}, column {column:?} is {size} bytes, \
+         exceeds the {cap}-byte cap (raise SizeGuards::max_cell_bytes, or \
+         stream the column out via --format csv/jsonl)"
+    )]
+    CellTooLarge {
+        row: u64,
+        column: String,
+        size: usize,
+        cap: usize,
+    },
+
+    /// A whole row's measured byte size exceeded `max_row_bytes`.
+    ///
+    /// Like [`CellTooLarge`](Self::CellTooLarge) this fires before the
+    /// row is appended to any buffer, so an unexpectedly wide row fails
+    /// fast instead of being materialized. `row` is the 0-based ordinal;
+    /// `size`/`cap` are byte counts.
+    #[error(
+        "row too large: row {row} is {size} bytes, exceeds the \
+         {cap}-byte cap (raise SizeGuards::max_row_bytes, or stream via \
+         --format csv/jsonl)"
+    )]
+    RowTooLarge { row: u64, size: usize, cap: usize },
+
+    /// The running total of buffered row bytes crossed
+    /// `max_total_buffered_bytes` while materializing an eager result.
+    ///
+    /// This is the guard the CLI's eager table path relies on: rather
+    /// than collect an unbounded `Vec<Row>` for a huge table, the eager
+    /// `query` accumulates a byte tally and aborts once it crosses the
+    /// cap. `rows_buffered` is how many rows had been accumulated; `cap`
+    /// is the byte ceiling.
+    #[error(
+        "result too large: buffered {rows_buffered} rows exceeding the \
+         {cap}-byte total cap (raise SizeGuards::max_total_buffered_bytes, \
+         or stream the result via the cursor API / --format csv/jsonl)"
+    )]
+    BufferTooLarge { rows_buffered: u64, cap: usize },
+
     #[error("registry error: {0}")]
     RegistryError(String),
 }

@@ -3,7 +3,9 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
+use crate::stream::{channel_stream, BoxRowStream, DEFAULT_CURSOR_CAPACITY};
 use crate::url::DatabaseUrl;
+use crate::value::Row;
 use crate::value::{ColumnInfo, TypeHint, Value};
 use async_trait::async_trait;
 use rusqlite::types::Value as SqliteValue;
@@ -77,6 +79,108 @@ impl AsyncConnection for SqliteConnection {
         })
         .await
         .map_err(|e| SqlError::QueryFailed(e.to_string()))?
+    }
+
+    /// Stream rows from a native `rusqlite` cursor at bounded memory.
+    ///
+    /// `rusqlite` is synchronous, so the row-stepping loop runs on a
+    /// `spawn_blocking` thread that pushes each decoded row through a
+    /// **bounded** `tokio::sync::mpsc` channel (`DEFAULT_CURSOR_CAPACITY`
+    /// rows). When the channel fills, the producer blocks on
+    /// `blocking_send`, so at most that many rows are buffered ahead of
+    /// the consumer — peak memory is `O(cap)`, never `O(total rows)`.
+    /// Column metadata is delivered up front through a oneshot so the
+    /// caller has it before pulling any row.
+    async fn query_stream(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<ColumnInfo>, BoxRowStream<'_>), SqlError> {
+        let sql = sql.to_string();
+        let conn = self.conn.clone();
+        let (col_tx, col_rx) = tokio::sync::oneshot::channel::<Result<Vec<ColumnInfo>, SqlError>>();
+        let (row_tx, row_rx) =
+            tokio::sync::mpsc::channel::<Result<Row, SqlError>>(DEFAULT_CURSOR_CAPACITY);
+
+        tokio::task::spawn_blocking(move || {
+            let guard = match conn.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    let _ = col_tx.send(Err(SqlError::QueryFailed(
+                        "SQLite connection mutex poisoned".to_string(),
+                    )));
+                    return;
+                }
+            };
+            let mut stmt = match guard.prepare(&sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = col_tx.send(Err(SqlError::QueryFailed(e.to_string())));
+                    return;
+                }
+            };
+            let col_names = stmt.column_names();
+            if col_names.is_empty() {
+                let _ = col_tx.send(Err(SqlError::QueryFailed(
+                    "Statement does not return rows".to_string(),
+                )));
+                return;
+            }
+            let columns: Vec<ColumnInfo> = col_names
+                .iter()
+                .map(|name| ColumnInfo {
+                    name: name.to_string(),
+                    type_hint: TypeHint::Other,
+                    nullable: true,
+                })
+                .collect();
+            let ncols = columns.len();
+            // Send columns first; if the consumer already hung up, stop.
+            if col_tx.send(Ok(columns)).is_err() {
+                return;
+            }
+
+            let mut rows_iter = match stmt.query([]) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = row_tx.blocking_send(Err(SqlError::QueryFailed(e.to_string())));
+                    return;
+                }
+            };
+            loop {
+                match rows_iter.next() {
+                    Ok(Some(row)) => {
+                        let mut values = Vec::with_capacity(ncols);
+                        let mut decode_err = None;
+                        for i in 0..ncols {
+                            match row.get::<_, SqliteValue>(i) {
+                                Ok(val) => values.push(sqlite_to_value(val)),
+                                Err(e) => {
+                                    decode_err = Some(SqlError::QueryFailed(e.to_string()));
+                                    break;
+                                }
+                            }
+                        }
+                        let msg = decode_err.map_or(Ok(values), Err);
+                        // blocking_send applies back-pressure: it parks
+                        // this thread until the consumer drains a slot.
+                        if row_tx.blocking_send(msg).is_err() {
+                            // Consumer dropped the cursor; stop stepping.
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = row_tx.blocking_send(Err(SqlError::QueryFailed(e.to_string())));
+                        return;
+                    }
+                }
+            }
+        });
+
+        let columns = col_rx
+            .await
+            .map_err(|_| SqlError::QueryFailed("SQLite cursor producer dropped".to_string()))??;
+        Ok((columns, channel_stream(row_rx)))
     }
 
     // execute_multi uses the default impl: tries query(), falls back to execute()
@@ -654,6 +758,230 @@ mod tests {
             fks[0].parent_columns,
             vec!["a".to_string(), "b".to_string()]
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- #65 streaming cursor: bounded-memory reads (no container) ---
+
+    /// Stream a large synthetic result through `query_cursor` in small
+    /// fixed batches and assert the cursor pulls **batch-at-a-time** —
+    /// every batch is `<= batch_size`, the batch count is exactly
+    /// `ceil(total / batch_size)`, and the row total is exact. A full
+    /// materialization (`query`) would instead buffer all rows at once;
+    /// this proves the cursor never does, so peak in-flight memory is
+    /// `O(batch + channel cap)`, not `O(total rows)`.
+    #[test]
+    fn test_sqlite_cursor_streams_in_bounded_batches() {
+        let (mut conn, path) = fresh_conn();
+        const TOTAL: i64 = 250_000;
+        const BATCH: usize = 128;
+        let cte = format!(
+            "WITH RECURSIVE seq(i) AS (\
+                 SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < {TOTAL}\
+             ) SELECT i, i * 2 AS doubled FROM seq"
+        );
+        let mut cursor = conn.query_cursor(&cte).expect("open cursor");
+        assert_eq!(cursor.columns().len(), 2, "two projected columns");
+
+        let mut total: u64 = 0;
+        let mut batches: u64 = 0;
+        let mut max_batch_len = 0usize;
+        loop {
+            let batch = cursor.next_batch(BATCH).expect("pull batch");
+            if batch.is_empty() {
+                break;
+            }
+            assert!(
+                batch.len() <= BATCH,
+                "a streamed batch ({}) must never exceed the requested size {}",
+                batch.len(),
+                BATCH
+            );
+            max_batch_len = max_batch_len.max(batch.len());
+            total += batch.len() as u64;
+            batches += 1;
+        }
+        assert_eq!(total, TOTAL as u64, "streamed every row exactly once");
+        assert!(
+            max_batch_len <= BATCH,
+            "peak in-flight batch stayed bounded by batch size"
+        );
+        let expected_batches = (TOTAL as u64).div_ceil(BATCH as u64);
+        assert_eq!(
+            batches, expected_batches,
+            "exactly ceil(total/batch) batches — proves batch-at-a-time, not full buffering"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Streaming a result whose every row carries a wide payload at a
+    /// tiny batch size completes without buffering the whole thing.
+    /// 100k rows x ~4 KiB would be ~400 MiB if materialized; the cursor
+    /// holds at most `batch + channel-cap` rows, so this stays bounded.
+    #[test]
+    fn test_sqlite_cursor_wide_rows_stay_bounded() {
+        let (mut conn, path) = fresh_conn();
+        const TOTAL: i64 = 100_000;
+        // Each row interpolates a ~4 KiB text payload.
+        let cte = format!(
+            "WITH RECURSIVE seq(i) AS (\
+                 SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < {TOTAL}\
+             ) SELECT i, printf('%.*c', 4096, 'x') AS payload FROM seq"
+        );
+        let cursor = conn.query_cursor(&cte).expect("open cursor");
+        let mut count: u64 = 0;
+        for row in cursor {
+            let row = row.expect("row ok");
+            assert_eq!(row.len(), 2);
+            // Confirm the wide payload actually rode through the stream.
+            if let Value::String(ref payload) = row[1] {
+                assert_eq!(payload.len(), 4096);
+            } else {
+                panic!("payload column should be a String");
+            }
+            count += 1;
+        }
+        assert_eq!(count, TOTAL as u64, "iterator drained every wide row");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The eager `query` and the streaming cursor return identical data
+    /// for a modest result, so the cursor is a drop-in for ingestion.
+    #[test]
+    fn test_sqlite_cursor_matches_eager_query() {
+        let (mut conn, path) = fresh_conn();
+        seed_test_users(&mut conn);
+        let eager = conn
+            .query("SELECT id, name, age FROM test_users ORDER BY id")
+            .expect("eager query");
+        let streamed: Vec<crate::value::Row> = conn
+            .query_cursor("SELECT id, name, age FROM test_users ORDER BY id")
+            .expect("cursor")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect streamed rows");
+        assert_eq!(eager.rows, streamed, "cursor data == eager data");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `next_batch(0)` is a no-op that returns an empty batch without
+    /// advancing the cursor; the next real pull still sees row 0.
+    #[test]
+    fn test_sqlite_cursor_next_batch_zero_is_noop() {
+        let (mut conn, path) = fresh_conn();
+        seed_test_users(&mut conn);
+        let mut cursor = conn
+            .query_cursor("SELECT id FROM test_users ORDER BY id")
+            .expect("cursor");
+        assert!(cursor.next_batch(0).expect("zero batch").is_empty());
+        let first = cursor.next_batch(1).expect("first row");
+        assert_eq!(first.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- #91 size guards: fail fast instead of OOM (no container) ---
+
+    /// An oversized cell trips the `max_cell_bytes` guard on the eager
+    /// `query` path and fails fast with a structured
+    /// [`SqlError::CellTooLarge`] naming the offending column and cap —
+    /// rather than materializing the giant value into the result `Vec`.
+    #[test]
+    fn test_sqlite_query_cell_guard_fails_fast() {
+        let (mut conn, path) = fresh_conn();
+        conn.set_size_guards(crate::SizeGuards {
+            max_cell_bytes: 1024,
+            max_row_bytes: 0,
+            max_total_buffered_bytes: 0,
+        });
+        // A single ~8 KiB text cell, well over the 1 KiB cell cap.
+        let err = conn
+            .query("SELECT printf('%.*c', 8192, 'x') AS big")
+            .expect_err("oversized cell must fail fast, not OOM");
+        match err {
+            SqlError::CellTooLarge {
+                column, size, cap, ..
+            } => {
+                assert_eq!(column, "big");
+                assert_eq!(size, 8192);
+                assert_eq!(cap, 1024);
+            }
+            other => panic!("expected CellTooLarge, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same `max_cell_bytes` guard fires on the **streaming** path:
+    /// pulling an oversized cell through the cursor yields a structured
+    /// error item, so a pathological row cannot OOM a streaming ingest.
+    #[test]
+    fn test_sqlite_cursor_cell_guard_fails_fast() {
+        let (mut conn, path) = fresh_conn();
+        conn.set_size_guards(crate::SizeGuards {
+            max_cell_bytes: 1024,
+            max_row_bytes: 0,
+            max_total_buffered_bytes: 0,
+        });
+        let mut cursor = conn
+            .query_cursor("SELECT printf('%.*c', 8192, 'x') AS big")
+            .expect("cursor opens (guard fires per-row, not at open)");
+        let err = cursor
+            .next_batch(1)
+            .expect_err("streamed oversized cell must fail fast");
+        assert!(matches!(err, SqlError::CellTooLarge { ref column, .. } if column == "big"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The `max_total_buffered_bytes` guard caps the eager `query`'s
+    /// running tally: a result whose summed row bytes cross the cap
+    /// aborts with [`SqlError::BufferTooLarge`] instead of buffering an
+    /// unbounded `Vec<Row>`. This is the guard the CLI eager table path
+    /// relies on so a huge table is not collected whole.
+    #[test]
+    fn test_sqlite_query_total_buffer_guard_fails_fast() {
+        let (mut conn, path) = fresh_conn();
+        // 10k rows x ~256 bytes ~= 2.5 MiB; cap at 64 KiB so it trips
+        // partway through without ever buffering the full result.
+        conn.set_size_guards(crate::SizeGuards {
+            max_cell_bytes: 0,
+            max_row_bytes: 0,
+            max_total_buffered_bytes: 64 * 1024,
+        });
+        let cte = "WITH RECURSIVE seq(i) AS (\
+                       SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 10000\
+                   ) SELECT i, printf('%.*c', 256, 'y') AS pad FROM seq";
+        let err = conn
+            .query(cte)
+            .expect_err("total-buffer cap must trip before full materialization");
+        match err {
+            SqlError::BufferTooLarge { rows_buffered, cap } => {
+                assert_eq!(cap, 64 * 1024);
+                assert!(
+                    rows_buffered < 10_000,
+                    "guard tripped before buffering all rows ({rows_buffered})"
+                );
+            }
+            other => panic!("expected BufferTooLarge, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The **streaming** cursor is bounded by construction and so does
+    /// **not** apply the total-buffer cap — the same huge synthetic
+    /// result that trips the eager `query` total cap streams to
+    /// completion through the cursor under those guards.
+    #[test]
+    fn test_sqlite_cursor_ignores_total_buffer_cap() {
+        let (mut conn, path) = fresh_conn();
+        conn.set_size_guards(crate::SizeGuards {
+            max_cell_bytes: 0,
+            max_row_bytes: 0,
+            max_total_buffered_bytes: 64 * 1024,
+        });
+        let cte = "WITH RECURSIVE seq(i) AS (\
+                       SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 10000\
+                   ) SELECT i, printf('%.*c', 256, 'y') AS pad FROM seq";
+        let cursor = conn.query_cursor(cte).expect("cursor");
+        let count = cursor.into_iter().filter(|r| r.is_ok()).count();
+        assert_eq!(count, 10_000, "cursor streams past the total-buffer cap");
         let _ = std::fs::remove_file(&path);
     }
 }

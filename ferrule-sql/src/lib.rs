@@ -19,14 +19,17 @@ pub mod connection;
 pub mod copy;
 pub mod dialect;
 pub mod error;
+pub mod guard;
 pub mod proxy;
 pub mod query_builder;
 pub mod render;
+pub mod stream;
 pub mod sync;
 pub mod transaction;
 pub mod tunnel;
 pub mod url;
 pub mod value;
+pub mod write;
 
 /// Per-backend driver modules, one feature-gated submodule per backend.
 ///
@@ -52,9 +55,11 @@ pub use copy::{
 };
 pub use dialect::Dialect;
 pub use error::SqlError;
+pub use guard::SizeGuards;
 pub use proxy::{is_no_proxy, resolve_proxy_from_env, ProxiedConnection, ProxyConfig};
 pub use query_builder::apply_paging;
 pub use render::{quote_string, render_value};
+pub use stream::{BoxRowStream, RowCursor, DEFAULT_CURSOR_CAPACITY};
 pub use sync::SyncConnection;
 pub use transaction::{begin_transaction, commit_transaction, rollback_transaction};
 pub use tunnel::SshConfig;
@@ -65,3 +70,7 @@ pub use tunnel::{
 };
 pub use url::DatabaseUrl;
 pub use value::{ColumnInfo, Row, TypeHint, Value};
+pub use write::{
+    write_rows, BatchOutcome, RejectedBatch, RejectedRow, WriteMode, WriteOptions, WriteReport,
+    DEFAULT_WRITE_BATCH,
+};

@@ -1,4 +1,6 @@
 use crate::error::SqlError;
+use crate::guard::SizeGuards;
+use crate::stream::{BoxRowStream, RowCursor};
 use crate::value::{ColumnInfo, Row};
 use async_trait::async_trait;
 use secrecy::SecretString;
@@ -119,6 +121,22 @@ pub trait AsyncConnection: Send {
     /// Execute a SELECT-like query and return rows.
     async fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError>;
 
+    /// Open a native server-side cursor for `sql` and return the column
+    /// metadata plus a back-pressured stream of decoded rows.
+    ///
+    /// Unlike [`query`](Self::query) this does **not** buffer the result:
+    /// the returned [`BoxRowStream`] pulls rows from the driver's native
+    /// cursor (`tokio-postgres` `query_raw`, `mysql_async` `query_iter`,
+    /// `tiberius` `QueryStream`, or a `spawn_blocking` row-stepping
+    /// producer feeding a bounded channel for `rusqlite` / `oracle`) only
+    /// as the consumer advances it, so peak memory stays bounded. The
+    /// stream borrows `self` for the async backends, which is why the
+    /// public cursor API holds the connection for the cursor's lifetime.
+    async fn query_stream(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<ColumnInfo>, BoxRowStream<'_>), SqlError>;
+
     /// Execute one or more statements.
     ///
     /// The default implementation tries `query()` first, then falls back to
@@ -204,10 +222,14 @@ pub trait AsyncConnection: Send {
 /// implementation detail — it never surfaces in the public API. SQLite
 /// and Oracle are natively synchronous and call straight through.
 ///
-/// **Memory model.** These methods buffer the full result set in memory
-/// (the `Vec<Row>` inside [`QueryResult`]); they are not a streaming
-/// cursor. Bounded-memory streaming reads land in a later wave behind a
-/// separate cursor API.
+/// **Memory model.** [`query`](Self::query) buffers the full result set
+/// in memory (the `Vec<Row>` inside [`QueryResult`]) but is bounded by
+/// the connection's [`SizeGuards`](crate::SizeGuards): an oversized
+/// cell/row or a result past the total cap fails fast with a structured
+/// error instead of OOMing. For an unbounded result use
+/// [`query_cursor`](Self::query_cursor), which streams from a native
+/// database cursor at `O(batch)` memory and never buffers the whole
+/// result.
 ///
 /// **Reentrancy.** Because the private runtime is current-thread, do not
 /// call these methods from inside another `block_on` on the same thread
@@ -222,6 +244,38 @@ pub trait Connection: Send {
     /// Execute a SELECT-like query and return all rows. Blocks until the
     /// full result set is buffered in memory.
     fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError>;
+
+    /// Open a streaming read cursor for `sql`, returning a [`RowCursor`]
+    /// that pulls rows from a native database cursor at bounded memory.
+    ///
+    /// Use this — not [`query`](Self::query) — to ingest a large result
+    /// under a fixed memory budget: the cursor never materializes the
+    /// whole result, and it applies the connection's per-cell / per-row
+    /// [`SizeGuards`](crate::SizeGuards) as each row is decoded. The
+    /// returned cursor borrows the connection for its
+    /// lifetime (the async drivers' row stream is tied to the connection
+    /// handle), so the connection cannot be used for another statement
+    /// until the cursor is dropped. Blocks on each batch; see
+    /// [`RowCursor`] for the bounded-memory and reentrancy contract.
+    fn query_cursor(&mut self, sql: &str) -> Result<RowCursor<'_>, SqlError>;
+
+    /// The size guards currently applied to this connection's reads
+    /// (per-cell, per-row, per-result byte caps). The default
+    /// implementation reports [`SizeGuards::default`]; the concrete
+    /// [`SyncConnection`](crate::sync::SyncConnection) tracks the real
+    /// configured value.
+    fn size_guards(&self) -> SizeGuards {
+        SizeGuards::default()
+    }
+
+    /// Install new size guards for subsequent reads. Lets a host raise or
+    /// lower the per-cell / per-row / per-result caps (e.g. the CLI
+    /// wiring its `[limits]` config). The default implementation is a
+    /// no-op for wrappers that hold no guard state; the concrete
+    /// [`SyncConnection`](crate::sync::SyncConnection) stores it.
+    fn set_size_guards(&mut self, guards: SizeGuards) {
+        let _ = guards;
+    }
 
     /// Execute one or more statements, one result per statement. Backends
     /// that natively support multi-resultsets (Postgres, MSSQL) split the
@@ -273,6 +327,15 @@ impl Connection for Box<dyn Connection> {
     }
     fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
         (**self).query(sql)
+    }
+    fn query_cursor(&mut self, sql: &str) -> Result<RowCursor<'_>, SqlError> {
+        (**self).query_cursor(sql)
+    }
+    fn size_guards(&self) -> SizeGuards {
+        (**self).size_guards()
+    }
+    fn set_size_guards(&mut self, guards: SizeGuards) {
+        (**self).set_size_guards(guards)
     }
     fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
         (**self).execute_multi(sql)

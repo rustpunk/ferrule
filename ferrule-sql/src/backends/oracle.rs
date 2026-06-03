@@ -3,8 +3,9 @@ use crate::connection::{
     StatementResult,
 };
 use crate::error::SqlError;
+use crate::stream::{channel_stream, BoxRowStream, DEFAULT_CURSOR_CAPACITY};
 use crate::url::DatabaseUrl;
-use crate::value::{ColumnInfo, TypeHint, Value};
+use crate::value::{ColumnInfo, Row, TypeHint, Value};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use oracle::sql_type::ToSql;
@@ -76,6 +77,78 @@ impl AsyncConnection for OracleConnection {
         })
         .await
         .map_err(|e| SqlError::QueryFailed(e.to_string()))?
+    }
+
+    /// Stream rows from an Oracle (ODPI-C) result set at bounded memory.
+    ///
+    /// The `oracle` crate is a synchronous C-FFI driver, so the
+    /// row-iteration loop runs on a `spawn_blocking` thread that pushes
+    /// each decoded row through a **bounded** `tokio::sync::mpsc` channel
+    /// (`DEFAULT_CURSOR_CAPACITY` rows). When the channel fills the
+    /// producer blocks on `blocking_send`, so peak memory is `O(cap)`,
+    /// never `O(total rows)`. Column metadata is delivered up front via a
+    /// oneshot so the caller has it before pulling any row.
+    async fn query_stream(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<ColumnInfo>, BoxRowStream<'_>), SqlError> {
+        let sql = sql.to_string();
+        let conn = self.conn.clone();
+        let (col_tx, col_rx) = tokio::sync::oneshot::channel::<Result<Vec<ColumnInfo>, SqlError>>();
+        let (row_tx, row_rx) =
+            tokio::sync::mpsc::channel::<Result<Row, SqlError>>(DEFAULT_CURSOR_CAPACITY);
+
+        tokio::task::spawn_blocking(move || {
+            let result_set = match conn.query(&sql, &[]) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    let _ = col_tx.send(Err(SqlError::QueryFailed(e.to_string())));
+                    return;
+                }
+            };
+            let columns: Vec<ColumnInfo> = result_set
+                .column_info()
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.name().to_string(),
+                    type_hint: oracle_type_to_hint(c.oracle_type()),
+                    nullable: c.nullable(),
+                })
+                .collect();
+            if col_tx.send(Ok(columns)).is_err() {
+                return;
+            }
+
+            for row_result in result_set {
+                let msg = match row_result {
+                    Ok(row) => {
+                        let values: Row = row
+                            .sql_values()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, sql_val)| {
+                                oracle_to_value(sql_val, row.column_info()[i].oracle_type())
+                            })
+                            .collect();
+                        Ok(values)
+                    }
+                    Err(e) => Err(SqlError::QueryFailed(e.to_string())),
+                };
+                let is_err = msg.is_err();
+                // blocking_send back-pressures the producer thread.
+                if row_tx.blocking_send(msg).is_err() {
+                    return;
+                }
+                if is_err {
+                    return;
+                }
+            }
+        });
+
+        let columns = col_rx
+            .await
+            .map_err(|_| SqlError::QueryFailed("Oracle cursor producer dropped".to_string()))??;
+        Ok((columns, channel_stream(row_rx)))
     }
 
     async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
