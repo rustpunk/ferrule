@@ -51,7 +51,7 @@ impl Default for DumpOptions {
 }
 
 /// Dump an entire table using server‑side paging.
-pub async fn dump_table(
+pub fn dump_table(
     conn: &mut dyn Connection,
     table: &str,
     backend: Backend,
@@ -64,13 +64,13 @@ pub async fn dump_table(
     // ORDER BY must come *before* apply_paging in dump_query — else
     // the LIMIT/OFFSET would slot between SELECT and ORDER BY.
     let sql = if opts.deterministic && opts.format == DumpFormat::Sql {
-        let pks = conn.primary_key(opts.schema.as_deref(), table).await?;
+        let pks = conn.primary_key(opts.schema.as_deref(), table)?;
         let order_cols: Vec<String> = if pks.is_empty() {
             eprintln!(
                 "[ferrule] note: table '{table}' has no PRIMARY KEY; \
                  sorting by all columns (slower)."
             );
-            let described = conn.describe_table(opts.schema.as_deref(), table).await?;
+            let described = conn.describe_table(opts.schema.as_deref(), table)?;
             let mut names: Vec<String> = described.columns.iter().map(|c| c.name.clone()).collect();
             names.sort();
             names
@@ -83,14 +83,14 @@ pub async fn dump_table(
         format!("SELECT * FROM {quoted_table}")
     };
 
-    dump_query(conn, &sql, backend, opts, Some(table)).await
+    dump_query(conn, &sql, backend, opts, Some(table))
 }
 
 /// Dump the results of an arbitrary SELECT query.
 ///
 /// Rows are fetched in paged batches and formatted incrementally so the
 /// entire result set never has to reside in memory at once.
-pub async fn dump_query(
+pub fn dump_query(
     conn: &mut dyn Connection,
     sql: &str,
     backend: Backend,
@@ -131,7 +131,7 @@ pub async fn dump_query(
                         Some(offset),
                         backend,
                     )?;
-                    let page = conn.query(&paged).await?;
+                    let page = conn.query(&paged)?;
 
                     if first_page {
                         if !page.columns.is_empty() {
@@ -178,7 +178,7 @@ pub async fn dump_query(
                     Some(offset),
                     backend,
                 )?;
-                let page = conn.query(&paged).await?;
+                let page = conn.query(&paged)?;
 
                 if first_page {
                     if !page.columns.is_empty() {
@@ -229,7 +229,7 @@ pub async fn dump_query(
                     Some(offset),
                     backend,
                 )?;
-                let page = conn.query(&paged).await?;
+                let page = conn.query(&paged)?;
 
                 if first_page {
                     if !page.columns.is_empty() {
@@ -390,7 +390,6 @@ mod tests {
     #[cfg(feature = "sqlite")]
     mod sqlite_dump_tests {
         use super::*;
-        use ferrule_sql::backends::sqlite::connect as sqlite_connect;
         use ferrule_sql::ConnectOptions;
         use ferrule_sql::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -403,32 +402,23 @@ mod tests {
             std::env::temp_dir().join(format!("ferrule-dump-test-{pid}-{n}-{suffix}.db"))
         }
 
-        async fn open_sqlite(
-            path: &std::path::Path,
-        ) -> ferrule_sql::backends::sqlite::SqliteConnection {
+        fn open_sqlite(path: &std::path::Path) -> Box<dyn ferrule_sql::Connection> {
             let _ = std::fs::remove_file(path);
             let url = DatabaseUrl::parse(&format!("sqlite://{}", path.display())).unwrap();
-            sqlite_connect(&url, &ConnectOptions::default())
-                .await
-                .unwrap()
+            ferrule_sql::connect(&url, &ConnectOptions::default(), None).unwrap()
         }
 
-        #[tokio::test]
-        async fn dump_twice_byte_equal() {
+        #[test]
+        fn dump_twice_byte_equal() {
             let path = tmp_path("twice");
-            let mut conn = open_sqlite(&path).await;
+            let mut conn = open_sqlite(&path);
             conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-                .await
                 .unwrap();
             // Insert out of PK order.
-            conn.execute("INSERT INTO users VALUES (2, 'Bob')")
-                .await
-                .unwrap();
+            conn.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
             conn.execute("INSERT INTO users VALUES (1, 'Alice')")
-                .await
                 .unwrap();
             conn.execute("INSERT INTO users VALUES (3, 'Carol')")
-                .await
                 .unwrap();
 
             let opts = DumpOptions {
@@ -436,12 +426,8 @@ mod tests {
                 deterministic: true,
                 ..Default::default()
             };
-            let out1 = dump_table(&mut conn, "users", Backend::Sqlite, &opts)
-                .await
-                .unwrap();
-            let out2 = dump_table(&mut conn, "users", Backend::Sqlite, &opts)
-                .await
-                .unwrap();
+            let out1 = dump_table(&mut conn, "users", Backend::Sqlite, &opts).unwrap();
+            let out2 = dump_table(&mut conn, "users", Backend::Sqlite, &opts).unwrap();
             assert_eq!(out1, out2, "deterministic dump not byte-equal");
             assert_eq!(
                 out1.matches("INSERT INTO").count(),
@@ -457,79 +443,56 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
 
-        #[tokio::test]
-        async fn dump_stable_across_insertion_order() {
+        #[test]
+        fn dump_stable_across_insertion_order() {
             let path_a = tmp_path("stable-a");
             let path_b = tmp_path("stable-b");
-            let mut a = open_sqlite(&path_a).await;
-            let mut b = open_sqlite(&path_b).await;
+            let mut a = open_sqlite(&path_a);
+            let mut b = open_sqlite(&path_b);
 
             a.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-                .await
                 .unwrap();
             b.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-                .await
                 .unwrap();
             // a: 1, 2, 3
-            a.execute("INSERT INTO users VALUES (1, 'Alice')")
-                .await
-                .unwrap();
-            a.execute("INSERT INTO users VALUES (2, 'Bob')")
-                .await
-                .unwrap();
-            a.execute("INSERT INTO users VALUES (3, 'Carol')")
-                .await
-                .unwrap();
+            a.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+            a.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+            a.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
             // b: 3, 1, 2
-            b.execute("INSERT INTO users VALUES (3, 'Carol')")
-                .await
-                .unwrap();
-            b.execute("INSERT INTO users VALUES (1, 'Alice')")
-                .await
-                .unwrap();
-            b.execute("INSERT INTO users VALUES (2, 'Bob')")
-                .await
-                .unwrap();
+            b.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
+            b.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+            b.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
 
             let opts = DumpOptions {
                 format: DumpFormat::Sql,
                 deterministic: true,
                 ..Default::default()
             };
-            let out_a = dump_table(&mut a, "users", Backend::Sqlite, &opts)
-                .await
-                .unwrap();
-            let out_b = dump_table(&mut b, "users", Backend::Sqlite, &opts)
-                .await
-                .unwrap();
+            let out_a = dump_table(&mut a, "users", Backend::Sqlite, &opts).unwrap();
+            let out_b = dump_table(&mut b, "users", Backend::Sqlite, &opts).unwrap();
             assert_eq!(out_a, out_b);
 
             let _ = std::fs::remove_file(&path_a);
             let _ = std::fs::remove_file(&path_b);
         }
 
-        #[tokio::test]
-        async fn dump_no_pk_warns_and_sorts() {
+        #[test]
+        fn dump_no_pk_warns_and_sorts() {
             let path = tmp_path("nopk");
-            let mut conn = open_sqlite(&path).await;
+            let mut conn = open_sqlite(&path);
             // SQLite "heap-ish" table — no INTEGER PRIMARY KEY. Note
             // that a `WITHOUT ROWID` table would require an explicit
             // PK, so we use a plain heap and confirm primary_key()
             // returns empty.
             conn.execute("CREATE TABLE heap (a INTEGER, b TEXT)")
-                .await
                 .unwrap();
-            let pks = conn.primary_key(None, "heap").await.unwrap();
+            let pks = conn.primary_key(None, "heap").unwrap();
             assert!(pks.is_empty(), "expected no PK for heap, got {pks:?}");
 
-            conn.execute("INSERT INTO heap VALUES (2, 'beta')")
-                .await
-                .unwrap();
+            conn.execute("INSERT INTO heap VALUES (2, 'beta')").unwrap();
             conn.execute("INSERT INTO heap VALUES (1, 'alpha')")
-                .await
                 .unwrap();
             conn.execute("INSERT INTO heap VALUES (3, 'gamma')")
-                .await
                 .unwrap();
 
             let opts = DumpOptions {
@@ -540,29 +503,23 @@ mod tests {
             // Stderr capture is painful in cargo test; the docs/test
             // contract is that the dumps are byte-equal even without
             // a PK.
-            let out1 = dump_table(&mut conn, "heap", Backend::Sqlite, &opts)
-                .await
-                .unwrap();
-            let out2 = dump_table(&mut conn, "heap", Backend::Sqlite, &opts)
-                .await
-                .unwrap();
+            let out1 = dump_table(&mut conn, "heap", Backend::Sqlite, &opts).unwrap();
+            let out2 = dump_table(&mut conn, "heap", Backend::Sqlite, &opts).unwrap();
             assert_eq!(out1, out2);
             assert_eq!(out1.matches("INSERT INTO").count(), 3);
 
             let _ = std::fs::remove_file(&path);
         }
 
-        #[tokio::test]
-        async fn dump_uses_backend_quoting() {
+        #[test]
+        fn dump_uses_backend_quoting() {
             let path = tmp_path("quote");
-            let mut conn = open_sqlite(&path).await;
+            let mut conn = open_sqlite(&path);
             conn.execute(
                 "CREATE TABLE \"weird name\" (\"id\" INTEGER PRIMARY KEY, \"first name\" TEXT)",
             )
-            .await
             .unwrap();
             conn.execute("INSERT INTO \"weird name\" VALUES (1, 'Alice')")
-                .await
                 .unwrap();
 
             let opts = DumpOptions {
@@ -570,9 +527,7 @@ mod tests {
                 deterministic: true,
                 ..Default::default()
             };
-            let out = dump_table(&mut conn, "weird name", Backend::Sqlite, &opts)
-                .await
-                .unwrap();
+            let out = dump_table(&mut conn, "weird name", Backend::Sqlite, &opts).unwrap();
             // SQLite uses ANSI quotes — table and column names must
             // each appear inside double quotes.
             assert!(
@@ -587,11 +542,11 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
 
-        #[tokio::test]
-        async fn dump_deterministic_query_requires_order_by() {
+        #[test]
+        fn dump_deterministic_query_requires_order_by() {
             let path = tmp_path("query-orderby");
-            let mut conn = open_sqlite(&path).await;
-            conn.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
+            let mut conn = open_sqlite(&path);
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
 
             let opts = DumpOptions {
                 format: DumpFormat::Sql,
@@ -607,7 +562,6 @@ mod tests {
                 &opts,
                 Some("dummy"),
             )
-            .await
             .unwrap_err();
             assert!(
                 err.to_string().to_lowercase().contains("order by"),
@@ -622,7 +576,6 @@ mod tests {
                 &opts,
                 Some("dummy"),
             )
-            .await
             .expect("dump_query with ORDER BY should succeed");
 
             let _ = std::fs::remove_file(&path);

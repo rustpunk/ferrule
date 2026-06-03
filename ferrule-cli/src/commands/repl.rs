@@ -17,7 +17,7 @@ pub struct ReplArgs {
     pub conn_flags: ConnectionFlags,
 }
 
-pub async fn run(args: ReplArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: ReplArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     if !std::io::stdin().is_terminal() {
         return Err(CliError::usage("REPL requires an interactive terminal."));
     }
@@ -35,8 +35,7 @@ pub async fn run(args: ReplArgs, global_config: &GlobalConfig) -> Result<(), Cli
         args.output,
         args.conn_flags.clone(),
         global_config,
-    )
-    .await?;
+    )?;
 
     // Override defaults from CLI flags
     repl.state.format = format;
@@ -58,17 +57,10 @@ pub async fn run(args: ReplArgs, global_config: &GlobalConfig) -> Result<(), Cli
     );
     println!("Type \\help for help, \\q to quit.");
 
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        let result = run_repl_loop(&mut repl, &rt);
-        rt.block_on(async move {
-            // Graceful cleanup: ping once more but ignore errors
-            let _ = repl.conn.ping().await;
-        });
-        result
-    })
-    .await
-    .map_err(|e| CliError::usage(format!("REPL task failed: {e}")))??;
+    let result = run_repl_loop(&mut repl);
+    // Graceful cleanup: ping once more but ignore errors.
+    let _ = repl.conn.ping();
+    result?;
 
     Ok(())
 }

@@ -4,7 +4,7 @@ use ferrule_config::profile::GlobalConfig;
 use ferrule_core::formatter::format_result;
 use ferrule_sql::connection::ConnectOptions;
 
-pub async fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);
 
     let total_start = std::time::Instant::now();
@@ -16,8 +16,7 @@ pub async fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(),
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     if args.output.verbose {
@@ -32,8 +31,7 @@ pub async fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(),
             args.conn_flags.insecure,
             None,
             &args.table,
-        )
-        .await?;
+        )?;
         println!("{}", payload);
         return Ok(());
     }
@@ -47,13 +45,12 @@ pub async fn run(args: DescribeArgs, global_config: &GlobalConfig) -> Result<(),
     }
 
     let conn_start = std::time::Instant::now();
-    let mut conn = super::connect_resolved(resolved, &opts).await?;
+    let mut conn = super::connect_resolved(resolved, &opts)?;
     let conn_time = conn_start.elapsed();
 
     let query_start = std::time::Instant::now();
     let result = conn
         .describe_table(None, &args.table)
-        .await
         .map_err(CliError::query)?;
     let query_time = query_start.elapsed();
 

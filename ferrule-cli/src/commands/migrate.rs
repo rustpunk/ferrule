@@ -58,7 +58,7 @@ fn core_err(msg: String) -> CliError {
     CliError::query(ferrule_sql::SqlError::QueryFailed(msg))
 }
 
-pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let resolved = resolve_connection(
         &args.connection,
         args.password,
@@ -66,8 +66,7 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
 
     // Enforce the same `--daemon` + SSH-tunnel incompatibility guard every
     // other command runs, so `migrate --daemon --ssh-tunnel` fails with the
@@ -100,17 +99,14 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
     // back to SQLite semantics (ANSI `LIMIT`, `TEXT` columns).
     let dialect = Dialect::from_scheme(resolved.url.scheme()).unwrap_or(Dialect::Sqlite);
 
-    let conn = super::connect_resolved(resolved, &opts).await?;
+    let conn = super::connect_resolved(resolved, &opts)?;
 
     let mut engine = MigrationEngine::new(conn, args.dir.clone(), dialect);
 
     match args.cmd {
         MigrateCmd::Up => {
-            engine
-                .ensure_migration_table()
-                .await
-                .map_err(CliError::query)?;
-            let pending = engine.pending_migrations().await.map_err(CliError::query)?;
+            engine.ensure_migration_table().map_err(CliError::query)?;
+            let pending = engine.pending_migrations().map_err(CliError::query)?;
             if pending.is_empty() {
                 println!("No pending migrations.");
                 return Ok(());
@@ -118,17 +114,14 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
             println!("Applying {} migration(s)...", pending.len());
             for m in pending {
                 println!("  ↑ {}", m.version);
-                engine.apply_up(&m).await.map_err(CliError::query)?;
+                engine.apply_up(&m).map_err(CliError::query)?;
             }
             println!("Done.");
         }
 
         MigrateCmd::Down => {
-            engine
-                .ensure_migration_table()
-                .await
-                .map_err(CliError::query)?;
-            let applied = engine.last_applied(1).await.map_err(CliError::query)?;
+            engine.ensure_migration_table().map_err(CliError::query)?;
+            let applied = engine.last_applied(1).map_err(CliError::query)?;
             let Some(last) = applied.into_iter().next() else {
                 return Err(core_err("no migrations to roll back".into()));
             };
@@ -140,16 +133,13 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                 )));
             };
             println!("  ↓ {}", file.version);
-            engine.apply_down(&file).await.map_err(CliError::query)?;
+            engine.apply_down(&file).map_err(CliError::query)?;
             println!("Rolled back {}.", file.version);
         }
 
         MigrateCmd::Status => {
-            engine
-                .ensure_migration_table()
-                .await
-                .map_err(CliError::query)?;
-            let applied = engine.applied_versions().await.map_err(CliError::query)?;
+            engine.ensure_migration_table().map_err(CliError::query)?;
+            let applied = engine.applied_versions().map_err(CliError::query)?;
             let up_files = engine.scan_dir(Direction::Up).map_err(CliError::query)?;
             let applied_count = up_files
                 .iter()
@@ -191,11 +181,8 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
         }
 
         MigrateCmd::History => {
-            engine
-                .ensure_migration_table()
-                .await
-                .map_err(CliError::query)?;
-            let applied = engine.all_applied().await.map_err(CliError::query)?;
+            engine.ensure_migration_table().map_err(CliError::query)?;
+            let applied = engine.all_applied().map_err(CliError::query)?;
             if applied.is_empty() {
                 println!("No applied migrations.");
             }
@@ -205,18 +192,12 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
         }
 
         MigrateCmd::Verify => {
-            engine
-                .ensure_migration_table()
-                .await
-                .map_err(CliError::query)?;
-            let applied = engine.all_applied().await.map_err(CliError::query)?;
+            engine.ensure_migration_table().map_err(CliError::query)?;
+            let applied = engine.all_applied().map_err(CliError::query)?;
             // Scan the migrations directory once and compare every applied
             // migration against the checksums already returned above — no
             // per-migration directory re-scan or follow-up SELECT.
-            let drift = engine
-                .verify_applied(&applied)
-                .await
-                .map_err(CliError::query)?;
+            let drift = engine.verify_applied(&applied).map_err(CliError::query)?;
             let drifted: std::collections::HashSet<&str> =
                 drift.iter().map(|d| d.version.as_str()).collect();
             for m in &applied {
@@ -237,16 +218,15 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
             let stem = format!("{}_{}", ts, name);
             let up = args.dir.join(format!("{}.up.sql", stem));
             let down = args.dir.join(format!("{}.down.sql", stem));
-            tokio::fs::create_dir_all(&args.dir)
-                .await
+            std::fs::create_dir_all(&args.dir)
                 .map_err(|e| core_err(format!("cannot create migrations dir: {}", e)))?;
             // Refuse to clobber existing files. Two `create <name>` runs in
-            // the same second collapse to the same stem; `tokio::fs::write`
+            // the same second collapse to the same stem; `std::fs::write`
             // would truncate, silently destroying hand-written SQL in the
             // earlier pair. Check both targets first and error instead.
             for path in [&up, &down] {
-                if tokio::fs::try_exists(path)
-                    .await
+                if path
+                    .try_exists()
                     .map_err(|e| core_err(format!("cannot check {}: {}", path.display(), e)))?
                 {
                     return Err(core_err(format!(
@@ -255,11 +235,9 @@ pub async fn run(args: MigrateArgs, global_config: &GlobalConfig) -> Result<(), 
                     )));
                 }
             }
-            tokio::fs::write(&up, "-- up\n\n")
-                .await
+            std::fs::write(&up, "-- up\n\n")
                 .map_err(|e| core_err(format!("cannot write {}: {}", up.display(), e)))?;
-            tokio::fs::write(&down, "-- down\n\n")
-                .await
+            std::fs::write(&down, "-- down\n\n")
                 .map_err(|e| core_err(format!("cannot write {}: {}", down.display(), e)))?;
             println!("Created {}", up.display());
             println!("Created {}", down.display());

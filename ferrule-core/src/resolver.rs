@@ -39,14 +39,14 @@ pub struct ResolvedConnection {
 /// `ssh_config` is already-merged SSH tunnel configuration (host,
 /// port, user, key_path hint).  `proxy_url` is the optional
 /// `--proxy-url` CLI flag.
-pub async fn resolve_connection(
+pub fn resolve_connection(
     connection: &str,
     password: Option<String>,
     ssh_config: Option<SshConfig>,
     proxy_url: Option<&str>,
     global_config: &ferrule_config::profile::GlobalConfig,
 ) -> Result<ResolvedConnection, SqlError> {
-    let url = resolve_url(connection, password, global_config).await?;
+    let url = resolve_url(connection, password, global_config)?;
     let proxy = resolve_proxy_config(connection, proxy_url, global_config, &url)?;
     // Surface the resolved credential as a standalone secret. It is
     // exactly the URL's password component after the credential stack
@@ -64,7 +64,7 @@ pub async fn resolve_connection(
 
 /// Resolve just the URL (and credential stack) without touching SSH
 /// or proxy.
-async fn resolve_url(
+fn resolve_url(
     connection: &str,
     password: Option<String>,
     global_config: &ferrule_config::profile::GlobalConfig,
@@ -189,8 +189,8 @@ mod tests {
     /// `secret` (for the in-process `ConnectOptions::password` path),
     /// and the two agree. This is the consistency contract the rest of
     /// the credential plumbing relies on.
-    #[tokio::test]
-    async fn url_password_is_surfaced_as_secret() {
+    #[test]
+    fn url_password_is_surfaced_as_secret() {
         let cfg = ferrule_config::profile::GlobalConfig::default();
         let resolved = resolve_connection(
             "postgres://user:url_pw@localhost/db",
@@ -199,7 +199,6 @@ mod tests {
             None,
             &cfg,
         )
-        .await
         .expect("resolve a plain URL");
 
         let secret = resolved.secret.expect("a surfaced secret");
@@ -215,8 +214,8 @@ mod tests {
 
     /// An explicit `--password` overrides the URL component, and that
     /// override is what gets surfaced as `secret`.
-    #[tokio::test]
-    async fn explicit_password_overrides_url_and_is_surfaced() {
+    #[test]
+    fn explicit_password_overrides_url_and_is_surfaced() {
         let cfg = ferrule_config::profile::GlobalConfig::default();
         let resolved = resolve_connection(
             "postgres://user:url_pw@localhost/db",
@@ -225,7 +224,6 @@ mod tests {
             None,
             &cfg,
         )
-        .await
         .expect("resolve with an explicit password");
 
         assert_eq!(
@@ -236,11 +234,10 @@ mod tests {
 
     /// A passwordless URL yields no surfaced secret, so the SQL core
     /// connects without a password (trust/peer auth, local socket).
-    #[tokio::test]
-    async fn passwordless_url_surfaces_no_secret() {
+    #[test]
+    fn passwordless_url_surfaces_no_secret() {
         let cfg = ferrule_config::profile::GlobalConfig::default();
         let resolved = resolve_connection("postgres://user@localhost/db", None, None, None, &cfg)
-            .await
             .expect("resolve a passwordless URL");
         assert!(resolved.secret.is_none());
     }

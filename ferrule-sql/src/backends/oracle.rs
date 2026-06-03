@@ -1,5 +1,5 @@
 use crate::connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
     StatementResult,
 };
 use crate::error::SqlError;
@@ -17,7 +17,7 @@ pub struct OracleConnection {
 }
 
 #[async_trait]
-impl Connection for OracleConnection {
+impl AsyncConnection for OracleConnection {
     async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
         let sql = sql.to_string();
         let conn = self.conn.clone();
@@ -549,7 +549,7 @@ fn parse_uuid_hex(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-pub async fn connect(
+pub(crate) async fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
 ) -> Result<OracleConnection, SqlError> {
@@ -876,54 +876,52 @@ mod tests {
     use crate::url::DatabaseUrl;
     use chrono::NaiveTime;
 
-    async fn try_connect() -> Option<OracleConnection> {
+    fn try_connect() -> Option<Box<dyn crate::Connection>> {
         let raw = std::env::var("ORACLE_TEST_URL").ok()?;
         let url = DatabaseUrl::parse(&raw).ok()?;
-        let conn = connect(&url, &ConnectOptions::default()).await.ok()?;
+        let conn = crate::connect(&url, &ConnectOptions::default(), None).ok()?;
         Some(conn)
     }
 
-    #[tokio::test]
-    async fn test_oracle_connect() {
-        let Some(_conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_connect() {
+        let Some(_conn) = try_connect() else {
             eprintln!("ORACLE_TEST_URL not set or unreachable; skipping test_oracle_connect");
             return;
         };
         println!("Oracle connection established successfully");
     }
 
-    #[tokio::test]
-    async fn test_oracle_ping() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_ping() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("ORACLE_TEST_URL not set or unreachable; skipping test_oracle_ping");
             return;
         };
-        conn.ping().await.expect("ping should succeed");
+        conn.ping().expect("ping should succeed");
     }
 
-    #[tokio::test]
-    async fn test_oracle_query() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_query() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("ORACLE_TEST_URL not set or unreachable; skipping test_oracle_query");
             return;
         };
         let result = conn
             .query("SELECT * FROM test_users")
-            .await
             .expect("query should succeed");
         assert!(!result.columns.is_empty(), "should have columns");
         assert!(!result.rows.is_empty(), "should have rows");
     }
 
-    #[tokio::test]
-    async fn test_oracle_execute() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_execute() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("ORACLE_TEST_URL not set or unreachable; skipping test_oracle_execute");
             return;
         };
         let summary = conn
             .execute("INSERT INTO test_users (name, age) VALUES ('TestUser', 99)")
-            .await
             .expect("execute should succeed");
         assert!(
             summary.rows_affected.is_some_and(|n| n > 0),
@@ -931,16 +929,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_oracle_list_tables() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_list_tables() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("ORACLE_TEST_URL not set or unreachable; skipping test_oracle_list_tables");
             return;
         };
-        let tables = conn
-            .list_tables(None)
-            .await
-            .expect("list_tables should succeed");
+        let tables = conn.list_tables(None).expect("list_tables should succeed");
         assert!(
             tables.iter().any(|t| t.eq_ignore_ascii_case("test_users")),
             "should contain test_users (got: {:?})",
@@ -948,9 +943,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_oracle_describe_table() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_describe_table() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "ORACLE_TEST_URL not set or unreachable; skipping test_oracle_describe_table"
             );
@@ -958,7 +953,6 @@ mod tests {
         };
         let result = conn
             .describe_table(None, "test_users")
-            .await
             .expect("describe_table should succeed");
         assert_eq!(result.columns.len(), 6, "should return 6 metadata columns");
         // Oracle column names from data dictionary are uppercase by default.
@@ -966,15 +960,14 @@ mod tests {
         assert!(!result.columns.is_empty(), "should have describe columns");
     }
 
-    #[tokio::test]
-    async fn test_oracle_type_mapping() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_type_mapping() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("ORACLE_TEST_URL not set or unreachable; skipping test_oracle_type_mapping");
             return;
         };
         let result = conn
             .query("SELECT name, age, score, active, meta FROM test_users WHERE name = 'Alice'")
-            .await
             .expect("query should succeed");
         assert_eq!(result.rows.len(), 1);
         let row = &result.rows[0];
@@ -994,8 +987,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_oracle_missing_client_error() {
+    #[test]
+    fn test_oracle_missing_client_error() {
         if std::env::var("ORACLE_TEST_URL").is_ok() {
             eprintln!(
                 "ORACLE_TEST_URL is set; skipping test_oracle_missing_client_error to avoid \
@@ -1020,12 +1013,10 @@ mod tests {
             return;
         }
         let url = DatabaseUrl::parse("oracle://user:pass@127.0.0.1:1521/XEPDB1").unwrap();
-        let result = connect(&url, &ConnectOptions::default()).await;
-        assert!(
-            result.is_err(),
-            "should fail when Instant Client is missing"
-        );
-        let err = result.unwrap_err().to_string();
+        let err = match crate::connect(&url, &ConnectOptions::default(), None) {
+            Ok(_) => panic!("connect should fail when Instant Client is missing"),
+            Err(e) => e.to_string(),
+        };
         assert!(
             err.contains("Oracle Instant Client not found")
                 || err.contains("DPI-1047")
@@ -1404,9 +1395,9 @@ mod tests {
     /// Round-trip a scratch table via the Oracle bulk path. Skips
     /// when ORACLE_TEST_URL is not set or unreachable. Uses a
     /// per-pid table so concurrent runs do not collide.
-    #[tokio::test]
-    async fn test_oracle_bulk_insert_rows_round_trip() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_bulk_insert_rows_round_trip() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "ORACLE_TEST_URL not set or unreachable; skipping test_oracle_bulk_insert_rows_round_trip"
             );
@@ -1415,7 +1406,7 @@ mod tests {
 
         let pid = std::process::id();
         let table = format!("ferrule_bulk_test_{pid}");
-        let _ = conn.execute(&format!("DROP TABLE {table}")).await;
+        let _ = conn.execute(&format!("DROP TABLE {table}"));
         conn.execute(&format!(
             "CREATE TABLE {table} (\
                id NUMBER(19) NOT NULL, \
@@ -1426,7 +1417,6 @@ mod tests {
                guid RAW(16) NULL\
              )"
         ))
-        .await
         .expect("CREATE TABLE");
 
         let columns = vec![
@@ -1496,7 +1486,6 @@ mod tests {
                 rows: &rows,
                 copy_format: crate::copy::CopyFormat::Text,
             })
-            .await
             .expect("bulk_insert_rows");
         assert_eq!(n, 3);
 
@@ -1504,13 +1493,12 @@ mod tests {
         // generic INSERT path doesn't auto-commit either. Inline test
         // simulates what copy.rs's outer transaction does for
         // --atomic; without it, the rows would not be visible.
-        conn.execute("COMMIT").await.expect("COMMIT");
+        conn.execute("COMMIT").expect("COMMIT");
 
         let result = conn
             .query(&format!(
                 "SELECT id, name, active, score, guid FROM {table} ORDER BY id"
             ))
-            .await
             .expect("read-back query");
         assert_eq!(result.rows.len(), 3);
 
@@ -1531,27 +1519,24 @@ mod tests {
         assert!(matches!(&result.rows[2][3], Value::Null));
         assert!(matches!(&result.rows[2][4], Value::Null));
 
-        let _ = conn.execute(&format!("DROP TABLE {table}")).await;
+        let _ = conn.execute(&format!("DROP TABLE {table}"));
     }
 
-    #[tokio::test]
-    async fn test_oracle_primary_key() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_primary_key() {
+        let Some(mut conn) = try_connect() else {
             eprintln!("Oracle test container not available, skipping test_oracle_primary_key");
             return;
         };
         // The CLAUDE.md seed declares `id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY`.
         // Oracle uppercases unquoted identifiers.
-        let pk = conn
-            .primary_key(None, "test_users")
-            .await
-            .expect("primary_key");
+        let pk = conn.primary_key(None, "test_users").expect("primary_key");
         assert_eq!(pk, vec!["ID".to_string()]);
     }
 
-    #[tokio::test]
-    async fn test_oracle_list_foreign_keys() {
-        let Some(mut conn) = try_connect().await else {
+    #[test]
+    fn test_oracle_list_foreign_keys() {
+        let Some(mut conn) = try_connect() else {
             eprintln!(
                 "Oracle test container not available, skipping test_oracle_list_foreign_keys"
             );
@@ -1559,7 +1544,7 @@ mod tests {
         };
         let pid = std::process::id();
         let child = format!("ferrule_fk_test_orders_{pid}");
-        let _ = conn.execute(&format!("DROP TABLE {child}")).await;
+        let _ = conn.execute(&format!("DROP TABLE {child}"));
         conn.execute(&format!(
             "CREATE TABLE {child} (\
                id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
@@ -1568,13 +1553,9 @@ mod tests {
                  REFERENCES test_users(id) ON DELETE CASCADE\
              )"
         ))
-        .await
         .expect("CREATE TABLE");
 
-        let fks = conn
-            .list_foreign_keys(None)
-            .await
-            .expect("list_foreign_keys");
+        let fks = conn.list_foreign_keys(None).expect("list_foreign_keys");
         let child_upper = child.to_uppercase();
         let matching: Vec<_> = fks
             .iter()
@@ -1591,18 +1572,18 @@ mod tests {
         assert_eq!(fk.parent_columns, vec!["ID".to_string()]);
         assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
 
-        let _ = conn.execute(&format!("DROP TABLE {child}")).await;
+        let _ = conn.execute(&format!("DROP TABLE {child}"));
     }
 
     /// End-to-end `--if-exists skip` then `upsert` round-trip against
     /// Oracle. Exercises the `MERGE … USING (SELECT … FROM dual UNION ALL …)`
     /// codegen (Skip = WHEN NOT MATCHED only; Upsert = full MERGE).
-    #[tokio::test]
-    async fn test_oracle_copy_skip_then_upsert() {
+    #[test]
+    fn test_oracle_copy_skip_then_upsert() {
         use crate::backend::Backend;
         use crate::copy::{copy_rows, CopyOptions, CopySource, IfExists};
 
-        let (Some(mut src), Some(mut dst)) = (try_connect().await, try_connect().await) else {
+        let (Some(mut src), Some(mut dst)) = (try_connect(), try_connect()) else {
             eprintln!(
                 "Oracle test container not available, skipping test_oracle_copy_skip_then_upsert"
             );
@@ -1613,30 +1594,25 @@ mod tests {
         let src_table = format!("ferrule_or_skip_src_{pid}");
         let dst_table = format!("ferrule_or_skip_dst_{pid}");
         // Oracle has no `DROP TABLE IF EXISTS`; best-effort drop then ignore.
-        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+        let _ = src.execute(&format!("DROP TABLE {src_table}"));
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}"));
         src.execute(&format!(
             "CREATE TABLE {src_table} (id NUMBER PRIMARY KEY, name VARCHAR2(64), val NUMBER)"
         ))
-        .await
         .expect("CREATE src");
         dst.execute(&format!(
             "CREATE TABLE {dst_table} (id NUMBER PRIMARY KEY, name VARCHAR2(64), val NUMBER)"
         ))
-        .await
         .expect("CREATE dst");
         src.execute(&format!("INSERT INTO {src_table} VALUES (1, 'new-1', 10)"))
-            .await
             .expect("seed src 1");
         src.execute(&format!("INSERT INTO {src_table} VALUES (2, 'new-2', 20)"))
-            .await
             .expect("seed src 2");
         dst.execute(&format!("INSERT INTO {dst_table} VALUES (1, 'old-1', 99)"))
-            .await
             .expect("seed dst");
         // Oracle has no autocommit on `execute`; flush both connections.
-        src.execute("COMMIT").await.expect("commit src");
-        dst.execute("COMMIT").await.expect("commit dst");
+        src.execute("COMMIT").expect("commit src");
+        dst.execute("COMMIT").expect("commit dst");
 
         // --- Skip ---------------------------------------------------------
         let opts = CopyOptions {
@@ -1648,14 +1624,12 @@ mod tests {
             ..Default::default()
         };
         copy_rows(&mut src, Backend::Oracle, &mut dst, Backend::Oracle, &opts)
-            .await
             .expect("copy_rows skip");
 
         let out = dst
             .query(&format!(
                 "SELECT id, name, val FROM {dst_table} ORDER BY id"
             ))
-            .await
             .expect("verify skip");
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "old-1"));
@@ -1671,14 +1645,12 @@ mod tests {
             ..Default::default()
         };
         copy_rows(&mut src, Backend::Oracle, &mut dst, Backend::Oracle, &opts)
-            .await
             .expect("copy_rows upsert");
 
         let out = dst
             .query(&format!(
                 "SELECT id, name, val FROM {dst_table} ORDER BY id"
             ))
-            .await
             .expect("verify upsert");
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
@@ -1690,7 +1662,7 @@ mod tests {
         }
         assert!(matches!(&out.rows[1][1], Value::String(s) if s == "new-2"));
 
-        let _ = src.execute(&format!("DROP TABLE {src_table}")).await;
-        let _ = dst.execute(&format!("DROP TABLE {dst_table}")).await;
+        let _ = src.execute(&format!("DROP TABLE {src_table}"));
+        let _ = dst.execute(&format!("DROP TABLE {dst_table}"));
     }
 }

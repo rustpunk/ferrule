@@ -3,7 +3,7 @@ use crate::error::CliError;
 use ferrule_config::profile::GlobalConfig;
 use ferrule_config::registry::ConnectionRegistry;
 
-pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), CliError> {
     match args.command {
         ConnCommand::Add { name, url } => {
             let mut registry = ConnectionRegistry::load_default().map_err(CliError::registry)?;
@@ -33,8 +33,7 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
                 conn_flags.ssh_key.as_deref(),
                 conn_flags.proxy_url.as_deref(),
                 _global_config,
-            )
-            .await?;
+            )?;
             super::check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
             let opts = ferrule_sql::connection::ConnectOptions {
                 insecure: conn_flags.insecure,
@@ -43,8 +42,8 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
             if opts.insecure {
                 eprintln!("Warning: --insecure disables TLS certificate verification.");
             }
-            let mut conn = super::connect_resolved(resolved, &opts).await?;
-            conn.ping().await.map_err(CliError::connection)?;
+            let mut conn = super::connect_resolved(resolved, &opts)?;
+            conn.ping().map_err(CliError::connection)?;
             println!("Connection '{}' is alive.", name);
         }
         ConnCommand::SetPassword { name } => {
@@ -55,10 +54,7 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
                 ));
             }
             let prompt = format!("Password for '{}': ", name);
-            let password = tokio::task::spawn_blocking(move || rpassword::prompt_password(prompt))
-                .await
-                .map_err(|e| CliError::usage(format!("Password prompt failed: {e}")))?
-                .map_err(CliError::Io)?;
+            let password = rpassword::prompt_password(prompt).map_err(CliError::Io)?;
             if password.is_empty() {
                 return Err(CliError::usage("Password cannot be empty."));
             }
@@ -79,17 +75,17 @@ pub async fn run(args: ConnArgs, _global_config: &GlobalConfig) -> Result<(), Cl
             println!("Password removed from keyring for '{}'.", name);
         }
         ConnCommand::Start { background } => {
-            crate::daemon::start_daemon(background).await?;
+            crate::daemon::start_daemon(background)?;
         }
         ConnCommand::Stop => {
-            crate::daemon::stop_daemon().await?;
+            crate::daemon::stop_daemon()?;
         }
         ConnCommand::Status => {
-            crate::daemon::daemon_status().await?;
+            crate::daemon::daemon_status()?;
         }
         ConnCommand::Restart => {
-            crate::daemon::stop_daemon().await.ok();
-            crate::daemon::start_daemon(false).await?;
+            crate::daemon::stop_daemon().ok();
+            crate::daemon::start_daemon(false)?;
         }
     }
     Ok(())

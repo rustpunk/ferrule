@@ -54,13 +54,13 @@ pub enum BookmarkCommand {
     },
 }
 
-pub async fn run(args: BookmarkArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: BookmarkArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     match args.command {
         BookmarkCommand::Add {
             name,
             sql,
             connection,
-        } => cmd_add(name, sql, connection).await,
+        } => cmd_add(name, sql, connection),
         BookmarkCommand::List => cmd_list(),
         BookmarkCommand::Run {
             name,
@@ -69,23 +69,20 @@ pub async fn run(args: BookmarkArgs, global_config: &GlobalConfig) -> Result<(),
             edit,
             output,
             conn_flags,
-        } => {
-            cmd_run(
-                name,
-                params,
-                connection,
-                edit,
-                output,
-                conn_flags,
-                global_config,
-            )
-            .await
-        }
-        BookmarkCommand::Delete { name } => cmd_delete(name).await,
+        } => cmd_run(
+            name,
+            params,
+            connection,
+            edit,
+            output,
+            conn_flags,
+            global_config,
+        ),
+        BookmarkCommand::Delete { name } => cmd_delete(name),
     }
 }
 
-async fn cmd_add(name: String, sql: String, connection: Option<String>) -> Result<(), CliError> {
+fn cmd_add(name: String, sql: String, connection: Option<String>) -> Result<(), CliError> {
     let mut store = BookmarkStore::load().map_err(CliError::registry)?;
     store.insert(name.clone(), sql, connection);
     store.save().map_err(CliError::registry)?;
@@ -114,7 +111,7 @@ fn cmd_list() -> Result<(), CliError> {
     Ok(())
 }
 
-async fn cmd_run(
+fn cmd_run(
     name: String,
     params: Vec<String>,
     explicit_connection: Option<String>,
@@ -164,8 +161,7 @@ async fn cmd_run(
         conn_flags.ssh_key.as_deref(),
         conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     check_daemon_ssh_compat(conn_flags.daemon, &resolved)?;
 
     if conn_flags.daemon {
@@ -177,8 +173,7 @@ async fn cmd_run(
             format,
             limit,
             offset,
-        )
-        .await?;
+        )?;
         println!("{}", payload);
         return Ok(());
     }
@@ -194,15 +189,15 @@ async fn cmd_run(
     let backend = Backend::from_scheme(resolved.url.scheme())
         .ok_or_else(|| CliError::usage(format!("Unsupported scheme: {}", resolved.url.scheme())))?;
 
-    let mut conn = connect_resolved(resolved, &opts).await?;
+    let mut conn = connect_resolved(resolved, &opts)?;
 
     let sql = ferrule_sql::apply_paging(&sql, limit, offset, backend).map_err(CliError::query)?;
 
-    let results = match conn.query(&sql).await {
+    let results = match conn.query(&sql) {
         Ok(qr) => vec![StatementResult::Query(qr)],
-        Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql).await {
+        Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql) {
             Ok(summary) => vec![StatementResult::Summary(summary)],
-            Err(_) => conn.execute_multi(&sql).await.map_err(CliError::query)?,
+            Err(_) => conn.execute_multi(&sql).map_err(CliError::query)?,
         },
         Err(e) => return Err(CliError::query(e)),
     };
@@ -236,7 +231,7 @@ async fn cmd_run(
     Ok(())
 }
 
-async fn cmd_delete(name: String) -> Result<(), CliError> {
+fn cmd_delete(name: String) -> Result<(), CliError> {
     let mut store = BookmarkStore::load().map_err(CliError::registry)?;
     store.remove(&name).map_err(CliError::registry)?;
     store.save().map_err(CliError::registry)?;

@@ -254,7 +254,7 @@ impl std::fmt::Debug for CopyOptions {
 
 /// Stream rows from `src` to `dst` per `opts`. Returns the number of
 /// rows inserted into the target.
-pub async fn copy_rows(
+pub fn copy_rows(
     src: &mut dyn Connection,
     src_backend: Backend,
     dst: &mut dyn Connection,
@@ -273,7 +273,7 @@ pub async fn copy_rows(
         ));
     }
 
-    let target_exists = table_exists(dst, &target_table).await?;
+    let target_exists = table_exists(dst, &target_table)?;
 
     if !target_exists && !opts.create_table {
         return Err(SqlError::QueryFailed(format!(
@@ -287,7 +287,7 @@ pub async fn copy_rows(
     // case — fail fast.
     if target_exists
         && opts.if_exists == IfExists::Error
-        && table_has_rows(dst, &target_table, dst_backend).await?
+        && table_has_rows(dst, &target_table, dst_backend)?
     {
         return Err(SqlError::QueryFailed(format!(
             "Target table '{target_table}' already contains rows. \
@@ -312,7 +312,7 @@ pub async fn copy_rows(
     // destination-PK auto-detection and the `--key COL[,COL...]` user
     // override. An empty override means "fall back to PK detection."
     let pk_columns: Vec<String> =
-        resolve_conflict_key(dst, &target_table, opts.if_exists, &opts.conflict_key).await?;
+        resolve_conflict_key(dst, &target_table, opts.if_exists, &opts.conflict_key)?;
 
     // Bulk loaders carry no conflict semantics (PG `COPY` ignores
     // conflicts, MSSQL bulk has no MERGE, MySQL `LOAD DATA` has its
@@ -336,7 +336,7 @@ pub async fn copy_rows(
         Some(0),
         src_backend,
     )?;
-    let first_page = src.query(&first_paged).await?;
+    let first_page = src.query(&first_paged)?;
 
     if first_page.columns.is_empty() {
         return Err(SqlError::QueryFailed(
@@ -380,13 +380,13 @@ pub async fn copy_rows(
             if src_table.is_empty() {
                 Vec::new()
             } else {
-                src.primary_key(None, &src_table).await.unwrap_or_default()
+                src.primary_key(None, &src_table).unwrap_or_default()
             }
         } else {
             Vec::new()
         };
         let ddl = translate_ddl(&target_table, &columns, dst_backend, &preserved_pk);
-        dst.execute(&ddl).await?;
+        dst.execute(&ddl)?;
     }
 
     // --atomic wraps the entire copy in one outer transaction. The
@@ -394,7 +394,7 @@ pub async fn copy_rows(
     // around just the DELETE + first batch (handled inside run_copy)
     // so it does not hold locks / redo / wal for the whole copy.
     let outer_tx_opened = if opts.atomic {
-        begin_transaction(dst, dst_backend).await
+        begin_transaction(dst, dst_backend)
     } else {
         false
     };
@@ -411,18 +411,17 @@ pub async fn copy_rows(
         &pk_columns,
         target_exists,
         first_page.rows,
-    )
-    .await;
+    );
 
     if outer_tx_opened {
         match &result {
             Ok(_) => {
                 // Commit; if commit fails, surface that as the error.
-                commit_transaction(dst, dst_backend).await?;
+                commit_transaction(dst, dst_backend)?;
             }
             Err(_) => {
                 // Best-effort rollback; ignore secondary errors.
-                let _ = rollback_transaction(dst, dst_backend).await;
+                let _ = rollback_transaction(dst, dst_backend);
             }
         }
     } else if result.is_ok() && backend_needs_explicit_commit(dst_backend) {
@@ -434,7 +433,7 @@ pub async fn copy_rows(
         // successful but losing the data. Issue the commit when no
         // outer transaction was opened (the --atomic branch above
         // already handles its own commit).
-        commit_transaction(dst, dst_backend).await?;
+        commit_transaction(dst, dst_backend)?;
     }
 
     result
@@ -449,7 +448,7 @@ pub async fn copy_rows(
 ///
 /// Single insertion point for both PK auto-detection and the (Phase 3)
 /// `--key COL[,COL...]` user override.
-async fn resolve_conflict_key(
+fn resolve_conflict_key(
     dst: &mut dyn Connection,
     target_table: &str,
     if_exists: IfExists,
@@ -461,7 +460,7 @@ async fn resolve_conflict_key(
     if !override_.is_empty() {
         return Ok(override_.to_vec());
     }
-    let pk = dst.primary_key(None, target_table).await?;
+    let pk = dst.primary_key(None, target_table)?;
     if pk.is_empty() {
         return Err(SqlError::QueryFailed(format!(
             "Target table '{target_table}' has no declared primary key — \
@@ -491,7 +490,7 @@ fn backend_needs_explicit_commit(backend: Backend) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_copy(
+fn run_copy(
     src: &mut dyn Connection,
     src_backend: Backend,
     dst: &mut dyn Connection,
@@ -517,7 +516,7 @@ async fn run_copy(
     // first batch lands, so subsequent batches do not hold locks.
     let need_inner_tx = target_exists && opts.if_exists == IfExists::Truncate && !opts.atomic;
     let inner_tx_opened = if need_inner_tx {
-        begin_transaction(dst, dst_backend).await
+        begin_transaction(dst, dst_backend)
     } else {
         false
     };
@@ -534,20 +533,19 @@ async fn run_copy(
         &quoted_table,
         &cols_clause,
         &first_rows,
-    )
-    .await;
+    );
 
     let first_len = match prologue {
         Ok(n) => {
             if inner_tx_opened {
                 // Commit the short truncate txn before continuing.
-                commit_transaction(dst, dst_backend).await?;
+                commit_transaction(dst, dst_backend)?;
             }
             n
         }
         Err(e) => {
             if inner_tx_opened {
-                let _ = rollback_transaction(dst, dst_backend).await;
+                let _ = rollback_transaction(dst, dst_backend);
             }
             return Err(e);
         }
@@ -571,7 +569,7 @@ async fn run_copy(
                 Some(offset),
                 src_backend,
             )?;
-            let page = src.query(&paged).await?;
+            let page = src.query(&paged)?;
             if page.rows.is_empty() {
                 break;
             }
@@ -589,8 +587,7 @@ async fn run_copy(
                 opts.bulk_mode,
                 opts.copy_format,
                 opts.verbose,
-            )
-            .await?;
+            )?;
             total += fetched;
             offset += fetched;
             if let Some(cb) = &opts.progress {
@@ -606,7 +603,7 @@ async fn run_copy(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_truncate_and_first_batch(
+fn run_truncate_and_first_batch(
     dst: &mut dyn Connection,
     dst_backend: Backend,
     opts: &CopyOptions,
@@ -620,7 +617,7 @@ async fn run_truncate_and_first_batch(
 ) -> Result<usize, SqlError> {
     if target_exists && opts.if_exists == IfExists::Truncate {
         let sql = format!("DELETE FROM {quoted_table}");
-        dst.execute(&sql).await?;
+        dst.execute(&sql)?;
     }
     if !first_rows.is_empty() {
         insert_batch(
@@ -636,8 +633,7 @@ async fn run_truncate_and_first_batch(
             opts.bulk_mode,
             opts.copy_format,
             opts.verbose,
-        )
-        .await?;
+        )?;
     }
     Ok(first_rows.len())
 }
@@ -648,7 +644,7 @@ async fn run_truncate_and_first_batch(
 /// (first batch) and the streaming loop, so a single copy never
 /// mixes the two paths within one run.
 #[allow(clippy::too_many_arguments)]
-async fn insert_batch(
+fn insert_batch(
     dst: &mut dyn Connection,
     target_table: &str,
     columns: &[ColumnInfo],
@@ -677,7 +673,7 @@ async fn insert_batch(
             rows,
             copy_format,
         };
-        match dst.bulk_insert_rows(target).await {
+        match dst.bulk_insert_rows(target) {
             Ok(_) => {
                 if verbose {
                     eprintln!(
@@ -717,7 +713,7 @@ async fn insert_batch(
         if_exists,
         pk_columns,
     ) {
-        dst.execute(&sql).await?;
+        dst.execute(&sql)?;
     }
     Ok(())
 }
@@ -1239,12 +1235,12 @@ pub fn translate_type(hint: TypeHint, dst: Backend) -> &'static str {
     }
 }
 
-async fn table_exists(conn: &mut dyn Connection, table: &str) -> Result<bool, SqlError> {
-    let tables = conn.list_tables(None).await?;
+fn table_exists(conn: &mut dyn Connection, table: &str) -> Result<bool, SqlError> {
+    let tables = conn.list_tables(None)?;
     Ok(tables.iter().any(|t| t.eq_ignore_ascii_case(table)))
 }
 
-async fn table_has_rows(
+fn table_has_rows(
     conn: &mut dyn Connection,
     table: &str,
     backend: Backend,
@@ -1256,7 +1252,7 @@ async fn table_has_rows(
         None,
         backend,
     )?;
-    let result = conn.query(&sql).await?;
+    let result = conn.query(&sql)?;
     Ok(!result.rows.is_empty())
 }
 
@@ -1348,13 +1344,13 @@ pub(crate) fn matches_glob(pattern: &str, name: &str) -> bool {
 /// Returns the filtered list in `list_tables` order (alphabetical for
 /// most backends). Caller is expected to feed this into [`topo_sort`]
 /// before issuing copies.
-pub async fn discover_tables(
+pub fn discover_tables(
     src: &mut dyn Connection,
     schema: Option<&str>,
     include: &[String],
     exclude: &[String],
 ) -> Result<Vec<String>, SqlError> {
-    let raw = src.list_tables(schema).await?;
+    let raw = src.list_tables(schema)?;
     Ok(raw
         .into_iter()
         .filter(|t| {
@@ -1478,21 +1474,21 @@ pub fn topo_sort(tables: &[String], fks: &[ForeignKey]) -> Result<Vec<String>, C
 ///
 /// Returns the total number of rows passed through across all tables.
 #[allow(clippy::too_many_arguments)]
-pub async fn copy_all_tables(
+pub fn copy_all_tables(
     src: &mut dyn Connection,
     src_backend: Backend,
     dst: &mut dyn Connection,
     dst_backend: Backend,
     opts: &AllTablesOptions,
 ) -> Result<usize, SqlError> {
-    let tables = discover_tables(src, None, &opts.include, &opts.exclude).await?;
+    let tables = discover_tables(src, None, &opts.include, &opts.exclude)?;
     if tables.is_empty() {
         return Err(SqlError::QueryFailed(
             "copy --all-tables: no tables matched the include/exclude filters.".into(),
         ));
     }
 
-    let fks = src.list_foreign_keys(None).await?;
+    let fks = src.list_foreign_keys(None)?;
     let ordered = match topo_sort(&tables, &fks) {
         Ok(o) => o,
         Err(cycle) if opts.no_fk_check => {
@@ -1532,7 +1528,7 @@ pub async fn copy_all_tables(
             verbose: opts.verbose,
             progress: None,
         };
-        let n = copy_rows(src, src_backend, dst, dst_backend, &per_table).await?;
+        let n = copy_rows(src, src_backend, dst, dst_backend, &per_table)?;
         if opts.verbose {
             eprintln!("[ferrule] [{}/{total_tables}] {table}: {n} rows", idx + 1);
         }
@@ -2181,9 +2177,8 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_sqlite_to_sqlite_round_trip() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_sqlite_to_sqlite_round_trip() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2199,26 +2194,18 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute(
             "CREATE TABLE test_users (id INTEGER, name TEXT, age INTEGER, score REAL, active INTEGER)",
         )
-        .await
         .unwrap();
         src.execute("INSERT INTO test_users VALUES (1, 'Alice', 30, 99.5, 1)")
-            .await
             .unwrap();
         src.execute("INSERT INTO test_users VALUES (2, 'Bob', 25, 88.25, 0)")
-            .await
             .unwrap();
         src.execute("INSERT INTO test_users VALUES (3, 'Carol', 40, NULL, 1)")
-            .await
             .unwrap();
 
         let opts = CopyOptions {
@@ -2235,13 +2222,11 @@ mod tests {
             progress: None,
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_rows");
         assert_eq!(copied, 3);
 
         let out = dst
             .query("SELECT id, name, age, score, active FROM test_users ORDER BY id")
-            .await
             .unwrap();
         assert_eq!(out.rows.len(), 3);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "Alice"));
@@ -2252,9 +2237,8 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_refuses_when_target_non_empty_with_default_strategy() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_refuses_when_target_non_empty_with_default_strategy() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2266,27 +2250,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let url = DatabaseUrl::parse(&format!("sqlite://{}", path.display())).unwrap();
-        let mut src = sqlite_connect(&url, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url, &ConnectOptions::default(), None).unwrap();
         // Open a second connection (sqlite — file path is what matters).
-        let mut dst = sqlite_connect(&url, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut dst = crate::connect(&url, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'existing')")
-            .await
-            .unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'existing')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
             ..Default::default()
         };
         // Same DB on both sides — target table 't' exists with one row.
-        let result = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts).await;
+        let result = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts);
         let err = result.expect_err("copy should refuse non-empty target by default");
         let msg = err.to_string();
         assert!(
@@ -2298,9 +2275,8 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_truncate_replaces_existing_rows() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_truncate_replaces_existing_rows() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2318,28 +2294,16 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
         dst.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
-        dst.execute("INSERT INTO t VALUES (99, 'stale')")
-            .await
-            .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'fresh-1')")
-            .await
-            .unwrap();
-        src.execute("INSERT INTO t VALUES (2, 'fresh-2')")
-            .await
-            .unwrap();
+        dst.execute("INSERT INTO t VALUES (99, 'stale')").unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'fresh-1')").unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'fresh-2')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -2347,14 +2311,10 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_rows");
         assert_eq!(copied, 2);
 
-        let out = dst
-            .query("SELECT id, name FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let out = dst.query("SELECT id, name FROM t ORDER BY id").unwrap();
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "fresh-1"));
         assert!(matches!(&out.rows[1][1], Value::String(s) if s == "fresh-2"));
@@ -2364,9 +2324,8 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_query_with_into_and_create_table() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_query_with_into_and_create_table() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2382,24 +2341,16 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER, active INTEGER)")
-            .await
             .unwrap();
         src.execute("INSERT INTO users VALUES (1, 'Alice', 30, 1)")
-            .await
             .unwrap();
         src.execute("INSERT INTO users VALUES (2, 'Bob', 25, 0)")
-            .await
             .unwrap();
         src.execute("INSERT INTO users VALUES (3, 'Carol', 40, 1)")
-            .await
             .unwrap();
 
         let opts = CopyOptions {
@@ -2411,13 +2362,11 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_rows");
         assert_eq!(copied, 2);
 
         let out = dst
             .query("SELECT id, name FROM active_users ORDER BY id")
-            .await
             .unwrap();
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "Alice"));
@@ -2454,47 +2403,43 @@ mod tests {
             pub behaviour: BulkBehaviour,
         }
 
-        #[async_trait]
         impl Connection for TrackingDst {
-            async fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
-                self.inner.execute(sql).await
+            fn execute(&mut self, sql: &str) -> Result<ExecutionSummary, SqlError> {
+                self.inner.execute(sql)
             }
-            async fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
-                self.inner.query(sql).await
+            fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
+                self.inner.query(sql)
             }
-            async fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
-                self.inner.execute_multi(sql).await
+            fn execute_multi(&mut self, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
+                self.inner.execute_multi(sql)
             }
-            async fn ping(&mut self) -> Result<(), SqlError> {
-                self.inner.ping().await
+            fn ping(&mut self) -> Result<(), SqlError> {
+                self.inner.ping()
             }
-            async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
-                self.inner.list_tables(schema).await
+            fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
+                self.inner.list_tables(schema)
             }
-            async fn describe_table(
+            fn describe_table(
                 &mut self,
                 schema: Option<&str>,
                 table: &str,
             ) -> Result<QueryResult, SqlError> {
-                self.inner.describe_table(schema, table).await
+                self.inner.describe_table(schema, table)
             }
-            async fn primary_key(
+            fn primary_key(
                 &mut self,
                 schema: Option<&str>,
                 table: &str,
             ) -> Result<Vec<String>, SqlError> {
-                self.inner.primary_key(schema, table).await
+                self.inner.primary_key(schema, table)
             }
-            async fn list_foreign_keys(
+            fn list_foreign_keys(
                 &mut self,
                 schema: Option<&str>,
             ) -> Result<Vec<crate::ForeignKey>, SqlError> {
-                self.inner.list_foreign_keys(schema).await
+                self.inner.list_foreign_keys(schema)
             }
-            async fn bulk_insert_rows(
-                &mut self,
-                _target: BulkInsert<'_>,
-            ) -> Result<usize, SqlError> {
+            fn bulk_insert_rows(&mut self, _target: BulkInsert<'_>) -> Result<usize, SqlError> {
                 self.bulk_calls.fetch_add(1, Ordering::SeqCst);
                 match self.behaviour {
                     BulkBehaviour::PanicIfCalled => {
@@ -2509,7 +2454,7 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
-    async fn seed_pair_for_dispatcher_test(
+    fn seed_pair_for_dispatcher_test(
         tag: &str,
     ) -> (
         Box<dyn crate::connection::Connection>,
@@ -2517,7 +2462,6 @@ mod tests {
         std::path::PathBuf,
         std::path::PathBuf,
     ) {
-        use crate::backends::sqlite::connect as sqlite_connect;
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2535,32 +2479,27 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'a')").await.unwrap();
-        src.execute("INSERT INTO t VALUES (2, 'b')").await.unwrap();
-        src.execute("INSERT INTO t VALUES (3, 'c')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        src.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
 
-        (Box::new(src), Box::new(dst), path_a, path_b)
+        (src, dst, path_a, path_b)
     }
 
     /// Off mode must never call the destination's bulk path. The
     /// wrapper panics if it does.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn dispatcher_off_never_invokes_bulk_path() {
+    #[test]
+    fn dispatcher_off_never_invokes_bulk_path() {
         use dispatcher_harness::{BulkBehaviour, TrackingDst};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let (src, dst_inner, path_a, path_b) = seed_pair_for_dispatcher_test("off").await;
+        let (src, dst_inner, path_a, path_b) = seed_pair_for_dispatcher_test("off");
         let bulk_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mut src = src;
         let mut dst = TrackingDst {
@@ -2582,7 +2521,6 @@ mod tests {
             Backend::Sqlite,
             &opts,
         )
-        .await
         .expect("copy_rows");
         assert_eq!(copied, 3);
         assert_eq!(bulk_calls.load(Ordering::SeqCst), 0);
@@ -2594,12 +2532,12 @@ mod tests {
     /// Auto mode tries the bulk path; on BulkUnavailable it falls
     /// back per batch and the rows still land via INSERT.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn dispatcher_auto_falls_back_on_bulk_unavailable() {
+    #[test]
+    fn dispatcher_auto_falls_back_on_bulk_unavailable() {
         use dispatcher_harness::{BulkBehaviour, TrackingDst};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let (src, dst_inner, path_a, path_b) = seed_pair_for_dispatcher_test("auto").await;
+        let (src, dst_inner, path_a, path_b) = seed_pair_for_dispatcher_test("auto");
         let bulk_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mut src = src;
         let mut dst = TrackingDst {
@@ -2624,7 +2562,6 @@ mod tests {
             Backend::Sqlite,
             &opts,
         )
-        .await
         .expect("copy_rows");
         assert_eq!(copied, 3);
         // Both batches attempted the bulk path before falling back.
@@ -2633,7 +2570,6 @@ mod tests {
         let out = dst
             .inner
             .query("SELECT id, name FROM t ORDER BY id")
-            .await
             .unwrap();
         assert_eq!(out.rows.len(), 3);
 
@@ -2644,12 +2580,12 @@ mod tests {
     /// On mode does not fall back: BulkUnavailable becomes a hard
     /// error with `--bulk-native` mentioned in the message.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn dispatcher_on_errors_when_bulk_unavailable() {
+    #[test]
+    fn dispatcher_on_errors_when_bulk_unavailable() {
         use dispatcher_harness::{BulkBehaviour, TrackingDst};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let (src, dst_inner, path_a, path_b) = seed_pair_for_dispatcher_test("on").await;
+        let (src, dst_inner, path_a, path_b) = seed_pair_for_dispatcher_test("on");
         let bulk_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mut src = src;
         let mut dst = TrackingDst {
@@ -2670,8 +2606,7 @@ mod tests {
             &mut dst,
             Backend::Sqlite,
             &opts,
-        )
-        .await;
+        );
         let err = result.expect_err("copy should fail when bulk path unavailable in On mode");
         let msg = err.to_string();
         assert!(
@@ -2689,9 +2624,8 @@ mod tests {
     /// exists are silently dropped; new rows land; existing values on
     /// conflicting rows are preserved.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_skip_preserves_existing_rows() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_skip_preserves_existing_rows() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2709,30 +2643,18 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-            .await
             .unwrap();
         dst.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-            .await
             .unwrap();
         // Destination has id=1 with the "old" value; copy will see
         // id=1 'new-1' from src and id=2 'src-only' (no dest match).
-        dst.execute("INSERT INTO t VALUES (1, 'kept')")
-            .await
-            .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'new-1')")
-            .await
-            .unwrap();
-        src.execute("INSERT INTO t VALUES (2, 'src-only')")
-            .await
-            .unwrap();
+        dst.execute("INSERT INTO t VALUES (1, 'kept')").unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'new-1')").unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'src-only')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -2740,17 +2662,13 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_rows");
         // `copied` reports rows passed through the dispatcher, not
         // rows landed. The destination is the source of truth for
         // the visible effect.
         assert_eq!(copied, 2);
 
-        let out = dst
-            .query("SELECT id, name FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let out = dst.query("SELECT id, name FROM t ORDER BY id").unwrap();
         assert_eq!(out.rows.len(), 2);
         // id=1 keeps the original 'kept' value (skip), id=2 inserted.
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "kept"));
@@ -2766,9 +2684,8 @@ mod tests {
     /// destination is immediately usable as an `--if-exists upsert`
     /// target without a separate `--key` override.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_create_table_preserve_pk_emits_primary_key() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_create_table_preserve_pk_emits_primary_key() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2784,18 +2701,13 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-            .await
             .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'a')").await.unwrap();
-        src.execute("INSERT INTO t VALUES (2, 'b')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -2804,17 +2716,15 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_rows");
         assert_eq!(copied, 2);
 
         // Destination has an `id` PK we can immediately upsert against.
-        let pk = dst.primary_key(None, "t").await.unwrap();
+        let pk = dst.primary_key(None, "t").unwrap();
         assert_eq!(pk, vec!["id".to_string()]);
 
         // Round-trip: upsert a changed source row, expect the destination row to overwrite.
         src.execute("UPDATE t SET name = 'a-upd' WHERE id = 1")
-            .await
             .unwrap();
         let upsert_opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -2828,9 +2738,8 @@ mod tests {
             Backend::Sqlite,
             &upsert_opts,
         )
-        .await
         .expect("upsert");
-        let out = dst.query("SELECT name FROM t WHERE id = 1").await.unwrap();
+        let out = dst.query("SELECT name FROM t WHERE id = 1").unwrap();
         assert!(matches!(&out.rows[0][0], Value::String(s) if s == "a-upd"));
 
         let _ = std::fs::remove_file(&path_a);
@@ -2841,9 +2750,8 @@ mod tests {
     /// falls through to the v1 column-only DDL (best-effort, not
     /// gated). The copy still completes successfully.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_create_table_preserve_pk_falls_through_when_source_lacks_pk() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_create_table_preserve_pk_falls_through_when_source_lacks_pk() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2859,18 +2767,13 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         // No PRIMARY KEY on the source.
         src.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'a')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -2879,12 +2782,11 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_rows");
         assert_eq!(copied, 1);
 
         // Destination created without a PK — fall-through, not failure.
-        let pk = dst.primary_key(None, "t").await.unwrap();
+        let pk = dst.primary_key(None, "t").unwrap();
         assert!(pk.is_empty(), "expected no PK; got {pk:?}");
 
         let _ = std::fs::remove_file(&path_a);
@@ -2894,9 +2796,8 @@ mod tests {
     /// SQLite end-to-end for `--if-exists upsert`: existing rows are
     /// overwritten by the source values; new rows are inserted.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_upsert_overwrites_existing_rows() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_upsert_overwrites_existing_rows() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2912,28 +2813,16 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-            .await
             .unwrap();
         dst.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-            .await
             .unwrap();
-        dst.execute("INSERT INTO t VALUES (1, 'old')")
-            .await
-            .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'new-1')")
-            .await
-            .unwrap();
-        src.execute("INSERT INTO t VALUES (2, 'src-only')")
-            .await
-            .unwrap();
+        dst.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'new-1')").unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'src-only')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -2941,14 +2830,10 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_rows");
         assert_eq!(copied, 2);
 
-        let out = dst
-            .query("SELECT id, name FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let out = dst.query("SELECT id, name FROM t ORDER BY id").unwrap();
         assert_eq!(out.rows.len(), 2);
         // id=1 overwritten to 'new-1' (upsert), id=2 inserted.
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
@@ -2962,9 +2847,8 @@ mod tests {
     /// must hard-error before the source is touched, pointing at the
     /// `--key` override or `--preserve-pk` for the create-table path.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_skip_without_pk_hard_errors() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_skip_without_pk_hard_errors() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2982,21 +2866,15 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
         // No PRIMARY KEY — Skip/Upsert can't pick conflict columns.
         dst.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'a')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -3004,7 +2882,6 @@ mod tests {
             ..Default::default()
         };
         let err = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect_err("expected hard error for no-PK + skip");
         let msg = format!("{err}");
         assert!(
@@ -3028,9 +2905,8 @@ mod tests {
     /// when the destination has no declared PK. Behaviour matches the
     /// PK-driven path: existing rows are upserted, new rows inserted.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_key_override_upserts_against_pk_less_table() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_key_override_upserts_against_pk_less_table() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -3048,29 +2924,17 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         // No PRIMARY KEY on either side; UNIQUE on (id) for the conflict.
         src.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
         dst.execute("CREATE TABLE t (id INTEGER, name TEXT, UNIQUE(id))")
-            .await
             .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'new-1')")
-            .await
-            .unwrap();
-        src.execute("INSERT INTO t VALUES (2, 'src-only')")
-            .await
-            .unwrap();
-        dst.execute("INSERT INTO t VALUES (1, 'old')")
-            .await
-            .unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'new-1')").unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'src-only')").unwrap();
+        dst.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -3079,14 +2943,10 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_rows with --key");
         assert_eq!(copied, 2);
 
-        let out = dst
-            .query("SELECT id, name FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let out = dst.query("SELECT id, name FROM t ORDER BY id").unwrap();
         assert_eq!(out.rows.len(), 2);
         assert!(matches!(&out.rows[0][1], Value::String(s) if s == "new-1"));
         assert!(matches!(&out.rows[1][1], Value::String(s) if s == "src-only"));
@@ -3098,9 +2958,8 @@ mod tests {
     /// `--key` naming a column that isn't in the source SELECT shape
     /// fails fast — before any INSERT runs — with an actionable error.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_key_override_unknown_column_fails_fast() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_key_override_unknown_column_fails_fast() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -3118,20 +2977,14 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
         dst.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
             .unwrap();
-        src.execute("INSERT INTO t VALUES (1, 'a')").await.unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
 
         let opts = CopyOptions {
             source: CopySource::Table("t".into()),
@@ -3140,7 +2993,6 @@ mod tests {
             ..Default::default()
         };
         let err = copy_rows(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect_err("expected error for unknown --key column");
         let msg = format!("{err}");
         assert!(
@@ -3156,9 +3008,8 @@ mod tests {
     /// INSERT path, even under `BulkMode::On` — the bulk loaders
     /// carry no MERGE / ON CONFLICT semantics.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_upsert_forces_generic_path_even_under_bulk_on() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_upsert_forces_generic_path_even_under_bulk_on() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use dispatcher_harness::{BulkBehaviour, TrackingDst};
@@ -3175,15 +3026,10 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let raw_dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let raw_dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         src.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-            .await
             .unwrap();
         // Seed the destination directly (before wrapping) so we keep
         // a single TrackingDst handle for the actual copy. The inner
@@ -3191,24 +3037,14 @@ mod tests {
         // but pass through plain execute()s — but plumbing seed DDL
         // through it adds noise. Seed via a short-lived second
         // connection on the same on-disk file instead.
-        let mut seed_dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut seed_dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
         seed_dst
             .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-            .await
             .unwrap();
-        seed_dst
-            .execute("INSERT INTO t VALUES (1, 'old')")
-            .await
-            .unwrap();
+        seed_dst.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
         drop(seed_dst);
-        src.execute("INSERT INTO t VALUES (1, 'new-1')")
-            .await
-            .unwrap();
-        src.execute("INSERT INTO t VALUES (2, 'src-only')")
-            .await
-            .unwrap();
+        src.execute("INSERT INTO t VALUES (1, 'new-1')").unwrap();
+        src.execute("INSERT INTO t VALUES (2, 'src-only')").unwrap();
 
         let bulk_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mut tracking = TrackingDst {
@@ -3230,7 +3066,6 @@ mod tests {
             Backend::Sqlite,
             &opts,
         )
-        .await
         .expect("copy_rows should succeed under forced-generic path");
         assert_eq!(copied, 2);
         // PanicIfCalled would have aborted if bulk_insert_rows had
@@ -3341,9 +3176,8 @@ mod tests {
     /// (via `--create-table`) after the parent so the FK target
     /// exists when the child rows land.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_all_tables_orders_by_fk_and_copies_everything() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_all_tables_orders_by_fk_and_copies_everything() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -3359,32 +3193,24 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         // Enable FK enforcement on the destination so the test would
         // fail if the load order were wrong (child before parent).
-        dst.execute("PRAGMA foreign_keys = ON").await.unwrap();
+        dst.execute("PRAGMA foreign_keys = ON").unwrap();
 
         src.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-            .await
             .unwrap();
         src.execute(
             "CREATE TABLE orders (id INTEGER PRIMARY KEY, \
                                   user_id INTEGER REFERENCES users(id), \
                                   total REAL)",
         )
-        .await
         .unwrap();
         src.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
-            .await
             .unwrap();
         src.execute("INSERT INTO orders VALUES (1, 1, 9.99), (2, 1, 4.50), (3, 2, 12.00)")
-            .await
             .unwrap();
 
         let opts = AllTablesOptions {
@@ -3392,13 +3218,12 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_all_tables(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_all_tables");
         // 2 users + 3 orders.
         assert_eq!(copied, 5);
 
-        let u = dst.query("SELECT count(*) FROM users").await.unwrap();
-        let o = dst.query("SELECT count(*) FROM orders").await.unwrap();
+        let u = dst.query("SELECT count(*) FROM users").unwrap();
+        let o = dst.query("SELECT count(*) FROM orders").unwrap();
         assert!(matches!(&u.rows[0][0], Value::Int64(2)));
         assert!(matches!(&o.rows[0][0], Value::Int64(3)));
 
@@ -3409,9 +3234,8 @@ mod tests {
     /// `--include` / `--exclude` glob filters: only matched tables
     /// are copied; topo_sort runs over the filtered subset.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_all_tables_respects_include_and_exclude() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_all_tables_respects_include_and_exclude() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -3429,30 +3253,20 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
         // Three independent tables; include `app_*`, exclude `app_logs`.
         src.execute("CREATE TABLE app_users (id INTEGER, name TEXT)")
-            .await
             .unwrap();
         src.execute("CREATE TABLE app_logs (id INTEGER, msg TEXT)")
-            .await
             .unwrap();
-        src.execute("CREATE TABLE other (id INTEGER)")
-            .await
-            .unwrap();
+        src.execute("CREATE TABLE other (id INTEGER)").unwrap();
         src.execute("INSERT INTO app_users VALUES (1, 'A')")
-            .await
             .unwrap();
         src.execute("INSERT INTO app_logs VALUES (1, 'noise')")
-            .await
             .unwrap();
-        src.execute("INSERT INTO other VALUES (1)").await.unwrap();
+        src.execute("INSERT INTO other VALUES (1)").unwrap();
 
         let opts = AllTablesOptions {
             include: vec!["app_*".into()],
@@ -3461,11 +3275,10 @@ mod tests {
             ..Default::default()
         };
         let copied = copy_all_tables(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect("copy_all_tables");
         // Only app_users (1 row) — app_logs excluded, other not in include.
         assert_eq!(copied, 1);
-        let tables = dst.list_tables(None).await.unwrap();
+        let tables = dst.list_tables(None).unwrap();
         assert!(tables.contains(&"app_users".to_string()));
         assert!(!tables.contains(&"app_logs".to_string()));
         assert!(!tables.contains(&"other".to_string()));
@@ -3479,9 +3292,8 @@ mod tests {
     /// may not succeed depending on data; here we just verify the
     /// dispatcher doesn't gate on the cycle).
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn copy_all_tables_rejects_cycle_unless_no_fk_check() {
-        use crate::backends::sqlite::connect as sqlite_connect;
+    #[test]
+    fn copy_all_tables_rejects_cycle_unless_no_fk_check() {
         use crate::connection::ConnectOptions;
         use crate::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -3497,32 +3309,25 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut src = sqlite_connect(&url_a, &ConnectOptions::default())
-            .await
-            .unwrap();
-        let mut dst = sqlite_connect(&url_b, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let mut src = crate::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut dst = crate::connect(&url_b, &ConnectOptions::default(), None).unwrap();
         // FK enforcement OFF on destination so the cyclic test data
         // can land at all.
-        dst.execute("PRAGMA foreign_keys = OFF").await.unwrap();
+        dst.execute("PRAGMA foreign_keys = OFF").unwrap();
 
         // a -> b -> a, a 2-cycle.
         src.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER REFERENCES b(id))")
-            .await
             .unwrap();
         src.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER REFERENCES a(id))")
-            .await
             .unwrap();
-        src.execute("INSERT INTO a VALUES (1, NULL)").await.unwrap();
-        src.execute("INSERT INTO b VALUES (1, NULL)").await.unwrap();
+        src.execute("INSERT INTO a VALUES (1, NULL)").unwrap();
+        src.execute("INSERT INTO b VALUES (1, NULL)").unwrap();
 
         let opts = AllTablesOptions {
             create_table: true,
             ..Default::default()
         };
         let err = copy_all_tables(&mut src, Backend::Sqlite, &mut dst, Backend::Sqlite, &opts)
-            .await
             .expect_err("cycle should hard-error");
         let msg = format!("{err}");
         assert!(msg.contains("foreign-key cycle"), "{msg}");
@@ -3542,7 +3347,6 @@ mod tests {
             Backend::Sqlite,
             &opts_relaxed,
         )
-        .await
         .expect("copy_all_tables with --no-fk-check");
         assert_eq!(copied, 2);
 

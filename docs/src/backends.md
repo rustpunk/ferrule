@@ -19,6 +19,48 @@ To opt into Oracle, build with `cargo install ferrule --features oracle`
 and arrange Instant Client at runtime — see
 [Troubleshooting](troubleshooting.md#oracle-libclntshso-not-found).
 
+## C-free embedding (the `ferrule-sql` core)
+
+The query core lives in the embeddable `ferrule-sql` crate
+(`default = []`, every backend opt-in). Embedders under a
+no-C-build-dependency policy can depend on `ferrule-sql` with
+Postgres + MySQL and link **zero C system libraries**:
+
+```toml
+ferrule-sql = { version = "*", default-features = false, features = ["postgres", "mysql"] }
+```
+
+On that feature set, TLS is rustls pinned to the pure-Rust **`ring`**
+crypto provider — `rustls`, `tokio-rustls`, and `mysql_async` are all
+configured `default-features = false` so the `aws-lc-rs` provider (and
+its cmake/cc `aws-lc-sys` build) never enters the graph; `mysql_async`
+uses `default-rustls-ring`, which also selects `flate2`'s pure-Rust
+`miniz_oxide` backend in place of `libz-sys`.
+
+The **accepted vendored-static floor** is exactly two self-contained
+`cc`-built crates with no system-library linkage: **`ring`** (the rustls
+crypto floor) and **`zstd-sys`** (a hard, non-feature-gated dependency of
+`mysql_common` — its removal is tracked in
+[issue #94](https://github.com/rustpunk/ferrule/issues/94)).
+
+The workspace `deny.toml` **bans** `aws-lc-sys`, `openssl-sys`,
+`native-tls`, and `libz-sys`, and `cargo deny check` enforces it on this
+surface. The two opt-in backends that fall outside the C-free floor are:
+
+- **`sqlite`** — bundles SQLite via a `cc` build (statically linked, no
+  system library), so it is C-free in the no-system-linkage sense but is
+  off the Postgres + MySQL floor above.
+- **`mssql`** — `tiberius` 0.12's stable release only offers `native-tls`,
+  which links the platform OpenSSL; the `mssql` feature therefore links a C
+  system library and is excluded from the `deny.toml` firewall graph.
+- **`oracle`** — needs the external ODPI-C Instant Client at runtime (see
+  above); it is `dlopen`'d, not linked at build time.
+
+The `ssh` tunnel feature is also opt-in; `russh` is pinned to the `ring`
+provider so it stays C-free, but it carries upstream RustSec advisories
+with no in-range fix, so it is excluded from the `deny.toml` graph (see
+the comments in `deny.toml` for the full rationale).
+
 ## PostgreSQL
 
 - Pure Rust; no `libpq` required.

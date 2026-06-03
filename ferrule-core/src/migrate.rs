@@ -59,7 +59,7 @@ impl MigrationEngine {
     /// - **Oracle** — has no `TEXT` type and `IF NOT EXISTS` is
     ///   unsupported pre-23c, so creation runs inside a PL/SQL block
     ///   that swallows ORA-00955 (name already used).
-    pub async fn ensure_migration_table(&mut self) -> Result<(), SqlError> {
+    pub fn ensure_migration_table(&mut self) -> Result<(), SqlError> {
         let sql = match self.dialect {
             Dialect::Sqlite | Dialect::Postgres => {
                 r#"CREATE TABLE IF NOT EXISTS ferrule_migrations (
@@ -101,14 +101,14 @@ END;"#
                     .to_string()
             }
         };
-        self.conn.execute(&sql).await?;
+        self.conn.execute(&sql)?;
         Ok(())
     }
 
     /// Return the list of migrations that have **not** yet been applied,
     /// sorted lexicographically by version.
-    pub async fn pending_migrations(&mut self) -> Result<Vec<MigrationFile>, SqlError> {
-        let applied = self.applied_versions().await?;
+    pub fn pending_migrations(&mut self) -> Result<Vec<MigrationFile>, SqlError> {
+        let applied = self.applied_versions()?;
         let mut pending = self.scan_dir(Direction::Up)?;
         pending.retain(|m| !applied.contains(&m.version));
         Ok(pending)
@@ -124,8 +124,8 @@ END;"#
     /// DDL implicitly commits, so the two steps run best-effort and a
     /// failure in the middle can leave the schema partially applied — see
     /// [`MigrationEngine::apply_atomic`] for the per-dialect details.
-    pub async fn apply_up(&mut self, file: &MigrationFile) -> Result<(), SqlError> {
-        let sql = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
+    pub fn apply_up(&mut self, file: &MigrationFile) -> Result<(), SqlError> {
+        let sql = std::fs::read_to_string(&file.path).map_err(|e| {
             SqlError::QueryFailed(format!(
                 "cannot read migration {}: {}",
                 file.path.display(),
@@ -140,7 +140,7 @@ END;"#
             quote_string(&file.version),
             quote_string(&checksum)
         );
-        self.apply_atomic(&sql, &track).await
+        self.apply_atomic(&sql, &track)
     }
 
     /// Rollback a single migration (`.down.sql`).
@@ -152,8 +152,8 @@ END;"#
     /// schema half-rolled-back while the row still marks the migration
     /// applied. On MySQL and Oracle, DDL implicitly commits, so the two
     /// steps run best-effort — see [`MigrationEngine::apply_atomic`].
-    pub async fn apply_down(&mut self, file: &MigrationFile) -> Result<(), SqlError> {
-        let sql = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
+    pub fn apply_down(&mut self, file: &MigrationFile) -> Result<(), SqlError> {
+        let sql = std::fs::read_to_string(&file.path).map_err(|e| {
             SqlError::QueryFailed(format!(
                 "cannot read migration {}: {}",
                 file.path.display(),
@@ -166,7 +166,7 @@ END;"#
             "DELETE FROM ferrule_migrations WHERE version = {}",
             quote_string(&file.version)
         );
-        self.apply_atomic(&sql, &track).await
+        self.apply_atomic(&sql, &track)
     }
 
     /// Run a migration `script` and its tracking-table statement `track`
@@ -191,7 +191,7 @@ END;"#
     ///   not autocommit DML, so an explicit `COMMIT` persists the
     ///   tracking-row write (and any DML in the script); MySQL autocommits,
     ///   so it needs none.
-    async fn apply_atomic(&mut self, script: &str, track: &str) -> Result<(), SqlError> {
+    fn apply_atomic(&mut self, script: &str, track: &str) -> Result<(), SqlError> {
         match self.dialect {
             Dialect::Sqlite | Dialect::Postgres | Dialect::MsSql => {
                 let (begin, prelude) = match self.dialect {
@@ -221,8 +221,8 @@ END;"#
                 // fails "already exists"). `execute` uses the plain
                 // non-resultset path and runs the batch exactly once.
                 let run = match self.dialect {
-                    Dialect::MsSql => self.conn.execute(&batch).await.map(|_| ()),
-                    _ => self.conn.execute_multi(&batch).await.map(|_| ()),
+                    Dialect::MsSql => self.conn.execute(&batch).map(|_| ()),
+                    _ => self.conn.execute_multi(&batch).map(|_| ()),
                 };
                 match run {
                     Ok(()) => Ok(()),
@@ -232,20 +232,20 @@ END;"#
                         // fails (e.g. the connection is gone, or XACT_ABORT
                         // already rolled back) the caller still sees the
                         // underlying migration failure.
-                        let _ = self.conn.execute("ROLLBACK;").await;
+                        let _ = self.conn.execute("ROLLBACK;");
                         Err(e)
                     }
                 }
             }
             Dialect::MySql | Dialect::Oracle => {
-                self.conn.execute_multi(script).await?;
-                self.conn.execute(track).await?;
+                self.conn.execute_multi(script)?;
+                self.conn.execute(track)?;
                 // Oracle does not autocommit DML: without an explicit COMMIT
                 // the tracking-row INSERT/DELETE (and any DML in the script)
                 // is rolled back when the connection closes. MySQL autocommits
                 // each statement, so this is Oracle-only.
                 if self.dialect == Dialect::Oracle {
-                    self.conn.execute("COMMIT").await?;
+                    self.conn.execute("COMMIT")?;
                 }
                 Ok(())
             }
@@ -264,7 +264,7 @@ END;"#
     /// The row-limit clause is dialect-specific: SQLite, Postgres, and
     /// MySQL accept `LIMIT n`; MSSQL uses `SELECT TOP n`; Oracle (12c+)
     /// uses `FETCH FIRST n ROWS ONLY`.
-    pub async fn last_applied(&mut self, n: usize) -> Result<Vec<AppliedMigration>, SqlError> {
+    pub fn last_applied(&mut self, n: usize) -> Result<Vec<AppliedMigration>, SqlError> {
         let order = "ORDER BY applied_at DESC, version DESC";
         let sql = match self.dialect {
             Dialect::Sqlite | Dialect::Postgres | Dialect::MySql => {
@@ -279,7 +279,7 @@ END;"#
                 )
             }
         };
-        self.query_applied(&sql).await
+        self.query_applied(&sql)
     }
 
     /// Read **every** applied migration from the tracking table, ordered
@@ -290,16 +290,16 @@ END;"#
     /// silently truncated window. The ordering is identical to
     /// `last_applied` and needs no dialect-specific limit clause, so the
     /// same query runs on all backends.
-    pub async fn all_applied(&mut self) -> Result<Vec<AppliedMigration>, SqlError> {
+    pub fn all_applied(&mut self) -> Result<Vec<AppliedMigration>, SqlError> {
         let sql =
             "SELECT version, checksum FROM ferrule_migrations ORDER BY applied_at DESC, version DESC";
-        self.query_applied(sql).await
+        self.query_applied(sql)
     }
 
     /// Run a `SELECT version, checksum FROM ferrule_migrations ...` query
     /// and collect the rows into [`AppliedMigration`]s.
-    async fn query_applied(&mut self, sql: &str) -> Result<Vec<AppliedMigration>, SqlError> {
-        let result = self.conn.query(sql).await?;
+    fn query_applied(&mut self, sql: &str) -> Result<Vec<AppliedMigration>, SqlError> {
+        let result = self.conn.query(sql)?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in result.rows {
             let version = row[0].to_string();
@@ -319,13 +319,13 @@ END;"#
     /// earlier `name.starts_with(version)` prefix match could bind the
     /// wrong file (e.g. version `2026` matching `20260602_x.up.sql`),
     /// reporting spurious drift or masking real drift.
-    pub async fn verify_checksum(&mut self, version: &str) -> Result<(), SqlError> {
+    pub fn verify_checksum(&mut self, version: &str) -> Result<(), SqlError> {
         validate_version(version)?;
         let sql = format!(
             "SELECT checksum FROM ferrule_migrations WHERE version = {}",
             quote_string(version)
         );
-        let result = self.conn.query(&sql).await?;
+        let result = self.conn.query(&sql)?;
         let db_checksum = result
             .rows
             .first()
@@ -349,7 +349,7 @@ END;"#
                 ))
             })?;
 
-        let content = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
+        let content = std::fs::read_to_string(&file.path).map_err(|e| {
             SqlError::QueryFailed(format!(
                 "cannot read migration file {}: {}",
                 file.path.display(),
@@ -371,9 +371,9 @@ END;"#
     // Internal helpers
     // ------------------------------------------------------------------
 
-    pub async fn applied_versions(&mut self) -> Result<HashSet<String>, SqlError> {
+    pub fn applied_versions(&mut self) -> Result<HashSet<String>, SqlError> {
         let sql = "SELECT version FROM ferrule_migrations";
-        let result = self.conn.query(sql).await?;
+        let result = self.conn.query(sql)?;
         let mut set = HashSet::with_capacity(result.rows.len());
         for row in result.rows {
             set.insert(row[0].to_string());
@@ -452,11 +452,11 @@ END;"#
     /// from the applied-list query — one directory scan and zero extra
     /// `SELECT`s, instead of re-reading the directory and re-querying the
     /// database once per applied migration.
-    pub async fn on_disk_checksums(&self) -> Result<HashMap<String, String>, SqlError> {
+    pub fn on_disk_checksums(&self) -> Result<HashMap<String, String>, SqlError> {
         let files = self.scan_dir(Direction::Up)?;
         let mut map = HashMap::with_capacity(files.len());
         for file in files {
-            let content = tokio::fs::read_to_string(&file.path).await.map_err(|e| {
+            let content = std::fs::read_to_string(&file.path).map_err(|e| {
                 SqlError::QueryFailed(format!(
                     "cannot read migration file {}: {}",
                     file.path.display(),
@@ -477,11 +477,11 @@ END;"#
     /// [`MigrationEngine::on_disk_checksums`]; no per-migration queries are
     /// issued. The returned vector lists every drifted migration with a
     /// human-readable reason — empty means all clean.
-    pub async fn verify_applied(
+    pub fn verify_applied(
         &self,
         applied: &[AppliedMigration],
     ) -> Result<Vec<ChecksumDrift>, SqlError> {
-        let on_disk = self.on_disk_checksums().await?;
+        let on_disk = self.on_disk_checksums()?;
         let mut drift = Vec::new();
         for migration in applied {
             match on_disk.get(&migration.version) {
@@ -594,13 +594,12 @@ mod tests {
         TestDir { base, mig, db }
     }
 
-    async fn engine(t: &TestDir) -> MigrationEngine {
+    fn engine(t: &TestDir) -> MigrationEngine {
         let url =
             DatabaseUrl::parse(&format!("sqlite://{}", t.db.display())).expect("parse sqlite url");
-        let conn = ferrule_sql::backends::sqlite::connect(&url, &ConnectOptions::default())
-            .await
-            .expect("connect sqlite");
-        MigrationEngine::new(Box::new(conn), t.mig.clone(), Dialect::Sqlite)
+        let conn =
+            ferrule_sql::connect(&url, &ConnectOptions::default(), None).expect("connect sqlite");
+        MigrationEngine::new(conn, t.mig.clone(), Dialect::Sqlite)
     }
 
     fn write_pair(t: &TestDir, stem: &str, up: &str, down: &str) {
@@ -608,8 +607,8 @@ mod tests {
         std::fs::write(t.mig.join(format!("{stem}.down.sql")), down).expect("write down");
     }
 
-    #[tokio::test]
-    async fn lifecycle_up_verify_down() {
+    #[test]
+    fn lifecycle_up_verify_down() {
         let t = test_dir();
         write_pair(
             &t,
@@ -618,35 +617,34 @@ mod tests {
              INSERT INTO users (name) VALUES ('a');\n",
             "DROP TABLE users;\n",
         );
-        let mut eng = engine(&t).await;
-        eng.ensure_migration_table().await.unwrap();
+        let mut eng = engine(&t);
+        eng.ensure_migration_table().unwrap();
 
-        let pending = eng.pending_migrations().await.unwrap();
+        let pending = eng.pending_migrations().unwrap();
         assert_eq!(pending.len(), 1);
-        eng.apply_up(&pending[0]).await.unwrap();
+        eng.apply_up(&pending[0]).unwrap();
 
         // Recorded, schema + data present, no drift, nothing left pending.
-        assert!(eng.applied_versions().await.unwrap().contains("20240101"));
-        let rows = eng.conn.query("SELECT name FROM users").await.unwrap();
+        assert!(eng.applied_versions().unwrap().contains("20240101"));
+        let rows = eng.conn.query("SELECT name FROM users").unwrap();
         assert_eq!(rows.rows.len(), 1);
-        let all = eng.all_applied().await.unwrap();
-        assert!(eng.verify_applied(&all).await.unwrap().is_empty());
-        assert!(eng.pending_migrations().await.unwrap().is_empty());
+        let all = eng.all_applied().unwrap();
+        assert!(eng.verify_applied(&all).unwrap().is_empty());
+        assert!(eng.pending_migrations().unwrap().is_empty());
 
         // Roll back: tracking row gone and the table dropped.
         let downs = eng.scan_dir(Direction::Down).unwrap();
-        eng.apply_down(&downs[0]).await.unwrap();
-        assert!(eng.applied_versions().await.unwrap().is_empty());
+        eng.apply_down(&downs[0]).unwrap();
+        assert!(eng.applied_versions().unwrap().is_empty());
         let tbls = eng
             .conn
             .query("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
-            .await
             .unwrap();
         assert_eq!(tbls.rows.len(), 0);
     }
 
-    #[tokio::test]
-    async fn apply_up_rolls_back_on_failure() {
+    #[test]
+    fn apply_up_rolls_back_on_failure() {
         // Regression guard: the second statement fails, so the whole
         // migration (the first statement + the tracking row) must roll back.
         let t = test_dir();
@@ -656,69 +654,68 @@ mod tests {
             "CREATE TABLE keep_me (id INTEGER);\nCREATE TABLE keep_me (id INTEGER);\n",
             "DROP TABLE keep_me;\n",
         );
-        let mut eng = engine(&t).await;
-        eng.ensure_migration_table().await.unwrap();
-        let pending = eng.pending_migrations().await.unwrap();
+        let mut eng = engine(&t);
+        eng.ensure_migration_table().unwrap();
+        let pending = eng.pending_migrations().unwrap();
 
         assert!(
-            eng.apply_up(&pending[0]).await.is_err(),
+            eng.apply_up(&pending[0]).is_err(),
             "apply_up must fail on the duplicate CREATE"
         );
         let tbls = eng
             .conn
             .query("SELECT name FROM sqlite_master WHERE type='table' AND name='keep_me'")
-            .await
             .unwrap();
         assert_eq!(tbls.rows.len(), 0, "partial schema must be rolled back");
         assert!(
-            eng.applied_versions().await.unwrap().is_empty(),
+            eng.applied_versions().unwrap().is_empty(),
             "a failed migration must not be recorded"
         );
     }
 
-    #[tokio::test]
-    async fn duplicate_version_is_rejected() {
+    #[test]
+    fn duplicate_version_is_rejected() {
         let t = test_dir();
         write_pair(&t, "20240101_a", "CREATE TABLE a(x);\n", "DROP TABLE a;\n");
         write_pair(&t, "20240101_b", "CREATE TABLE b(x);\n", "DROP TABLE b;\n");
-        let eng = engine(&t).await;
+        let eng = engine(&t);
         assert!(
             eng.scan_dir(Direction::Up).is_err(),
             "two files deriving the same version must be rejected up front"
         );
     }
 
-    #[tokio::test]
-    async fn verify_applied_detects_checksum_drift() {
+    #[test]
+    fn verify_applied_detects_checksum_drift() {
         let t = test_dir();
         write_pair(&t, "20240101_e", "CREATE TABLE e(x);\n", "DROP TABLE e;\n");
-        let mut eng = engine(&t).await;
-        eng.ensure_migration_table().await.unwrap();
-        let pending = eng.pending_migrations().await.unwrap();
-        eng.apply_up(&pending[0]).await.unwrap();
+        let mut eng = engine(&t);
+        eng.ensure_migration_table().unwrap();
+        let pending = eng.pending_migrations().unwrap();
+        eng.apply_up(&pending[0]).unwrap();
 
         // Edit the applied file: verify must flag the checksum drift.
         std::fs::write(t.mig.join("20240101_e.up.sql"), "CREATE TABLE e(x, y);\n").unwrap();
-        let all = eng.all_applied().await.unwrap();
-        let drift = eng.verify_applied(&all).await.unwrap();
+        let all = eng.all_applied().unwrap();
+        let drift = eng.verify_applied(&all).unwrap();
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].version, "20240101");
     }
 
-    #[tokio::test]
-    async fn verify_applied_detects_missing_file() {
+    #[test]
+    fn verify_applied_detects_missing_file() {
         let t = test_dir();
         write_pair(&t, "20240101_g", "CREATE TABLE g(x);\n", "DROP TABLE g;\n");
-        let mut eng = engine(&t).await;
-        eng.ensure_migration_table().await.unwrap();
-        let pending = eng.pending_migrations().await.unwrap();
-        eng.apply_up(&pending[0]).await.unwrap();
+        let mut eng = engine(&t);
+        eng.ensure_migration_table().unwrap();
+        let pending = eng.pending_migrations().unwrap();
+        eng.apply_up(&pending[0]).unwrap();
 
         // Delete the on-disk file: verify must report applied-but-missing drift.
         std::fs::remove_file(t.mig.join("20240101_g.up.sql")).unwrap();
         std::fs::remove_file(t.mig.join("20240101_g.down.sql")).unwrap();
-        let all = eng.all_applied().await.unwrap();
-        let drift = eng.verify_applied(&all).await.unwrap();
+        let all = eng.all_applied().unwrap();
+        let drift = eng.verify_applied(&all).unwrap();
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].version, "20240101");
     }

@@ -22,6 +22,7 @@ pub mod error;
 pub mod proxy;
 pub mod query_builder;
 pub mod render;
+pub mod sync;
 pub mod transaction;
 pub mod tunnel;
 pub mod url;
@@ -29,11 +30,12 @@ pub mod value;
 
 /// Per-backend driver modules, one feature-gated submodule per backend.
 ///
-/// Public so downstream crates — notably `ferrule-core`'s CLI-support
-/// modules and their SQLite-backed integration tests — can reach the
-/// concrete connection constructors (e.g.
-/// `ferrule_sql::backends::sqlite::connect`) without routing through the
-/// URL-scheme dispatcher in [`connect`].
+/// The module is `pub` so the per-backend concrete connection types and
+/// their inline integration tests are reachable, but the connection
+/// *constructors* are `pub(crate)`: every caller establishes connections
+/// through the synchronous URL-scheme dispatcher [`connect`], which is
+/// the only blocking entry point and the one that owns the private
+/// runtime. Embedders never touch a driver's async constructor directly.
 pub mod backends;
 
 #[cfg(feature = "ssh")]
@@ -50,16 +52,15 @@ pub use copy::{
 };
 pub use dialect::Dialect;
 pub use error::SqlError;
-pub use proxy::{
-    http_connect, is_no_proxy, resolve_proxy_from_env, ProxiedConnection, ProxyConfig,
-};
+pub use proxy::{is_no_proxy, resolve_proxy_from_env, ProxiedConnection, ProxyConfig};
 pub use query_builder::apply_paging;
 pub use render::{quote_string, render_value};
+pub use sync::SyncConnection;
 pub use transaction::{begin_transaction, commit_transaction, rollback_transaction};
 pub use tunnel::SshConfig;
 #[cfg(feature = "ssh")]
 pub use tunnel::{
-    setup_tunnel, KeySource, SshSession, TunnelError, TunnelHandle, TunnelStream, TunnelTransport,
+    KeySource, SshSession, TunnelError, TunnelHandle, TunnelStream, TunnelTransport,
     TunnelTransportResult, TunneledConnection,
 };
 pub use url::DatabaseUrl;

@@ -132,7 +132,7 @@ pub fn resolve_proxy_from_env(_target_scheme: &str) -> Option<ProxyConfig> {
 
 /// Perform an HTTP CONNECT handshake through the proxy, returning
 /// a `TcpStream` that is tunneled to `target_host:target_port`.
-pub async fn http_connect(
+pub(crate) async fn http_connect(
     proxy: &ProxyConfig,
     target_host: &str,
     target_port: u16,
@@ -194,12 +194,12 @@ pub async fn http_connect(
 /// When this struct is dropped, the listener is dropped and the
 /// forwarder task exits naturally.
 pub struct ProxiedConnection {
-    pub inner: Box<dyn crate::Connection>,
+    pub inner: Box<dyn crate::connection::AsyncConnection>,
     pub forwarder: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[async_trait::async_trait]
-impl crate::Connection for ProxiedConnection {
+impl crate::connection::AsyncConnection for ProxiedConnection {
     async fn execute(&mut self, sql: &str) -> Result<crate::ExecutionSummary, crate::SqlError> {
         self.inner.execute(sql).await
     }

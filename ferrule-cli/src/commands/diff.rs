@@ -119,25 +119,25 @@ fn diff_tables(
     (only_in_a, only_in_b, type_changes)
 }
 
-async fn collect_table_set(
+fn collect_table_set(
     conn: &mut dyn Connection,
     pinned: Option<&str>,
 ) -> Result<Vec<String>, CliError> {
     if let Some(name) = pinned {
         return Ok(vec![name.to_string()]);
     }
-    conn.list_tables(None).await.map_err(CliError::query)
+    conn.list_tables(None).map_err(CliError::query)
 }
 
-async fn build_schema_diff(
+fn build_schema_diff(
     a_conn: &mut dyn Connection,
     a_backend: Backend,
     b_conn: &mut dyn Connection,
     b_backend: Backend,
     pinned_table: Option<&str>,
 ) -> Result<SchemaDiff, CliError> {
-    let a_tables = collect_table_set(a_conn, pinned_table).await?;
-    let b_tables = collect_table_set(b_conn, pinned_table).await?;
+    let a_tables = collect_table_set(a_conn, pinned_table)?;
+    let b_tables = collect_table_set(b_conn, pinned_table)?;
 
     let a_set: BTreeMap<String, ()> = a_tables.iter().cloned().map(|t| (t, ())).collect();
     let b_set: BTreeMap<String, ()> = b_tables.iter().cloned().map(|t| (t, ())).collect();
@@ -159,14 +159,8 @@ async fn build_schema_diff(
     let mut common: Vec<&String> = a_tables.iter().filter(|t| b_set.contains_key(*t)).collect();
     common.sort();
     for t in common {
-        let a_desc = a_conn
-            .describe_table(None, t)
-            .await
-            .map_err(CliError::query)?;
-        let b_desc = b_conn
-            .describe_table(None, t)
-            .await
-            .map_err(CliError::query)?;
+        let a_desc = a_conn.describe_table(None, t).map_err(CliError::query)?;
+        let b_desc = b_conn.describe_table(None, t).map_err(CliError::query)?;
         let a_cols = extract_columns(&a_desc, a_backend);
         let b_cols = extract_columns(&b_desc, b_backend);
         let (only_in_a, only_in_b, type_changes) = diff_tables(&a_cols, &b_cols);
@@ -267,7 +261,7 @@ fn render_text(diff: &SchemaDiff) -> String {
     out
 }
 
-pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);
 
     // Both sides share the same `--ssh-tunnel` / `--ssh-key`: in
@@ -281,8 +275,7 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     let resolved_b = super::resolve_connection(
         &args.connection_b,
         args.password_b,
@@ -290,8 +283,7 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved_a)?;
     super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved_b)?;
 
@@ -320,8 +312,8 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let mut conn_a = super::connect_resolved(resolved_a, &opts).await?;
-    let mut conn_b = super::connect_resolved(resolved_b, &opts).await?;
+    let mut conn_a = super::connect_resolved(resolved_a, &opts)?;
+    let mut conn_b = super::connect_resolved(resolved_b, &opts)?;
 
     let diff = build_schema_diff(
         conn_a.as_mut(),
@@ -329,8 +321,7 @@ pub async fn run(args: DiffArgs, global_config: &GlobalConfig) -> Result<(), Cli
         conn_b.as_mut(),
         backend_b,
         args.table.as_deref(),
-    )
-    .await?;
+    )?;
 
     let rendered = render_diff(&diff, format)?;
     println!("{}", rendered);
@@ -458,8 +449,8 @@ mod tests {
         assert_eq!(cols, vec![col("id", "INTEGER"), col("name", "TEXT")]);
     }
 
-    #[tokio::test]
-    async fn end_to_end_sqlite_drift_detected() {
+    #[test]
+    fn end_to_end_sqlite_drift_detected() {
         use ferrule_sql::url::DatabaseUrl;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -474,21 +465,14 @@ mod tests {
 
         let url_a = DatabaseUrl::parse(&format!("sqlite://{}", path_a.display())).unwrap();
         let url_b = DatabaseUrl::parse(&format!("sqlite://{}", path_b.display())).unwrap();
-        let mut a = ferrule_sql::connect(&url_a, &ConnectOptions::default(), None)
-            .await
-            .unwrap();
-        let mut b = ferrule_sql::connect(&url_b, &ConnectOptions::default(), None)
-            .await
-            .unwrap();
+        let mut a = ferrule_sql::connect(&url_a, &ConnectOptions::default(), None).unwrap();
+        let mut b = ferrule_sql::connect(&url_b, &ConnectOptions::default(), None).unwrap();
 
-        a.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .await
-            .unwrap();
+        a.execute("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
         b.execute("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)")
-            .await
             .unwrap();
-        a.execute("CREATE TABLE only_a (id INTEGER)").await.unwrap();
-        b.execute("CREATE TABLE only_b (id INTEGER)").await.unwrap();
+        a.execute("CREATE TABLE only_a (id INTEGER)").unwrap();
+        b.execute("CREATE TABLE only_b (id INTEGER)").unwrap();
 
         let diff = build_schema_diff(
             a.as_mut(),
@@ -497,7 +481,6 @@ mod tests {
             Backend::Sqlite,
             None,
         )
-        .await
         .expect("diff");
 
         assert!(

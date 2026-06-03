@@ -41,7 +41,7 @@ pub struct DumpArgs {
     pub conn_flags: ConnectionFlags,
 }
 
-pub async fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args
         .dump_format
         .as_deref()
@@ -62,8 +62,7 @@ pub async fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), Cli
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     let backend = ferrule_sql::Backend::from_scheme(resolved.url.scheme())
@@ -88,8 +87,7 @@ pub async fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), Cli
             ferrule_core::OutputFormat::Json,
             None,
             None,
-        )
-        .await?;
+        )?;
         write_output(&args, &payload)?;
         return Ok(());
     }
@@ -102,10 +100,9 @@ pub async fn run(args: DumpArgs, global_config: &GlobalConfig) -> Result<(), Cli
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let mut conn = connect_resolved(resolved, &opts_conn).await?;
+    let mut conn = connect_resolved(resolved, &opts_conn)?;
 
     let dumped = ferrule_core::dump_table(conn.as_mut(), &args.table, backend, &opts)
-        .await
         .map_err(CliError::query)?;
 
     write_output(&args, &dumped)?;

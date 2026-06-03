@@ -29,17 +29,30 @@ base64 = { workspace = true }
 hex = "0.4"
 rust_decimal = { version = "1", optional = true, features = ["db-tokio-postgres"] }
 tokio-postgres = { version = "0.7", optional = true, features = ["with-serde_json-1","with-chrono-0_4","with-uuid-1"] }
+# tokio-postgres-rustls 0.13 already pins rustls to the ring provider internally
+# (its rustls dep is default-features=false + features=["ring",...]), so it pulls
+# no aws-lc-rs of its own.
 tokio-postgres-rustls = { version = "0.13", optional = true }
-tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true }
+# rustls/tokio-rustls default to the aws_lc_rs provider, which drags in the
+# cc/cmake-built aws-lc-sys. Pin them to the pure-Rust `ring` provider so the
+# Postgres TLS path stays inside the #67 C-free vendored-static floor (ring only).
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring","logging","tls12"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring","logging","std","tls12"] }
 webpki-roots = { version = "0.26", optional = true }
 uuid = { workspace = true, optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink","alloc"] }
-mysql_async = { version = "0.35", optional = true }
+# default-rustls-ring selects flate2's pure-Rust backend (drops libz-sys) and the
+# ring rustls provider (drops aws-lc-sys); default-features=false suppresses
+# mysql_async's own `default`, which would re-enable the aws-lc-rs provider.
+mysql_async = { version = "0.35", optional = true, default-features = false, features = ["default-rustls-ring","chrono"] }
 tiberius = { version = "0.12", optional = true, features = ["chrono"] }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled","chrono","serde_json"], optional = true }
 oracle = { version = "0.6", optional = true, features = ["chrono"] }
-russh = { version = "0.60", optional = true }
+# russh defaults to the aws-lc-rs crypto provider; pin it to ring so the SSH
+# tunnel transport carries no aws-lc-sys. flate2 (resolves to pure-Rust
+# miniz_oxide here) and rsa preserve the compression + RSA key-auth behaviour
+# of russh's default feature set.
+russh = { version = "0.60", optional = true, default-features = false, features = ["ring","flate2","rsa"] }
 pkcs5 = { version = "=0.8.0-rc.13", optional = true }

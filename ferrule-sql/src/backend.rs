@@ -1,8 +1,9 @@
 #![allow(unused_imports, unused_variables)]
 
 use crate::backends;
-use crate::connection::{ConnectOptions, Connection};
+use crate::connection::{AsyncConnection, ConnectOptions, Connection};
 use crate::error::SqlError;
+use crate::sync::SyncConnection;
 use crate::url::DatabaseUrl;
 
 /// Supported database backends.
@@ -56,10 +57,14 @@ impl Backend {
 }
 
 /// Establish a direct (non-proxied) connection to the given URL.
+///
+/// Internal async helper. Returns the inner [`AsyncConnection`]; the
+/// public [`connect`] wraps it in a [`SyncConnection`] that owns the
+/// driving runtime.
 async fn connect_direct(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
-) -> Result<Box<dyn Connection>, SqlError> {
+) -> Result<Box<dyn AsyncConnection>, SqlError> {
     let backend = Backend::from_scheme(url.scheme())
         .ok_or_else(|| SqlError::UnsupportedScheme(url.scheme().to_string()))?;
 
@@ -92,18 +97,53 @@ async fn connect_direct(
     }
 }
 
-/// Establish a connection to the given URL.
+/// Build the private current-thread runtime that drives one
+/// connection handle's driver futures for its whole lifetime.
 ///
-/// When `proxy` is `Some`, the connection is routed through the
-/// proxy via HTTP CONNECT. For Postgres this means `connect_raw`
-/// with a pre-built stream; for MySQL/MSSQL/Oracle a local TCP
-/// listener is bound and bytes are pumped through the proxy; for
-/// SQLite the proxy is ignored (local file, no network).
-pub async fn connect(
+/// Current-thread (not multi-thread) by design: a single embedded
+/// connection needs exactly one driver task plus the in-flight
+/// statement future, both polled cooperatively on the calling thread
+/// during `block_on`. `enable_all` turns on the I/O and time drivers
+/// the network backends need.
+fn build_runtime() -> Result<tokio::runtime::Runtime, SqlError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| SqlError::ConnectionFailed(format!("failed to build connection runtime: {e}")))
+}
+
+/// Establish a blocking connection to the given URL.
+///
+/// When `proxy` is `Some`, the connection is routed through the proxy
+/// via HTTP CONNECT. For Postgres this means `connect_raw` with a
+/// pre-built stream; for MySQL/MSSQL/Oracle a local TCP listener is
+/// bound and bytes are pumped through the proxy; for SQLite the proxy is
+/// ignored (local file, no network).
+///
+/// **Blocking:** this call blocks until the connection is established.
+/// The returned [`Connection`] owns a private current-thread runtime
+/// that drives every later blocking call; it never exposes a `Future`.
+/// Do not call from inside another `block_on` on the same thread.
+#[must_use = "a connection handle must be used or the connection is dropped immediately"]
+pub fn connect(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
     proxy: Option<&crate::proxy::ProxyConfig>,
 ) -> Result<Box<dyn Connection>, SqlError> {
+    let rt = build_runtime()?;
+    let inner = rt.block_on(connect_inner(url, opts, proxy))?;
+    Ok(Box::new(SyncConnection::new(rt, inner)))
+}
+
+/// Async core of [`connect`]: resolve the backend and establish the
+/// inner [`AsyncConnection`], honoring an optional HTTP CONNECT proxy.
+/// Must be driven on the same runtime that [`connect`] later moves into
+/// the returned [`SyncConnection`].
+async fn connect_inner(
+    url: &DatabaseUrl,
+    opts: &ConnectOptions,
+    proxy: Option<&crate::proxy::ProxyConfig>,
+) -> Result<Box<dyn AsyncConnection>, SqlError> {
     let backend = Backend::from_scheme(url.scheme())
         .ok_or_else(|| SqlError::UnsupportedScheme(url.scheme().to_string()))?;
 
@@ -164,7 +204,7 @@ async fn connect_via_proxy_listener(
     opts: &ConnectOptions,
     proxy: &crate::proxy::ProxyConfig,
     backend: Backend,
-) -> Result<Box<dyn Connection>, SqlError> {
+) -> Result<Box<dyn AsyncConnection>, SqlError> {
     let target_host = url
         .host()
         .ok_or_else(|| {
@@ -241,13 +281,13 @@ async fn connect_via_proxy_listener(
 /// the SSH session (and, for the LocalListener path, the forwarder
 /// task) for the connection's lifetime.
 #[cfg(feature = "ssh")]
-pub async fn connect_with_tunnel(
+async fn connect_with_tunnel_inner(
     url: &DatabaseUrl,
     opts: &ConnectOptions,
     ssh_config: &crate::tunnel::SshConfig,
     key_source: &crate::tunnel::KeySource,
     proxy: Option<&crate::proxy::ProxyConfig>,
-) -> Result<Box<dyn Connection>, SqlError> {
+) -> Result<Box<dyn AsyncConnection>, SqlError> {
     use crate::tunnel::{
         setup_tunnel, TunnelError, TunnelTransport, TunnelTransportResult, TunneledConnection,
     };
@@ -375,4 +415,28 @@ fn rewrite_url_to_local(url: &DatabaseUrl, port: u16) -> Result<DatabaseUrl, Sql
         .set_port(Some(port))
         .map_err(|()| SqlError::InvalidUrl("set_port failed".to_string()))?;
     DatabaseUrl::parse(parsed.as_str())
+}
+
+/// Establish a blocking connection to `url` through an SSH tunnel.
+///
+/// An optional `proxy` routes the SSH session itself through an HTTP
+/// CONNECT proxy. See [`connect`] for the runtime / blocking contract:
+/// the returned handle owns the private runtime that also hosts the SSH
+/// session and (for the LocalListener transport) the byte-forwarder
+/// task, so all of them are driven on every later blocking call and torn
+/// down together when the handle drops.
+#[cfg(feature = "ssh")]
+#[must_use = "a connection handle must be used or the connection is dropped immediately"]
+pub fn connect_with_tunnel(
+    url: &DatabaseUrl,
+    opts: &ConnectOptions,
+    ssh_config: &crate::tunnel::SshConfig,
+    key_source: &crate::tunnel::KeySource,
+    proxy: Option<&crate::proxy::ProxyConfig>,
+) -> Result<Box<dyn Connection>, SqlError> {
+    let rt = build_runtime()?;
+    let inner = rt.block_on(connect_with_tunnel_inner(
+        url, opts, ssh_config, key_source, proxy,
+    ))?;
+    Ok(Box::new(SyncConnection::new(rt, inner)))
 }

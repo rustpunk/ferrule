@@ -50,28 +50,28 @@ fn rollback_sql_for(backend: Backend) -> &'static str {
 /// Open a target-side transaction. Returns `true` if the BEGIN
 /// succeeded, `false` if the backend rejected the statement (best-
 /// effort: the caller proceeds without a wrapping transaction).
+///
+/// **Blocking:** issues at most one synchronous `BEGIN` round-trip.
 #[must_use]
-pub async fn begin_transaction(conn: &mut dyn Connection, backend: Backend) -> bool {
+pub fn begin_transaction(conn: &mut dyn Connection, backend: Backend) -> bool {
     match begin_sql_for(backend) {
         None => true,
-        Some(stmt) => conn.execute(stmt).await.is_ok(),
+        Some(stmt) => conn.execute(stmt).is_ok(),
     }
 }
 
+/// Commit the wrapping transaction. **Blocking:** one synchronous
+/// `COMMIT` round-trip.
 #[must_use = "commit_transaction returns a SqlError on wire failure that the caller must surface"]
-pub async fn commit_transaction(
-    conn: &mut dyn Connection,
-    backend: Backend,
-) -> Result<(), SqlError> {
-    conn.execute(commit_sql_for(backend)).await.map(|_| ())
+pub fn commit_transaction(conn: &mut dyn Connection, backend: Backend) -> Result<(), SqlError> {
+    conn.execute(commit_sql_for(backend)).map(|_| ())
 }
 
+/// Roll back the wrapping transaction. **Blocking:** one synchronous
+/// `ROLLBACK` round-trip.
 #[must_use = "rollback_transaction returns a SqlError on wire failure; best-effort callers should still `let _ =`"]
-pub async fn rollback_transaction(
-    conn: &mut dyn Connection,
-    backend: Backend,
-) -> Result<(), SqlError> {
-    conn.execute(rollback_sql_for(backend)).await.map(|_| ())
+pub fn rollback_transaction(conn: &mut dyn Connection, backend: Backend) -> Result<(), SqlError> {
+    conn.execute(rollback_sql_for(backend)).map(|_| ())
 }
 
 #[cfg(test)]

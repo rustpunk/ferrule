@@ -99,7 +99,7 @@ fn print_explain_payload(payload: &str, out: ExplainOutput) {
     }
 }
 
-async fn run_bench(
+fn run_bench(
     conn: &mut dyn Connection,
     sql: &str,
     n: u32,
@@ -114,21 +114,17 @@ async fn run_bench(
     for i in 0..(warmup + n) {
         let start = std::time::Instant::now();
         // Mirror the regular dispatch triage so DML and SELECT both work.
-        let iter_result: Result<(), CliError> = match conn.query(sql).await {
+        let iter_result: Result<(), CliError> = match conn.query(sql) {
             Ok(_) => Ok(()),
-            Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(sql).await {
+            Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(sql) {
                 Ok(_) => Ok(()),
-                Err(_) => conn
-                    .execute_multi(sql)
-                    .await
-                    .map(|_| ())
-                    .map_err(CliError::query),
+                Err(_) => conn.execute_multi(sql).map(|_| ()).map_err(CliError::query),
             },
             Err(e) => Err(CliError::query(e)),
         };
         if let Err(e) = iter_result {
             if txn.begin {
-                let _ = ferrule_sql::transaction::rollback_transaction(conn, txn.backend).await;
+                let _ = ferrule_sql::transaction::rollback_transaction(conn, txn.backend);
                 eprintln!("[ferrule] inner statement failed — rolled back wrapping transaction");
             }
             return Err(e);
@@ -145,9 +141,7 @@ async fn run_bench(
     print!("{}", summary.render(width));
 
     if let Some(path) = csv_output {
-        tokio::fs::write(path, summary.to_csv())
-            .await
-            .map_err(CliError::Io)?;
+        std::fs::write(path, summary.to_csv()).map_err(CliError::Io)?;
         eprintln!("Wrote {} samples to {}", summary.n(), path);
     }
 
@@ -159,11 +153,10 @@ async fn run_bench(
 
     if txn.begin {
         if txn.rollback {
-            let _ = ferrule_sql::transaction::rollback_transaction(conn, txn.backend).await;
+            let _ = ferrule_sql::transaction::rollback_transaction(conn, txn.backend);
             eprintln!("[ferrule] explicit ROLLBACK (--rollback)");
         } else {
             ferrule_sql::transaction::commit_transaction(conn, txn.backend)
-                .await
                 .map_err(CliError::query)?;
         }
     }
@@ -171,7 +164,7 @@ async fn run_bench(
     Ok(())
 }
 
-pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     // Validate --filter precondition before resolving format.
     // Filter operates on JSON, so it implies --format json.
     let format = if args.filter.is_some() {
@@ -234,14 +227,10 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     let total_start = std::time::Instant::now();
 
     let sql = if let Some(path) = args.file {
-        tokio::fs::read_to_string(path)
-            .await
-            .map_err(CliError::Io)?
+        std::fs::read_to_string(path).map_err(CliError::Io)?
     } else if args.stdin {
         let mut buf = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut buf)
-            .await
-            .map_err(CliError::Io)?;
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(CliError::Io)?;
         buf
     } else if let Some(sql) = args.sql {
         sql
@@ -283,7 +272,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             password: args.password,
             file_path: Some(file_path),
         };
-        return crate::commands::watch::run(watch_args, global_config).await;
+        return crate::commands::watch::run(watch_args, global_config);
     }
 
     if args.watch {
@@ -300,7 +289,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             password: args.password,
             file_path: None,
         };
-        return crate::commands::watch::run(watch_args, global_config).await;
+        return crate::commands::watch::run(watch_args, global_config);
     }
 
     if args.dry_run {
@@ -359,9 +348,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
                 let lookup_micros = t.elapsed().as_micros() as u64;
                 let rendered = render_query_result(&cached.result, format, limit, offset)?;
                 if let Some(path) = args.output.output.as_deref() {
-                    tokio::fs::write(path, &rendered)
-                        .await
-                        .map_err(CliError::Io)?;
+                    std::fs::write(path, &rendered).map_err(CliError::Io)?;
                     eprintln!("Wrote to {}", path);
                 }
                 let filtered = maybe_apply_filter(rendered, args.filter.as_deref())?;
@@ -403,8 +390,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     if args.output.verbose {
@@ -438,8 +424,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
                 format,
                 None,
                 None,
-            )
-            .await?;
+            )?;
             print_explain_payload(&payload, out);
             return Ok(());
         }
@@ -447,8 +432,8 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             insecure: args.conn_flags.insecure,
             password: None,
         };
-        let mut conn = super::connect_resolved(resolved, &opts).await?;
-        let result = conn.query(&wrapped).await.map_err(CliError::query)?;
+        let mut conn = super::connect_resolved(resolved, &opts)?;
+        let result = conn.query(&wrapped).map_err(CliError::query)?;
         let rendered = format_result(&result, format).map_err(CliError::query)?;
         print_explain_payload(&rendered, out);
         return Ok(());
@@ -464,8 +449,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
             format,
             limit,
             offset,
-        )
-        .await?;
+        )?;
         let payload = maybe_apply_filter(payload, args.filter.as_deref())?;
         println!("{}", payload);
         return Ok(());
@@ -480,7 +464,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     }
 
     let conn_start = std::time::Instant::now();
-    let mut conn = super::connect_resolved(resolved, &opts).await?;
+    let mut conn = super::connect_resolved(resolved, &opts)?;
     let conn_time = conn_start.elapsed();
 
     // Wrap the entire statement batch in a single outer transaction when
@@ -488,7 +472,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     // still returns `true` so the wrapping COMMIT/ROLLBACK terminates
     // the implicit transaction.
     let outer_tx_opened = if args.begin {
-        ferrule_sql::transaction::begin_transaction(&mut *conn, backend).await
+        ferrule_sql::transaction::begin_transaction(&mut *conn, backend)
     } else {
         false
     };
@@ -516,16 +500,15 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
                 rollback: args.rollback,
                 backend,
             },
-        )
-        .await;
+        );
     }
 
     let query_start = std::time::Instant::now();
-    let dispatch_result: Result<Vec<StatementResult>, CliError> = match conn.query(&sql).await {
+    let dispatch_result: Result<Vec<StatementResult>, CliError> = match conn.query(&sql) {
         Ok(qr) => Ok(vec![StatementResult::Query(qr)]),
-        Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql).await {
+        Err(ferrule_sql::SqlError::QueryFailed(_)) => match conn.execute(&sql) {
             Ok(summary) => Ok(vec![StatementResult::Summary(summary)]),
-            Err(_) => conn.execute_multi(&sql).await.map_err(CliError::query),
+            Err(_) => conn.execute_multi(&sql).map_err(CliError::query),
         },
         Err(e) => Err(CliError::query(e)),
     };
@@ -536,7 +519,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
         Ok(r) => r,
         Err(e) => {
             if outer_tx_opened {
-                let _ = ferrule_sql::transaction::rollback_transaction(&mut *conn, backend).await;
+                let _ = ferrule_sql::transaction::rollback_transaction(&mut *conn, backend);
                 eprintln!("[ferrule] inner statement failed — rolled back wrapping transaction");
             }
             return Err(e);
@@ -639,9 +622,7 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
     if let Some(path) = args.output.output {
         eprintln!("Warning: file output with multi-statement uses first result only.");
         let rendered = render_single_result(&results[0], format, limit, offset)?;
-        tokio::fs::write(&path, rendered)
-            .await
-            .map_err(CliError::Io)?;
+        std::fs::write(&path, rendered).map_err(CliError::Io)?;
         eprintln!("Wrote to {}", path);
     }
 
@@ -657,11 +638,10 @@ pub async fn run(args: QueryArgs, global_config: &GlobalConfig) -> Result<(), Cl
 
     if outer_tx_opened {
         if args.rollback {
-            let _ = ferrule_sql::transaction::rollback_transaction(&mut *conn, backend).await;
+            let _ = ferrule_sql::transaction::rollback_transaction(&mut *conn, backend);
             eprintln!("[ferrule] explicit ROLLBACK (--rollback)");
         } else {
             ferrule_sql::transaction::commit_transaction(&mut *conn, backend)
-                .await
                 .map_err(CliError::query)?;
         }
     }
@@ -823,27 +803,23 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn begin_with_daemon_usage_error() {
+    #[test]
+    fn begin_with_daemon_usage_error() {
         let mut args = synth_query_args("sqlite://x", "SELECT 1");
         args.begin = true;
         args.conn_flags.daemon = true;
         let global = GlobalConfig::default();
-        let err = run(args, &global)
-            .await
-            .expect_err("--begin --daemon should be a usage error");
+        let err = run(args, &global).expect_err("--begin --daemon should be a usage error");
         assert!(matches!(err, CliError::Usage(_)), "got: {:?}", err);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn begin_with_watch_usage_error() {
+    #[test]
+    fn begin_with_watch_usage_error() {
         let mut args = synth_query_args("sqlite://x", "SELECT 1");
         args.begin = true;
         args.watch = true;
         let global = GlobalConfig::default();
-        let err = run(args, &global)
-            .await
-            .expect_err("--begin --watch should be a usage error");
+        let err = run(args, &global).expect_err("--begin --watch should be a usage error");
         assert!(matches!(err, CliError::Usage(_)), "got: {:?}", err);
     }
 
@@ -911,8 +887,8 @@ mod tests {
 
     // 18. --bench bypasses the cache: no record_last should fire, no
     // row should land in the cache db.
-    #[tokio::test(flavor = "current_thread")]
-    async fn bench_bypasses_cache() {
+    #[test]
+    fn bench_bypasses_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("data.db");
         let url = format!("sqlite://{}", db_path.display());
@@ -926,7 +902,7 @@ mod tests {
         args.bench_warmup = 0;
         // Run; the synth args target an on-disk sqlite that connect
         // will create automatically.
-        run(args, &global).await.expect("bench run must succeed");
+        run(args, &global).expect("bench run must succeed");
         assert!(
             cache::take_last().is_none(),
             "--bench must not record a cache hit/miss event"
@@ -939,8 +915,8 @@ mod tests {
     }
 
     // 19. is_modifying SQL bypasses insert: cache row count stays 0.
-    #[tokio::test(flavor = "current_thread")]
-    async fn is_modifying_bypasses_insert() {
+    #[test]
+    fn is_modifying_bypasses_insert() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("data.db");
         let url = format!("sqlite://{}", db_path.display());
@@ -956,7 +932,7 @@ mod tests {
 
         let mut args = synth_query_args(&url, "INSERT INTO t VALUES (2)");
         args.cache = Some("5m".into());
-        run(args, &global).await.expect("insert run must succeed");
+        run(args, &global).expect("insert run must succeed");
         assert_eq!(
             cache_count(&cache_path),
             0,

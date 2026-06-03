@@ -120,12 +120,17 @@ fn main() {
     }))
     .ok();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-
-    let result: Result<(), CliError> = rt.block_on(async {
+    // #64: ferrule-sql is now synchronous and owns a private
+    // current-thread runtime inside each connection handle. The CLI
+    // therefore drives dispatch on the calling thread directly — no
+    // outer runtime — so those per-connection runtimes never nest
+    // inside an ambient one ("cannot start a runtime from within a
+    // runtime"). The two subsystems that still need async (the
+    // connection-pool daemon and `--watch`) own a local runtime at
+    // their own call sites and hop connection work onto a blocking
+    // thread; an async embedder of ferrule-sql does the same via
+    // `tokio::task::spawn_blocking`.
+    let result: Result<(), CliError> = {
         let cli = Cli::parse();
         let global_config =
             ferrule_config::GlobalConfig::load(cli.config.as_deref()).unwrap_or_default();
@@ -134,27 +139,27 @@ fn main() {
         let start = std::time::Instant::now();
 
         let outcome = match cli.command {
-            Commands::Connection(args) => commands::conn::run(args, &global_config).await,
-            Commands::Query(args) => commands::query::run(args, &global_config).await,
-            Commands::Bookmark(args) => commands::bookmark::run(args, &global_config).await,
-            Commands::Explain(args) => commands::explain::run(args, &global_config).await,
-            Commands::Repl(args) => commands::repl::run(args, &global_config).await,
-            Commands::Watch(args) => commands::watch::run(args, &global_config).await,
-            Commands::Dump(args) => commands::dump::run(args, &global_config).await,
-            Commands::Export(args) => commands::export::run(args, &global_config).await,
-            Commands::Load(args) => commands::load::run(args, &global_config).await,
-            Commands::Tables(args) => commands::tables::run(args, &global_config).await,
-            Commands::Describe(args) => commands::describe::run(args, &global_config).await,
-            Commands::Diff(args) => commands::diff::run(args, &global_config).await,
-            Commands::Copy(args) => commands::copy::run(*args, &global_config).await,
-            Commands::Migrate(args) => commands::migrate::run(args, &global_config).await,
-            Commands::History(args) => commands::history::run(args, &global_config).await,
-            Commands::Slow(args) => commands::history::run_slow(args, &global_config).await,
+            Commands::Connection(args) => commands::conn::run(args, &global_config),
+            Commands::Query(args) => commands::query::run(args, &global_config),
+            Commands::Bookmark(args) => commands::bookmark::run(args, &global_config),
+            Commands::Explain(args) => commands::explain::run(args, &global_config),
+            Commands::Repl(args) => commands::repl::run(args, &global_config),
+            Commands::Watch(args) => commands::watch::run(args, &global_config),
+            Commands::Dump(args) => commands::dump::run(args, &global_config),
+            Commands::Export(args) => commands::export::run(args, &global_config),
+            Commands::Load(args) => commands::load::run(args, &global_config),
+            Commands::Tables(args) => commands::tables::run(args, &global_config),
+            Commands::Describe(args) => commands::describe::run(args, &global_config),
+            Commands::Diff(args) => commands::diff::run(args, &global_config),
+            Commands::Copy(args) => commands::copy::run(*args, &global_config),
+            Commands::Migrate(args) => commands::migrate::run(args, &global_config),
+            Commands::History(args) => commands::history::run(args, &global_config),
+            Commands::Slow(args) => commands::history::run_slow(args, &global_config),
         };
 
         record_dispatch(&global_config, snapshot, start.elapsed(), &outcome);
         outcome
-    });
+    };
 
     if let Err(err) = result {
         let code = err.exit_code();

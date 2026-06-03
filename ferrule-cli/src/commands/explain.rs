@@ -27,7 +27,7 @@ pub struct ExplainArgs {
     pub conn_flags: ConnectionFlags,
 }
 
-pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);
 
     if args.output.verbose {
@@ -41,8 +41,7 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
         args.conn_flags.ssh_key.as_deref(),
         args.conn_flags.proxy_url.as_deref(),
         global_config,
-    )
-    .await?;
+    )?;
     check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
 
     if args.output.verbose {
@@ -74,8 +73,7 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
             format,
             None,
             None,
-        )
-        .await?;
+        )?;
         // Try to pretty-print JSON / XML
         print_payload(&payload, explain_out);
         return Ok(());
@@ -89,13 +87,10 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
         eprintln!("Warning: --insecure disables TLS certificate verification.");
     }
 
-    let mut conn = connect_resolved(resolved, &opts).await?;
+    let mut conn = connect_resolved(resolved, &opts)?;
 
     let result = if is_multi {
-        let results = conn
-            .execute_multi(&wrapped_sql)
-            .await
-            .map_err(CliError::query)?;
+        let results = conn.execute_multi(&wrapped_sql).map_err(CliError::query)?;
         results
             .into_iter()
             .find_map(|r| match r {
@@ -108,7 +103,7 @@ pub async fn run(args: ExplainArgs, global_config: &GlobalConfig) -> Result<(), 
                 ))
             })?
     } else {
-        conn.query(&wrapped_sql).await.map_err(CliError::query)?
+        conn.query(&wrapped_sql).map_err(CliError::query)?
     };
 
     let rendered = format_result(&result, format).map_err(CliError::query)?;

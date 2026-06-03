@@ -97,11 +97,11 @@ impl SlowArgs {
     }
 }
 
-pub async fn run_slow(args: SlowArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
-    run(args.into_history(), global_config).await
+pub fn run_slow(args: SlowArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+    run(args.into_history(), global_config)
 }
 
-pub async fn run(args: HistoryArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+pub fn run(args: HistoryArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
     let format = args.output.resolve_format(global_config);
     let limit = args.output.resolve_limit(global_config);
     let offset = args.output.offset;
