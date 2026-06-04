@@ -157,7 +157,7 @@ fn main() {
             Commands::Tui(args) => tui::run(args, &global_config),
             #[cfg(not(feature = "tui"))]
             Commands::Tui(_) => Err(CliError::usage(
-                "This ferrule binary was built without the `tui` feature.                  Rebuild with `cargo build --features ferrule-cli/tui`.",
+                "This ferrule binary was built without the `tui` feature.                  Rebuild with `cargo build --features ferrule/tui`.",
             )),
             Commands::Watch(args) => commands::watch::run(args, &global_config),
             Commands::Dump(args) => commands::dump::run(args, &global_config),

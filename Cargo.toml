@@ -3,7 +3,11 @@ members = ["ferrule-sql", "ferrule-core", "ferrule-config", "ferrule-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+# ferrule-config / ferrule-core / ferrule-cli inherit this version. ferrule-sql
+# pins its own (`0.1.0-alpha`) — it shipped its first crates.io cut before the
+# rest of the workspace. The 0.2.0-alpha train supersedes the `ferrule`
+# 0.1.0-alpha placeholder already on crates.io and matches hasp's 0.2.0-alpha.
+version = "0.2.0-alpha"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Ferrule Contributors"]

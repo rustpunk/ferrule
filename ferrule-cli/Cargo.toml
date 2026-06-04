@@ -1,10 +1,19 @@
 [package]
-name = "ferrule-cli"
+# The package is `ferrule` (the marquee, user-installable binary: `cargo
+# install ferrule`), implemented on top of the reusable ferrule-sql /
+# ferrule-core / ferrule-config libraries. The crate directory stays
+# `ferrule-cli/` and the workspace member path is unchanged.
+name = "ferrule"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Rust-native database query CLI for Postgres, MySQL, MSSQL, SQLite, and Oracle. Part of the rustpunk portfolio."
+readme = "README.md"
+keywords = ["database", "sql", "cli", "postgres", "mysql"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "ferrule"
@@ -34,9 +43,9 @@ tui = ["dep:ratatui"]
 # in turn forwards to ferrule-sql), so cargo's per-crate feature
 # unification keeps the ssh-gated `connect_with_tunnel` available to the
 # CLI whenever the CLI's `ssh` feature is on.
-ferrule-sql = { path = "../ferrule-sql" }
-ferrule-core = { path = "../ferrule-core" }
-ferrule-config = { path = "../ferrule-config" }
+ferrule-sql = { path = "../ferrule-sql", version = "0.1.0-alpha" }
+ferrule-core = { path = "../ferrule-core", version = "0.2.0-alpha" }
+ferrule-config = { path = "../ferrule-config", version = "0.2.0-alpha" }
 
 clap = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
@@ -63,7 +72,7 @@ jmespath = "0.5"
 dashmap = "6"
 dirs = { workspace = true }
 indexmap = { workspace = true }
-hasp = { path = "../../hasp/crates/hasp", default-features = false, features = ["env", "keyring", "file"] }
+hasp = { path = "../../hasp/crates/hasp", version = "0.2.0-alpha", default-features = false, features = ["env", "keyring", "file"] }
 
 # Persistent query history store (R4 / #4).
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }

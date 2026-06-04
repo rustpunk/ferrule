@@ -222,7 +222,7 @@ fn connect_via_ssh_tunnel(
     let _ = (&ssh.config, &ssh.key_source);
     Err(CliError::usage(
         "This ferrule binary was built without the `ssh` feature. \
-         Rebuild with `cargo build --features ferrule-cli/ssh` (or `--features all`)."
+         Rebuild with `cargo build --features ferrule/ssh` (or `--features all`)."
             .to_string(),
     ))
 }

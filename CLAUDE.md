@@ -468,7 +468,7 @@ that opens a `direct-tcpip` channel and either pipes the russh
 `ChannelStream` straight into `tokio_postgres::Config::connect_raw`
 (Postgres), or binds a local TCP listener and forwards bytes through
 the SSH session (every other backend). The `ssh` Cargo feature is
-opt-in: build with `--features ferrule-cli/ssh` (or `--features all`).
+opt-in: build with `--features ferrule/ssh` (or `--features all`).
 
 Manual integration test: pair a `linuxserver/openssh-server` container
 with the existing Postgres container and confirm `ferrule conn test`

@@ -262,10 +262,10 @@ The SSH stack is opt-in via the `ssh` Cargo feature:
 cargo build --release
 
 # With SSH support
-cargo build --release --features ferrule-cli/ssh
+cargo build --release --features ferrule/ssh
 
 # All features (Oracle + SSH)
-cargo build --release --features ferrule-cli/all
+cargo build --release --features ferrule/all
 ```
 
 The default build excludes russh because the SSH dependency stack
@@ -278,7 +278,7 @@ binary:
 
 ```text
 This ferrule binary was built without the `ssh` feature. Rebuild
-with `cargo build --features ferrule-cli/ssh` (or `--features all`).
+with `cargo build --features ferrule/ssh` (or `--features all`).
 ```
 
 ## Troubleshooting
