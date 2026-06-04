@@ -15,6 +15,14 @@ default = ["ferrule-core/postgres", "ferrule-core/mysql", "ferrule-core/mssql", 
 all = ["ferrule-core/oracle", "ferrule-core/ssh"]
 oracle = ["ferrule-core/oracle"]
 ssh = ["ferrule-core/ssh"]
+# Harlequin-style terminal UI (`ferrule tui`). Off by default like
+# `ssh`/`oracle`. NOT folded into `all` (which stays backend-only), but
+# CI's `cargo clippy --all-features` and `cargo doc --workspace` DO turn
+# it on, so every line of the tui module must stay clippy- and
+# rustdoc-clean. Pulls in ratatui 0.29, whose bundled crossterm backend
+# matches the crossterm 0.28 pin below (do not bump to ratatui 0.30,
+# which needs crossterm 0.29 and would split the version in-tree).
+tui = ["dep:ratatui"]
 
 [dependencies]
 # The extracted SQL driver core: neutral Value/Row types, DatabaseUrl
@@ -40,6 +48,11 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 crossterm = "0.28"
 notify = "8"
+
+# Harlequin-style terminal UI backend (the `tui` feature). Default
+# features include the crossterm backend, which resolves to the same
+# crossterm 0.28 pinned directly above — one crossterm version in-tree.
+ratatui = { version = "0.29", optional = true }
 
 rpassword = { workspace = true }
 rustyline = "15"

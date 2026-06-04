@@ -336,6 +336,23 @@ pub struct TablesArgs {
     pub conn_flags: ConnectionFlags,
 }
 
+/// TUI command arguments — open the interactive terminal UI against a
+/// connection. The struct is always present (it is plain clap args) so
+/// the `tui` subcommand appears in `--help` even without the feature; a
+/// non-tui build's dispatch prints a "rebuild with --features tui"
+/// diagnostic, mirroring the SSH "built without ssh" path.
+#[derive(Args, Clone, Debug)]
+pub struct TuiArgs {
+    /// Connection name or raw URL
+    pub connection: String,
+
+    #[command(flatten)]
+    pub output: OutputFlags,
+
+    #[command(flatten)]
+    pub conn_flags: ConnectionFlags,
+}
+
 /// Schema command arguments — list schemas/databases on a connection.
 #[derive(Args, Clone, Debug)]
 pub struct SchemaArgs {
