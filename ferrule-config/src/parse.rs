@@ -62,6 +62,63 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(dur)
 }
 
+/// Parse a human-readable byte size like `1024`, `10MB`, or `5MiB`
+/// into a count of bytes.
+///
+/// Sibling of [`parse_duration`] (same trim -> split -> numeric-prefix ->
+/// unit-match shape) but a distinct unit class, kept separate per the
+/// module docs rather than folded into one over-general parser.
+///
+/// Recognised units:
+///   - bare integer (`"1024"`) -> bytes
+///   - `B` -> bytes
+///   - decimal SI (powers of 1000): `KB`, `MB`, `GB`
+///   - binary IEC (powers of 1024): `KiB`, `MiB`, `GiB`
+///
+/// The unit match is case-sensitive on the IEC `i` (so `KiB` is binary
+/// and `KB` is decimal). A leading `-` is non-digit, so negative inputs
+/// fall out the same way `parse_duration("-5m")` does (no number before
+/// the unit). The multiplier is applied with [`u64::checked_mul`] so an
+/// oversized input (`"99999999999GB"`) returns `Err` rather than
+/// overflowing -- this is a library crate and must not panic.
+///
+/// The error is a plain `String` so both the `String`-erroring config
+/// layer and the `CliError`-erroring CLI layer can wrap it without a
+/// shared error type.
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("size is empty".into());
+    }
+    let split = match s.find(|c: char| !c.is_ascii_digit()) {
+        // No unit suffix at all -> a bare integer is a byte count.
+        None => {
+            return s.parse().map_err(|_| format!("size '{s}': invalid number"));
+        }
+        Some(i) => i,
+    };
+    let (num, unit) = s.split_at(split);
+    if num.is_empty() {
+        return Err(format!("size '{s}': missing number before unit"));
+    }
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("size '{s}': invalid number '{num}'"))?;
+    let unit = unit.trim();
+    let mul: u64 = match unit {
+        "B" => 1,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "KiB" => 1_024,
+        "MiB" => 1_024 * 1_024,
+        "GiB" => 1_024 * 1_024 * 1_024,
+        other => return Err(format!("size '{s}': unknown unit '{other}'")),
+    };
+    n.checked_mul(mul)
+        .ok_or_else(|| format!("size '{s}': value overflows u64 bytes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +176,65 @@ mod tests {
     fn error_messages_name_the_input() {
         let err = parse_duration("10x").unwrap_err();
         assert!(err.contains("10x"), "error should echo the input: {err}");
+        assert!(
+            err.contains("unknown unit"),
+            "error should name the fault: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_size_bare_integer_is_bytes() {
+        assert_eq!(parse_size("0").unwrap(), 0);
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn parse_size_decimal_si_units() {
+        assert_eq!(parse_size("1B").unwrap(), 1);
+        assert_eq!(parse_size("1KB").unwrap(), 1_000);
+        assert_eq!(parse_size("1MB").unwrap(), 1_000_000);
+        assert_eq!(parse_size("2GB").unwrap(), 2_000_000_000);
+    }
+
+    #[test]
+    fn parse_size_binary_iec_units() {
+        assert_eq!(parse_size("1KiB").unwrap(), 1_024);
+        assert_eq!(parse_size("1MiB").unwrap(), 1_048_576);
+        assert_eq!(parse_size("1GiB").unwrap(), 1_073_741_824);
+    }
+
+    #[test]
+    fn parse_size_trims_surrounding_whitespace() {
+        assert_eq!(parse_size("  5MB ").unwrap(), 5_000_000);
+    }
+
+    #[test]
+    fn parse_size_rejects_bad_inputs() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("   ").is_err());
+        assert!(parse_size("abc").is_err()); // no leading number
+        assert!(parse_size("5x").is_err()); // unknown unit
+        assert!(parse_size("-5MB").is_err()); // leading '-' is non-digit -> no number
+    }
+
+    #[test]
+    fn parse_size_oversized_value_errors_without_panic() {
+        // checked_mul: 99999999999 * 1_000_000_000 overflows u64.
+        let err = parse_size("99999999999GB").unwrap_err();
+        assert!(
+            err.contains("99999999999GB"),
+            "error should echo input: {err}"
+        );
+        assert!(
+            err.contains("overflow"),
+            "error should name overflow: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_size_error_messages_name_the_input() {
+        let err = parse_size("5x").unwrap_err();
+        assert!(err.contains("5x"), "error should echo the input: {err}");
         assert!(
             err.contains("unknown unit"),
             "error should name the fault: {err}"

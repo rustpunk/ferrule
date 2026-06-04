@@ -77,6 +77,12 @@ pub struct HistoryFilter {
 struct SlowSink {
     file: Mutex<std::fs::File>,
     threshold_ms: u64,
+    /// Path of the live log, needed to rename it on rotation. The
+    /// archive lives at `<path>.1`.
+    path: PathBuf,
+    /// Rotate to `<path>.1` before a write that would push the file past
+    /// this many bytes (#55). `None` disables rotation.
+    max_size_bytes: Option<u64>,
 }
 
 /// SQLite-backed history store. Owns one connection; not Send because
@@ -145,6 +151,9 @@ impl HistoryDb {
             if let Some(parent) = slow_path.parent() {
                 std::fs::create_dir_all(parent).map_err(CliError::Io)?;
             }
+            let max_size_bytes = slow
+                .max_size_bytes()
+                .map_err(|e| CliError::usage(format!("slow_log: {e}")))?;
             let file = OpenOptions::new()
                 .append(true)
                 .create(true)
@@ -153,6 +162,8 @@ impl HistoryDb {
             db.slow = Some(SlowSink {
                 file: Mutex::new(file),
                 threshold_ms,
+                path: slow_path,
+                max_size_bytes,
             });
         }
         Ok(Some(db))
@@ -211,6 +222,26 @@ impl HistoryDb {
             .file
             .lock()
             .map_err(|e| CliError::usage(format!("slow_log: lock poisoned: {e}")))?;
+        // #55: single-archive rotation. Under the held lock so two
+        // records in the same process can't both rotate. If appending
+        // this line would push the file past the configured cap, move
+        // the current log to `<path>.1` (overwriting any prior archive)
+        // and start a fresh empty log. A file that is already over-cap
+        // but empty-after-rotation still accepts an oversized line — the
+        // cap bounds the *count* of retained lines, not a single line.
+        if let Some(cap) = sink.max_size_bytes {
+            let current = file.metadata().map_err(CliError::Io)?.len();
+            if current > 0 && current.saturating_add(line.len() as u64) > cap {
+                let archive = rotated_path(&sink.path);
+                std::fs::rename(&sink.path, &archive).map_err(CliError::Io)?;
+                let fresh = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&sink.path)
+                    .map_err(CliError::Io)?;
+                *file = fresh;
+            }
+        }
         file.write_all(line.as_bytes()).map_err(CliError::Io)?;
         Ok(())
     }
@@ -373,6 +404,15 @@ fn resolve_slow_path(cfg: &SlowLogConfig) -> Result<PathBuf, CliError> {
 
 fn oneline_for_log(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The single rotation archive path for a slow-log file: `<path>.1`.
+/// Appends `.1` to the file name (preserving any existing extension) so
+/// `slow.log` rotates to `slow.log.1`.
+fn rotated_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".1");
+    PathBuf::from(name)
 }
 
 /// Shell-style glob: `*` matches any run, `?` matches a single char.
@@ -645,6 +685,14 @@ mod tests {
     }
 
     fn open_memory_with_slow(path: &std::path::Path, threshold_ms: u64) -> HistoryDb {
+        open_memory_with_slow_cap(path, threshold_ms, None)
+    }
+
+    fn open_memory_with_slow_cap(
+        path: &std::path::Path,
+        threshold_ms: u64,
+        max_size_bytes: Option<u64>,
+    ) -> HistoryDb {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let file = OpenOptions::new()
@@ -657,6 +705,8 @@ mod tests {
             slow: Some(SlowSink {
                 file: Mutex::new(file),
                 threshold_ms,
+                path: path.to_path_buf(),
+                max_size_bytes,
             }),
         }
     }
@@ -694,6 +744,92 @@ mod tests {
         db.record(&rec("never-slow", 5), &cfg).unwrap();
         let body = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(body.is_empty(), "slow.log should be empty, got {body:?}");
+    }
+
+    // #55: when the slow log crosses the configured byte cap, the live
+    // file is rotated to `<path>.1` (single archive) and a fresh log is
+    // started. The oldest teed lines end up in `.1`; the newest stay in
+    // the live log. A second rotation overwrites `.1` rather than
+    // accumulating `.2`, `.3`, …
+    #[test]
+    fn slow_log_rotates_single_archive_on_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("slow.log");
+        let archive = tmp.path().join("slow.log.1");
+        // A single teed line for "slow-N" is well under 200 bytes; cap
+        // at 200 forces a rotation after a few lines.
+        let mut db = open_memory_with_slow_cap(&log, 100, Some(200));
+        let cfg = HistoryConfig::default();
+
+        // Record enough slow rows to rotate at least twice. Each line is
+        // tagged with a monotonic marker so we can assert which file it
+        // landed in.
+        for i in 0..40 {
+            db.record(&rec(&format!("marker-{i:02}"), 150), &cfg)
+                .unwrap();
+        }
+
+        // Both files must exist after crossing the cap.
+        assert!(log.exists(), "live log must exist");
+        assert!(archive.exists(), "archive (.1) must exist after rotation");
+
+        // The live log must respect the cap (allowing the over-cap final
+        // line that triggered the *next* rotation not to have happened
+        // yet — i.e. length <= cap + one line).
+        let live = std::fs::read_to_string(&log).unwrap();
+        let archived = std::fs::read_to_string(&archive).unwrap();
+        let max_line = live
+            .lines()
+            .chain(archived.lines())
+            .map(|l| l.len() + 1)
+            .max()
+            .unwrap_or(0) as u64;
+        assert!(
+            live.len() as u64 <= 200 + max_line,
+            "live log {} bytes exceeds cap+one-line; got:\n{live}",
+            live.len()
+        );
+
+        // Single-archive semantics: no `.2` is ever produced.
+        let two = tmp.path().join("slow.log.2");
+        assert!(
+            !two.exists(),
+            "only one archive (.1) should exist, never .2"
+        );
+
+        // The newest marker lives in the live log; an older marker lives
+        // in the archive (proving rotation moved old lines aside).
+        assert!(
+            live.contains("marker-39"),
+            "newest line should be in the live log; live:\n{live}"
+        );
+        let newest_in_archive = archived.contains("marker-39");
+        assert!(
+            !newest_in_archive,
+            "newest line must not be in the archive; archive:\n{archived}"
+        );
+        assert!(
+            archived.contains("marker-"),
+            "archive should hold older teed lines; archive:\n{archived}"
+        );
+    }
+
+    // #55: with no cap configured the log grows unbounded and no archive
+    // is created — rotation is strictly opt-in.
+    #[test]
+    fn slow_log_no_cap_never_rotates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("slow.log");
+        let archive = tmp.path().join("slow.log.1");
+        let mut db = open_memory_with_slow_cap(&log, 100, None);
+        let cfg = HistoryConfig::default();
+        for i in 0..50 {
+            db.record(&rec(&format!("line-{i}"), 150), &cfg).unwrap();
+        }
+        assert!(log.exists());
+        assert!(!archive.exists(), "no archive without a configured cap");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(body.lines().count(), 50, "all lines stay in one file");
     }
 
     #[test]
