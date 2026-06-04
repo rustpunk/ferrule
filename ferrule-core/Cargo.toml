@@ -5,6 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Result formatters, output rendering, and credential-resolution glue layered on the ferrule-sql driver core — the shared library behind the ferrule database CLI."
+documentation = "https://docs.rs/ferrule-core"
+readme = "README.md"
+keywords = ["database", "sql", "formatter", "cli", "ferrule"]
+categories = ["database"]
+
+# Backend features forward through to ferrule-sql; build docs.rs with all of
+# them so the rendered docs are complete (the default feature set is empty).
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
@@ -21,12 +32,12 @@ ssh = ["ferrule-sql/ssh"]
 # dispatcher, transaction helpers, the copy/bulk write path, the
 # Dialect classifier, and the SqlError error type. ferrule-core's
 # backend features forward straight through to ferrule-sql's.
-ferrule-sql = { path = "../ferrule-sql" }
+ferrule-sql = { path = "../ferrule-sql", version = "0.1.0-alpha" }
 
 # Config (needed by resolver — the only ferrule-core module that
 # touches credential resolution; kept out of ferrule-sql so the SQL
 # core stays config-free).
-ferrule-config = { path = "../ferrule-config" }
+ferrule-config = { path = "../ferrule-config", version = "0.2.0-alpha" }
 
 tokio = { workspace = true }
 serde = { workspace = true }

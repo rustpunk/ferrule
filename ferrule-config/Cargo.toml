@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Connection registry, profiles, and the layered credential-resolution stack (CLI flag / env / OS keyring / file via hasp) for the ferrule database CLI."
+documentation = "https://docs.rs/ferrule-config"
+readme = "README.md"
+keywords = ["database", "credentials", "keyring", "config", "ferrule"]
+categories = ["database"]
 
 [dependencies]
 serde = { workspace = true }
@@ -14,7 +20,7 @@ toml = { workspace = true }
 secrecy = { workspace = true }
 indexmap = { workspace = true }
 chrono = { workspace = true }
-hasp = { path = "../../hasp/crates/hasp", default-features = false, features = ["env", "keyring", "file"] }
+hasp = { path = "../../hasp/crates/hasp", version = "0.2.0-alpha", default-features = false, features = ["env", "keyring", "file"] }
 
 [dev-dependencies]
 tempfile = "3"
