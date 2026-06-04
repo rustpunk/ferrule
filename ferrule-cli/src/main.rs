@@ -11,12 +11,14 @@ mod path_util;
 mod repl;
 mod ssh_flags;
 mod ssh_keys;
+#[cfg(feature = "tui")]
+mod tui;
 mod watch;
 
 use commands::{
     BookmarkArgs, ConnArgs, CopyArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, ExportArgs,
     HistoryArgs, LoadArgs, MigrateArgs, QueryArgs, ReplArgs, SchemaArgs, SlowArgs, TablesArgs,
-    WatchArgs,
+    TuiArgs, WatchArgs,
 };
 use error::CliError;
 use history::{HistoryDb, RunRecord};
@@ -56,6 +58,9 @@ enum Commands {
     /// Interactive REPL
     #[command(alias = "r")]
     Repl(ReplArgs),
+
+    /// Interactive terminal UI (requires the `tui` feature)
+    Tui(TuiArgs),
 
     /// Execute a SQL query
     #[command(alias = "q")]
@@ -148,6 +153,12 @@ fn main() {
             Commands::Bookmark(args) => commands::bookmark::run(args, &global_config),
             Commands::Explain(args) => commands::explain::run(args, &global_config),
             Commands::Repl(args) => commands::repl::run(args, &global_config),
+            #[cfg(feature = "tui")]
+            Commands::Tui(args) => tui::run(args, &global_config),
+            #[cfg(not(feature = "tui"))]
+            Commands::Tui(_) => Err(CliError::usage(
+                "This ferrule binary was built without the `tui` feature.                  Rebuild with `cargo build --features ferrule-cli/tui`.",
+            )),
             Commands::Watch(args) => commands::watch::run(args, &global_config),
             Commands::Dump(args) => commands::dump::run(args, &global_config),
             Commands::Export(args) => commands::export::run(args, &global_config),
@@ -257,6 +268,7 @@ impl Snapshot {
             Commands::Bookmark(_) => ("bookmark", None, None, false),
             Commands::Connection(_) => ("conn", None, None, false),
             Commands::Repl(a) => ("repl", a.connection.as_deref().map(redact), None, false),
+            Commands::Tui(a) => ("tui", Some(redact(&a.connection)), None, false),
             // Don't recursively log every `ferrule history` read.
             Commands::History(_) => ("history", None, None, true),
             Commands::Slow(_) => ("slow", None, None, true),
