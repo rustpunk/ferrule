@@ -17,6 +17,7 @@ pub mod formatter;
 pub mod load;
 pub mod migrate;
 pub mod params;
+pub mod redact;
 pub mod resolver;
 
 pub use dump::{dump_query, dump_table, DumpFormat, DumpOptions};
@@ -24,3 +25,4 @@ pub use explain::{explain_sql, is_modifying, ExplainOutput};
 pub use formatter::{format_result, OutputFormat};
 pub use load::{infer_schema, load_data, LoadFormat, LoadOptions};
 pub use params::{infer_type, load_from_json, parse_param, substitute, ParameterSet};
+pub use redact::redact_sql;

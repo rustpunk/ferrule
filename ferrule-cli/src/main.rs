@@ -190,12 +190,24 @@ struct Snapshot {
 
 impl Snapshot {
     fn capture(cmd: &Commands) -> Self {
+        // Two redaction layers are paired at this single capture site so
+        // nothing secret reaches the history store or the slow-log tee:
+        //   - `redact(conn)` scrubs the connection-URL password via
+        //     `DatabaseUrl::redacted` (url.rs).
+        //   - `redact_sql(sql)` scrubs inline secrets in the SQL body
+        //     (PASSWORD / IDENTIFIED BY literals, embedded connection
+        //     URLs) via `ferrule_core::redact_sql` (#49).
         let (name, conn, sql, skip) = match cmd {
-            Commands::Query(a) => ("query", Some(redact(&a.connection)), a.sql.clone(), false),
+            Commands::Query(a) => (
+                "query",
+                Some(redact(&a.connection)),
+                a.sql.as_deref().map(ferrule_core::redact_sql),
+                false,
+            ),
             Commands::Watch(a) => (
                 "watch",
                 Some(redact(&a.connection)),
-                Some(a.sql.clone()),
+                Some(ferrule_core::redact_sql(&a.sql)),
                 false,
             ),
             Commands::Tables(a) => ("tables", Some(redact(&a.connection)), None, false),
@@ -208,7 +220,7 @@ impl Snapshot {
             Commands::Explain(a) => (
                 "explain",
                 Some(redact(&a.connection)),
-                Some(a.sql.clone()),
+                Some(ferrule_core::redact_sql(&a.sql)),
                 false,
             ),
             Commands::Dump(a) => ("dump", Some(redact(&a.connection)), None, false),
@@ -216,7 +228,7 @@ impl Snapshot {
             Commands::Export(a) => (
                 "export",
                 Some(redact(&a.connection)),
-                Some(a.sql.clone()),
+                Some(ferrule_core::redact_sql(&a.sql)),
                 false,
             ),
             Commands::Diff(a) => (
@@ -232,7 +244,7 @@ impl Snapshot {
             Commands::Copy(a) => (
                 "copy",
                 Some(format!("{} | {}", redact(&a.source), redact(&a.dest))),
-                a.query.clone(),
+                a.query.as_deref().map(ferrule_core::redact_sql),
                 false,
             ),
             Commands::Migrate(_) => ("migrate", None, None, false),
