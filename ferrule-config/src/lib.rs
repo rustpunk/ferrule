@@ -3,6 +3,7 @@
 pub mod bookmarks;
 pub mod credentials;
 pub mod error;
+pub mod parse;
 pub mod profile;
 pub mod registry;
 

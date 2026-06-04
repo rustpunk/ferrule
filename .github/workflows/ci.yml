@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Supersede in-flight runs on the same ref so a quick re-push doesn't queue.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # ferrule-config depends on the sibling `hasp` repo through a relative
+  # path dependency (`../../hasp/crates/hasp`). The crates.io `hasp` is only
+  # a name-reservation placeholder and does not satisfy ferrule's feature
+  # requirements, so every job clones the GitHub source as a sibling of the
+  # checkout before invoking cargo. See CLAUDE.md ("clone the sibling hasp").
+  HASP_REPO: https://github.com/rustpunk/hasp.git
+
+jobs:
+  gate:
+    name: fmt · clippy · build · test · doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone sibling hasp
+        # github.workspace is .../<repo>/<repo>, so ../hasp lands a true
+        # sibling that the `../../hasp/crates/hasp` path dep resolves to.
+        run: git clone --depth 1 "$HASP_REPO" ../hasp
+
+      - name: Install system libraries
+        # libdbus-1-dev + pkg-config: hasp's keyring backend on Linux.
+        # libssl-dev: the opt-in `mssql` backend (tiberius → native-tls →
+        # openssl-sys) compiled under --all-features. The four C-free
+        # default backends need none of these — they are here only so the
+        # all-features clippy/test passes can build mssql.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: clippy (all features)
+        # ferrule-sql advertises a C-free *default*; the opt-in oracle / ssh
+        # / mssql backends must still lint clean. Keeping --all-features here
+        # is also what cleared issue #54 from blocking the matrix.
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      - name: build
+        run: cargo build --workspace
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: test (all features)
+        # Backend integration tests connect to fixed localhost ports and skip
+        # gracefully when no DB container / Oracle Instant Client is present
+        # (see CLAUDE.md), so this stays green on a bare runner.
+        run: cargo test --workspace --all-features
+
+      - name: doc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+  supply-chain:
+    name: cargo-deny · C-free firewall
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone sibling hasp
+        # cargo-deny and `cargo tree` resolve the dependency graph, which
+        # reads hasp's manifest through the path dep — so it must be present
+        # even though neither step compiles anything.
+        run: git clone --depth 1 "$HASP_REPO" ../hasp
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo-deny (advisories · bans · licenses · sources)
+        # Reads deny.toml. Its [graph] section scopes the check to the C-free
+        # shipping surface (postgres + mysql + sqlite + oracle, no defaults);
+        # [bans] enforces the issue #67 firewall.
+        run: cargo deny check
+
+      - name: C-free firewall (cargo tree)
+        # Independent, human-readable confirmation that the four banned
+        # crates are absent from the canonical C-free surface (ferrule-sql
+        # with postgres + mysql). Complements deny.toml [bans], which
+        # enforces the same invariant across the wider scoped graph.
+        run: |
+          set -uo pipefail
+          banned=(aws-lc-sys openssl-sys native-tls libz-sys)
+          status=0
+          for crate in "${banned[@]}"; do
+            if cargo tree -p ferrule-sql --no-default-features \
+                 --features postgres,mysql -i "$crate" >/dev/null 2>&1; then
+              echo "::error::C-free firewall breached: '$crate' is present in the ferrule-sql {postgres,mysql} graph"
+              cargo tree -p ferrule-sql --no-default-features \
+                --features postgres,mysql -i "$crate" || true
+              status=1
+            else
+              echo "ok: $crate absent from the C-free graph"
+            fi
+          done
+          exit "$status"

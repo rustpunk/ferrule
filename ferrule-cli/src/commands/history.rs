@@ -206,29 +206,13 @@ fn oneline(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Lightweight `1h` / `30m` / `2d` parser. We don't pull in `humantime`
-/// for one call site — Phase 2 will add the dep when slow-log threshold
-/// parsing needs it.
+/// Parse `ferrule history --since DURATION` (`30s`, `5m`, `2h`, `3d`, …).
+///
+/// Delegates to the shared [`ferrule_config::parse::parse_duration`] so the
+/// recognised units stay in lock-step with the `[slow_log] threshold`
+/// parser. Like that parser, a bare integer (no unit) is rejected.
 fn parse_since(s: &str) -> Result<Duration, CliError> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(CliError::usage("--since requires a value like 1h, 30m, 2d"));
-    }
-    let (num, suffix) = s.split_at(
-        s.find(|c: char| !c.is_ascii_digit())
-            .ok_or_else(|| CliError::usage(format!("--since: missing unit suffix in '{s}'")))?,
-    );
-    let n: i64 = num
-        .parse()
-        .map_err(|_| CliError::usage(format!("--since: invalid number '{num}'")))?;
-    let dur = match suffix {
-        "s" | "sec" | "secs" => Duration::seconds(n),
-        "m" | "min" | "mins" => Duration::minutes(n),
-        "h" | "hr" | "hrs" => Duration::hours(n),
-        "d" | "day" | "days" => Duration::days(n),
-        _ => return Err(CliError::usage(format!("--since: unknown unit '{suffix}'"))),
-    };
-    Ok(dur)
+    ferrule_config::parse::parse_duration(s).map_err(|e| CliError::usage(format!("--since: {e}")))
 }
 
 #[cfg(test)]
