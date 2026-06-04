@@ -185,6 +185,12 @@ fn default_history_max_rows() -> u64 {
 /// explicit opt-in. When enabled, the `HistoryDb::record` hook also
 /// appends a tab-separated line to `path` for every run whose
 /// `duration_ms >= threshold_ms`.
+///
+/// `max_size` (#55) caps the slow-log file: before a tee write that
+/// would push the file past the cap, the existing log is rotated to
+/// `<path>.1` (a single archive — a second rotation overwrites it) and
+/// a fresh empty log is started. `None` (the default) disables rotation
+/// so the log grows unbounded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlowLogConfig {
@@ -198,6 +204,11 @@ pub struct SlowLogConfig {
     /// `<XDG_DATA_HOME>/ferrule/slow.log`.
     #[serde(default)]
     pub path: Option<String>,
+    /// Maximum slow-log file size before single-archive rotation, as a
+    /// byte-size string (`"10MB"`, `"5MiB"`, or a bare integer of
+    /// bytes). `None` disables rotation. See [`Self::max_size_bytes`].
+    #[serde(default)]
+    pub max_size: Option<String>,
 }
 
 impl Default for SlowLogConfig {
@@ -206,6 +217,7 @@ impl Default for SlowLogConfig {
             enabled: false,
             threshold: default_slow_threshold(),
             path: None,
+            max_size: None,
         }
     }
 }
@@ -216,6 +228,16 @@ impl SlowLogConfig {
     /// `Err` with a clear message on bad input.
     pub fn threshold_ms(&self) -> Result<u64, String> {
         parse_threshold_ms(&self.threshold)
+    }
+
+    /// Resolve `max_size` to a byte count. Returns `Ok(None)` when no
+    /// cap is configured (rotation disabled), `Ok(Some(bytes))` for a
+    /// valid size string, and `Err` with a clear message on bad input.
+    pub fn max_size_bytes(&self) -> Result<Option<u64>, String> {
+        match self.max_size.as_deref() {
+            None => Ok(None),
+            Some(s) => crate::parse::parse_size(s).map(Some),
+        }
     }
 }
 
@@ -375,6 +397,7 @@ url = "postgres://user:pass@host/db"
             enabled: true,
             threshold: t.into(),
             path: None,
+            max_size: None,
         }
     }
 
@@ -393,6 +416,47 @@ url = "postgres://user:pass@host/db"
         assert!(slow("").threshold_ms().is_err());
         assert!(slow("fast").threshold_ms().is_err());
         assert!(slow("5x").threshold_ms().is_err());
+    }
+
+    #[test]
+    fn slow_log_max_size_bytes_resolves() {
+        // None -> Ok(None) (rotation disabled).
+        assert_eq!(SlowLogConfig::default().max_size_bytes().unwrap(), None);
+        // Configured size -> Ok(Some(bytes)).
+        let mut cfg = SlowLogConfig {
+            max_size: Some("10MB".into()),
+            ..SlowLogConfig::default()
+        };
+        assert_eq!(cfg.max_size_bytes().unwrap(), Some(10_000_000));
+        cfg.max_size = Some("5MiB".into());
+        assert_eq!(cfg.max_size_bytes().unwrap(), Some(5 * 1_024 * 1_024));
+        // Bad input -> Err.
+        cfg.max_size = Some("bad".into());
+        assert!(cfg.max_size_bytes().is_err());
+    }
+
+    #[test]
+    fn slow_log_max_size_round_trips_through_toml() {
+        // deny_unknown_fields means the new key must deserialize; verify
+        // a config that sets it loads and resolves.
+        let toml = r#"
+[slow_log]
+enabled = true
+threshold = "1s"
+max_size = "5MiB"
+"#;
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.slow_log.max_size_bytes().unwrap(),
+            Some(5 * 1_024 * 1_024)
+        );
+        // Absent key -> None.
+        let toml2 = r#"
+[slow_log]
+enabled = true
+"#;
+        let cfg2: GlobalConfig = toml::from_str(toml2).unwrap();
+        assert_eq!(cfg2.slow_log.max_size_bytes().unwrap(), None);
     }
 
     #[test]

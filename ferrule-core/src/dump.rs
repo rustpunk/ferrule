@@ -50,7 +50,7 @@ impl Default for DumpOptions {
     }
 }
 
-/// Dump an entire table using server‑side paging.
+/// Dump an entire table by streaming a single native cursor.
 pub fn dump_table(
     conn: &mut dyn Connection,
     table: &str,
@@ -59,10 +59,11 @@ pub fn dump_table(
 ) -> Result<String, SqlError> {
     let quoted_table = ferrule_sql::copy::quote_identifier(table, backend);
 
-    // Determinism (Scope A): append ORDER BY before paging so that
-    // the per-page LIMIT/OFFSET windows partition a stable order.
-    // ORDER BY must come *before* apply_paging in dump_query — else
-    // the LIMIT/OFFSET would slot between SELECT and ORDER BY.
+    // Determinism (Scope A): append ORDER BY to the SELECT so the
+    // single streaming cursor yields rows in a stable, server-side
+    // order. (No LIMIT/OFFSET windowing is involved any more — one
+    // ordered SELECT streamed through one cursor is strictly more
+    // stable than the old paged path.)
     let sql = if opts.deterministic && opts.format == DumpFormat::Sql {
         let pks = conn.primary_key(opts.schema.as_deref(), table)?;
         let order_cols: Vec<String> = if pks.is_empty() {
@@ -88,8 +89,11 @@ pub fn dump_table(
 
 /// Dump the results of an arbitrary SELECT query.
 ///
-/// Rows are fetched in paged batches and formatted incrementally so the
-/// entire result set never has to reside in memory at once.
+/// Rows are streamed from a single native database cursor in bounded
+/// `batch_size` chunks, so fetch memory stays `O(batch)` rather than
+/// re-issuing an `O(offset)` LIMIT/OFFSET query per page. The assembled
+/// output is still buffered into the returned `String` (true
+/// row-to-writer streaming is a separate, deferred signature change).
 pub fn dump_query(
     conn: &mut dyn Connection,
     sql: &str,
@@ -115,49 +119,36 @@ pub fn dump_query(
         ));
     }
 
-    let mut offset = 0usize;
-    let mut first_page = true;
-    let mut columns: Vec<ColumnInfo> = Vec::new();
+    // Stream rows from a single native cursor (#55-adjacent debt: was an
+    // O(n^2) LIMIT/OFFSET re-query loop). The cursor borrows `conn` for
+    // its whole lifetime, so any introspection call (`primary_key`,
+    // `describe_table`) must already have run — `dump_table` does that
+    // before it reaches here. Fetch memory is bounded to one
+    // `batch_size` chunk; the assembled output string is still buffered
+    // by value (true row-to-writer streaming is a separate signature
+    // change, deferred).
+    let mut cursor = conn.query_cursor(sql)?;
+    let columns: Vec<ColumnInfo> = cursor.columns().to_vec();
 
     match opts.format {
         DumpFormat::Csv => {
             let mut buf = Vec::new();
             {
                 let mut wtr = csv::Writer::from_writer(&mut buf);
+                if !columns.is_empty() {
+                    let headers: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                    wtr.write_record(&headers)
+                        .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+                }
                 loop {
-                    let paged = ferrule_sql::query_builder::apply_paging(
-                        sql,
-                        Some(opts.batch_size),
-                        Some(offset),
-                        backend,
-                    )?;
-                    let page = conn.query(&paged)?;
-
-                    if first_page {
-                        if !page.columns.is_empty() {
-                            columns = page.columns;
-                            let headers: Vec<&str> =
-                                columns.iter().map(|c| c.name.as_str()).collect();
-                            wtr.write_record(&headers)
-                                .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
-                        }
-                        first_page = false;
-                    }
-
-                    if page.rows.is_empty() {
+                    let batch = cursor.next_batch(opts.batch_size)?;
+                    if batch.is_empty() {
                         break;
                     }
-
-                    for row in &page.rows {
+                    for row in &batch {
                         let cells: Vec<String> = row.iter().map(value_to_csv_cell).collect();
                         wtr.write_record(&cells)
                             .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
-                    }
-
-                    let fetched = page.rows.len();
-                    offset += fetched;
-                    if fetched < opts.batch_size {
-                        break;
                     }
                 }
                 wtr.flush()
@@ -172,26 +163,11 @@ pub fn dump_query(
             let mut first_row = true;
 
             loop {
-                let paged = ferrule_sql::query_builder::apply_paging(
-                    sql,
-                    Some(opts.batch_size),
-                    Some(offset),
-                    backend,
-                )?;
-                let page = conn.query(&paged)?;
-
-                if first_page {
-                    if !page.columns.is_empty() {
-                        columns = page.columns;
-                    }
-                    first_page = false;
-                }
-
-                if page.rows.is_empty() {
+                let batch = cursor.next_batch(opts.batch_size)?;
+                if batch.is_empty() {
                     break;
                 }
-
-                for row in &page.rows {
+                for row in &batch {
                     if !first_row {
                         buf.push(b',');
                     }
@@ -205,12 +181,6 @@ pub fn dump_query(
                         .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
                     buf.extend_from_slice(json_str.as_bytes());
                 }
-
-                let fetched = page.rows.len();
-                offset += fetched;
-                if fetched < opts.batch_size {
-                    break;
-                }
             }
 
             buf.push(b']');
@@ -220,33 +190,18 @@ pub fn dump_query(
         DumpFormat::Sql => {
             let table = table_name.unwrap_or("dumped_table");
             let quoted_table = ferrule_sql::copy::quote_identifier(table, backend);
+            let col_names: Vec<String> = columns
+                .iter()
+                .map(|c| ferrule_sql::copy::quote_identifier(&c.name, backend))
+                .collect();
+            let cols = col_names.join(", ");
             let mut out = String::new();
 
             loop {
-                let paged = ferrule_sql::query_builder::apply_paging(
-                    sql,
-                    Some(opts.batch_size),
-                    Some(offset),
-                    backend,
-                )?;
-                let page = conn.query(&paged)?;
-
-                if first_page {
-                    if !page.columns.is_empty() {
-                        columns = page.columns;
-                    }
-                    first_page = false;
-                }
-
-                if page.rows.is_empty() {
+                let batch = cursor.next_batch(opts.batch_size)?;
+                if batch.is_empty() {
                     break;
                 }
-
-                let col_names: Vec<String> = columns
-                    .iter()
-                    .map(|c| ferrule_sql::copy::quote_identifier(&c.name, backend))
-                    .collect();
-                let cols = col_names.join(", ");
 
                 if opts.deterministic {
                     // One INSERT statement per row — eliminates batch-
@@ -254,7 +209,7 @@ pub fn dump_query(
                     // independently re-orderable / re-loadable. Stream
                     // straight into `out` to avoid a per-row Vec<String>
                     // and an intermediate format!() temp.
-                    for row in &page.rows {
+                    for row in &batch {
                         let _ = write!(&mut out, "INSERT INTO {quoted_table} ({cols}) VALUES (");
                         for (i, v) in row.iter().enumerate() {
                             if i > 0 {
@@ -265,8 +220,10 @@ pub fn dump_query(
                         out.push_str(");\n");
                     }
                 } else {
-                    let values: Vec<String> = page
-                        .rows
+                    // One batched VALUES list per cursor chunk — keeps the
+                    // non-deterministic dump compact. (A chunk maps to one
+                    // `INSERT` statement, as the batched path always has.)
+                    let values: Vec<String> = batch
                         .iter()
                         .map(|row| {
                             let cells: Vec<String> =
@@ -279,12 +236,6 @@ pub fn dump_query(
                         "INSERT INTO {quoted_table} ({cols}) VALUES {};\n",
                         values.join(", ")
                     ));
-                }
-
-                let fetched = page.rows.len();
-                offset += fetched;
-                if fetched < opts.batch_size {
-                    break;
                 }
             }
 
@@ -538,6 +489,69 @@ mod tests {
                 out.contains("\"first name\""),
                 "expected ANSI-quoted column name, got:\n{out}"
             );
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // #55-adjacent: the cursor rewrite must span multiple batches.
+        // 2500 rows > the 1000-row batch_size AND >
+        // DEFAULT_CURSOR_CAPACITY (1024), so every format walks the
+        // `next_batch` loop several times.
+        #[test]
+        fn dump_streams_across_multiple_batches() {
+            let path = tmp_path("multibatch");
+            let mut conn = open_sqlite(&path);
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            const N: usize = 2500;
+            // Bulk insert in one statement to keep the fixture fast.
+            let mut sql = String::from("INSERT INTO t (id, v) VALUES ");
+            for i in 0..N {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("({}, 'row-{}')", i + 1, i + 1));
+            }
+            conn.execute(&sql).unwrap();
+
+            // CSV: N data rows + 1 header line.
+            let csv_opts = DumpOptions {
+                format: DumpFormat::Csv,
+                ..Default::default()
+            };
+            let csv = dump_table(&mut conn, "t", Backend::Sqlite, &csv_opts).unwrap();
+            let csv_lines = csv.lines().count();
+            assert_eq!(csv_lines, N + 1, "CSV should have N data + 1 header line");
+
+            // JSON: parses to an array of exactly N objects.
+            let json_opts = DumpOptions {
+                format: DumpFormat::Json,
+                ..Default::default()
+            };
+            let json = dump_table(&mut conn, "t", Backend::Sqlite, &json_opts).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                parsed.as_array().map(|a| a.len()),
+                Some(N),
+                "JSON should hold N objects"
+            );
+
+            // SQL (deterministic = one INSERT per row): N INSERT lines.
+            let sql_opts = DumpOptions {
+                format: DumpFormat::Sql,
+                deterministic: true,
+                ..Default::default()
+            };
+            let dump = dump_table(&mut conn, "t", Backend::Sqlite, &sql_opts).unwrap();
+            assert_eq!(
+                dump.matches("INSERT INTO").count(),
+                N,
+                "deterministic SQL should have N INSERT lines"
+            );
+            // First and last rows are present and ordered by PK.
+            let first = dump.find("row-1\'").unwrap();
+            let last = dump.find(&format!("row-{N}\'")).unwrap();
+            assert!(first < last, "rows should be PK-ordered across batches");
 
             let _ = std::fs::remove_file(&path);
         }

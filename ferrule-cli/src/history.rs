@@ -77,6 +77,12 @@ pub struct HistoryFilter {
 struct SlowSink {
     file: Mutex<std::fs::File>,
     threshold_ms: u64,
+    /// Path of the live log, needed to rename it on rotation. The
+    /// archive lives at `<path>.1`.
+    path: PathBuf,
+    /// Rotate to `<path>.1` before a write that would push the file past
+    /// this many bytes (#55). `None` disables rotation.
+    max_size_bytes: Option<u64>,
 }
 
 /// SQLite-backed history store. Owns one connection; not Send because
@@ -145,6 +151,9 @@ impl HistoryDb {
             if let Some(parent) = slow_path.parent() {
                 std::fs::create_dir_all(parent).map_err(CliError::Io)?;
             }
+            let max_size_bytes = slow
+                .max_size_bytes()
+                .map_err(|e| CliError::usage(format!("slow_log: {e}")))?;
             let file = OpenOptions::new()
                 .append(true)
                 .create(true)
@@ -153,6 +162,8 @@ impl HistoryDb {
             db.slow = Some(SlowSink {
                 file: Mutex::new(file),
                 threshold_ms,
+                path: slow_path,
+                max_size_bytes,
             });
         }
         Ok(Some(db))
@@ -211,22 +222,47 @@ impl HistoryDb {
             .file
             .lock()
             .map_err(|e| CliError::usage(format!("slow_log: lock poisoned: {e}")))?;
+        // #55: single-archive rotation. Under the held lock so two
+        // records in the same process can't both rotate. If appending
+        // this line would push the file past the configured cap, move
+        // the current log to `<path>.1` (overwriting any prior archive)
+        // and start a fresh empty log. A file that is already over-cap
+        // but empty-after-rotation still accepts an oversized line — the
+        // cap bounds the *count* of retained lines, not a single line.
+        if let Some(cap) = sink.max_size_bytes {
+            let current = file.metadata().map_err(CliError::Io)?.len();
+            if current > 0 && current.saturating_add(line.len() as u64) > cap {
+                let archive = rotated_path(&sink.path);
+                std::fs::rename(&sink.path, &archive).map_err(CliError::Io)?;
+                let fresh = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&sink.path)
+                    .map_err(CliError::Io)?;
+                *file = fresh;
+            }
+        }
         file.write_all(line.as_bytes()).map_err(CliError::Io)?;
         Ok(())
     }
 
     /// Open-loop pruning: drop rows older than `max_age_days`, then
     /// trim total count to `max_rows`. Zero in either field disables
-    /// that pass.
-    pub fn prune(&mut self, cfg: &HistoryConfig) -> Result<(), CliError> {
+    /// that pass. Returns the number of rows deleted across both passes.
+    /// The opportunistic caller in [`Self::record`] ignores the count;
+    /// `ferrule history prune` reports it.
+    pub fn prune(&mut self, cfg: &HistoryConfig) -> Result<u64, CliError> {
+        let mut deleted: u64 = 0;
         if cfg.max_age_days > 0 {
             let cutoff = Utc::now() - Duration::days(i64::from(cfg.max_age_days));
-            self.conn
+            let n = self
+                .conn
                 .execute(
                     "DELETE FROM history WHERE ts < ?",
                     params![cutoff.to_rfc3339()],
                 )
                 .map_err(|e| CliError::usage(format!("history: prune (age) failed: {e}")))?;
+            deleted += n as u64;
         }
         if cfg.max_rows > 0 {
             // Count cheap before deleting; SQLite uses a covering index on id.
@@ -236,16 +272,65 @@ impl HistoryDb {
                 .map_err(|e| CliError::usage(format!("history: count failed: {e}")))?;
             let excess = total.saturating_sub(cfg.max_rows as i64);
             if excess > 0 {
-                self.conn
+                let n = self
+                    .conn
                     .execute(
                         "DELETE FROM history WHERE id IN \
                          (SELECT id FROM history ORDER BY id ASC LIMIT ?)",
                         params![excess],
                     )
                     .map_err(|e| CliError::usage(format!("history: prune (count) failed: {e}")))?;
+                deleted += n as u64;
             }
         }
-        Ok(())
+        Ok(deleted)
+    }
+
+    /// Count how many rows [`Self::prune`] would delete under `cfg`,
+    /// without deleting anything. Mirrors prune's two-pass age/count
+    /// logic with `COUNT` in place of `DELETE`, so `--dry-run` reports
+    /// the same number a real prune would remove.
+    pub fn prune_dry_run(&self, cfg: &HistoryConfig) -> Result<u64, CliError> {
+        let mut would_delete: u64 = 0;
+        // Pass 1: rows older than max_age_days.
+        if cfg.max_age_days > 0 {
+            let cutoff = Utc::now() - Duration::days(i64::from(cfg.max_age_days));
+            let n: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM history WHERE ts < ?",
+                    params![cutoff.to_rfc3339()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| CliError::usage(format!("history: dry-run (age) failed: {e}")))?;
+            would_delete += n as u64;
+        }
+        // Pass 2: count-based trim. Mirror prune: it computes excess from
+        // the *current* total, then deletes the oldest `excess` rows.
+        // The age pass runs first in prune, so the post-age survivor
+        // count is `total - (age-deleted)`; compute it with the same
+        // cutoff predicate to keep dry-run faithful.
+        if cfg.max_rows > 0 {
+            let surviving: i64 = if cfg.max_age_days > 0 {
+                let cutoff = Utc::now() - Duration::days(i64::from(cfg.max_age_days));
+                self.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM history WHERE ts >= ?",
+                        params![cutoff.to_rfc3339()],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| CliError::usage(format!("history: dry-run (count) failed: {e}")))?
+            } else {
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0))
+                    .map_err(|e| CliError::usage(format!("history: dry-run (count) failed: {e}")))?
+            };
+            let excess = surviving.saturating_sub(cfg.max_rows as i64);
+            if excess > 0 {
+                would_delete += excess as u64;
+            }
+        }
+        Ok(would_delete)
     }
 
     /// Read rows back from the store, ordered most-recent first (or
@@ -373,6 +458,15 @@ fn resolve_slow_path(cfg: &SlowLogConfig) -> Result<PathBuf, CliError> {
 
 fn oneline_for_log(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The single rotation archive path for a slow-log file: `<path>.1`.
+/// Appends `.1` to the file name (preserving any existing extension) so
+/// `slow.log` rotates to `slow.log.1`.
+fn rotated_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".1");
+    PathBuf::from(name)
 }
 
 /// Shell-style glob: `*` matches any run, `?` matches a single char.
@@ -626,6 +720,57 @@ mod tests {
         assert_eq!(sqls, ["Q9", "Q8", "Q7", "Q6", "Q5"]);
     }
 
+    // #48: prune returns the number of rows it deleted, and a dry run
+    // reports the same number without touching the store.
+    #[test]
+    fn prune_returns_deleted_count_and_dry_run_matches() {
+        let mut db = open_memory();
+        // Insert 10 rows with pruning disabled so the count stays at 10.
+        let no_prune = HistoryConfig {
+            max_age_days: 0,
+            max_rows: 0,
+            ..Default::default()
+        };
+        for i in 0..10 {
+            db.record(&rec(&format!("Q{i}"), 1), &no_prune).unwrap();
+        }
+        assert_eq!(db.count().unwrap(), 10);
+
+        // A prune to max_rows = 4 should drop 6 rows.
+        let trim = HistoryConfig {
+            max_age_days: 0,
+            max_rows: 4,
+            ..Default::default()
+        };
+        // Dry run first: reports 6, deletes nothing.
+        let would = db.prune_dry_run(&trim).unwrap();
+        assert_eq!(would, 6, "dry run should report 6 would-be deletions");
+        assert_eq!(db.count().unwrap(), 10, "dry run must not delete");
+
+        // Real prune: deletes exactly the 6 the dry run predicted.
+        let deleted = db.prune(&trim).unwrap();
+        assert_eq!(deleted, would, "real delete count must match dry run");
+        assert_eq!(deleted, 6);
+        assert_eq!(db.count().unwrap(), 4);
+    }
+
+    // #48: a second prune on an already-trimmed store deletes nothing.
+    #[test]
+    fn prune_is_idempotent_on_trimmed_store() {
+        let mut db = open_memory();
+        let trim = HistoryConfig {
+            max_age_days: 0,
+            max_rows: 3,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            db.record(&rec(&format!("Q{i}"), 1), &trim).unwrap();
+        }
+        assert_eq!(db.prune_dry_run(&trim).unwrap(), 0);
+        assert_eq!(db.prune(&trim).unwrap(), 0);
+        assert_eq!(db.count().unwrap(), 3);
+    }
+
     #[test]
     fn maybe_open_returns_none_when_disabled() {
         let cfg = HistoryConfig {
@@ -645,6 +790,14 @@ mod tests {
     }
 
     fn open_memory_with_slow(path: &std::path::Path, threshold_ms: u64) -> HistoryDb {
+        open_memory_with_slow_cap(path, threshold_ms, None)
+    }
+
+    fn open_memory_with_slow_cap(
+        path: &std::path::Path,
+        threshold_ms: u64,
+        max_size_bytes: Option<u64>,
+    ) -> HistoryDb {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let file = OpenOptions::new()
@@ -657,6 +810,8 @@ mod tests {
             slow: Some(SlowSink {
                 file: Mutex::new(file),
                 threshold_ms,
+                path: path.to_path_buf(),
+                max_size_bytes,
             }),
         }
     }
@@ -694,6 +849,92 @@ mod tests {
         db.record(&rec("never-slow", 5), &cfg).unwrap();
         let body = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(body.is_empty(), "slow.log should be empty, got {body:?}");
+    }
+
+    // #55: when the slow log crosses the configured byte cap, the live
+    // file is rotated to `<path>.1` (single archive) and a fresh log is
+    // started. The oldest teed lines end up in `.1`; the newest stay in
+    // the live log. A second rotation overwrites `.1` rather than
+    // accumulating `.2`, `.3`, …
+    #[test]
+    fn slow_log_rotates_single_archive_on_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("slow.log");
+        let archive = tmp.path().join("slow.log.1");
+        // A single teed line for "slow-N" is well under 200 bytes; cap
+        // at 200 forces a rotation after a few lines.
+        let mut db = open_memory_with_slow_cap(&log, 100, Some(200));
+        let cfg = HistoryConfig::default();
+
+        // Record enough slow rows to rotate at least twice. Each line is
+        // tagged with a monotonic marker so we can assert which file it
+        // landed in.
+        for i in 0..40 {
+            db.record(&rec(&format!("marker-{i:02}"), 150), &cfg)
+                .unwrap();
+        }
+
+        // Both files must exist after crossing the cap.
+        assert!(log.exists(), "live log must exist");
+        assert!(archive.exists(), "archive (.1) must exist after rotation");
+
+        // The live log must respect the cap (allowing the over-cap final
+        // line that triggered the *next* rotation not to have happened
+        // yet — i.e. length <= cap + one line).
+        let live = std::fs::read_to_string(&log).unwrap();
+        let archived = std::fs::read_to_string(&archive).unwrap();
+        let max_line = live
+            .lines()
+            .chain(archived.lines())
+            .map(|l| l.len() + 1)
+            .max()
+            .unwrap_or(0) as u64;
+        assert!(
+            live.len() as u64 <= 200 + max_line,
+            "live log {} bytes exceeds cap+one-line; got:\n{live}",
+            live.len()
+        );
+
+        // Single-archive semantics: no `.2` is ever produced.
+        let two = tmp.path().join("slow.log.2");
+        assert!(
+            !two.exists(),
+            "only one archive (.1) should exist, never .2"
+        );
+
+        // The newest marker lives in the live log; an older marker lives
+        // in the archive (proving rotation moved old lines aside).
+        assert!(
+            live.contains("marker-39"),
+            "newest line should be in the live log; live:\n{live}"
+        );
+        let newest_in_archive = archived.contains("marker-39");
+        assert!(
+            !newest_in_archive,
+            "newest line must not be in the archive; archive:\n{archived}"
+        );
+        assert!(
+            archived.contains("marker-"),
+            "archive should hold older teed lines; archive:\n{archived}"
+        );
+    }
+
+    // #55: with no cap configured the log grows unbounded and no archive
+    // is created — rotation is strictly opt-in.
+    #[test]
+    fn slow_log_no_cap_never_rotates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("slow.log");
+        let archive = tmp.path().join("slow.log.1");
+        let mut db = open_memory_with_slow_cap(&log, 100, None);
+        let cfg = HistoryConfig::default();
+        for i in 0..50 {
+            db.record(&rec(&format!("line-{i}"), 150), &cfg).unwrap();
+        }
+        assert!(log.exists());
+        assert!(!archive.exists(), "no archive without a configured cap");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(body.lines().count(), 50, "all lines stay in one file");
     }
 
     #[test]

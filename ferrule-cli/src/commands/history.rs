@@ -7,8 +7,9 @@
 //! read command.
 
 use chrono::Duration;
-use clap::Args;
+use clap::{Args, Subcommand};
 use ferrule_config::profile::GlobalConfig;
+use ferrule_config::HistoryConfig;
 use ferrule_core::formatter::format_result;
 use ferrule_sql::connection::QueryResult;
 use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
@@ -54,6 +55,32 @@ pub struct HistoryArgs {
 
     #[command(flatten)]
     pub output: OutputFlags,
+
+    /// Optional management subcommand. When omitted, `ferrule history`
+    /// reads the store (the default behaviour). The only subcommand today
+    /// is `prune`, which applies the retention policy on demand.
+    #[command(subcommand)]
+    pub command: Option<HistoryCommand>,
+}
+
+/// Management subcommands under `ferrule history`. The reader path (no
+/// subcommand) is the common case; these mutate the store.
+#[derive(Subcommand, Clone, Debug)]
+pub enum HistoryCommand {
+    /// Apply the retention policy now (delete rows past the age / row
+    /// caps) instead of waiting for the opportunistic prune on the next
+    /// recorded run.
+    Prune {
+        /// Report how many rows would be deleted without deleting them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override `[history] max_age_days` for this prune only.
+        #[arg(long, value_name = "DAYS")]
+        max_age_days: Option<u32>,
+        /// Override `[history] max_rows` for this prune only.
+        #[arg(long, value_name = "N")]
+        max_rows: Option<u64>,
+    },
 }
 
 /// Arguments for `ferrule slow` — a thin alias for `ferrule history
@@ -93,6 +120,9 @@ impl SlowArgs {
             min_duration_ms: self.min_duration_ms,
             slow: self.min_duration_ms.is_none(),
             output: self.output,
+            // `ferrule slow` is read-only; it never carries a prune
+            // subcommand.
+            command: None,
         }
     }
 }
@@ -102,17 +132,21 @@ pub fn run_slow(args: SlowArgs, global_config: &GlobalConfig) -> Result<(), CliE
 }
 
 pub fn run(args: HistoryArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+    // Management subcommands branch off before the reader path.
+    if let Some(command) = args.command {
+        return run_command(command, global_config);
+    }
+
     let format = args.output.resolve_format(global_config);
     let limit = args.output.resolve_limit(global_config);
     let offset = args.output.offset;
 
-    let mut db = HistoryDb::maybe_open(&global_config.history)?.ok_or_else(|| {
+    let db = HistoryDb::maybe_open(&global_config.history)?.ok_or_else(|| {
         CliError::usage(
             "history is disabled. Enable [history] enabled = true in your config, \
              or unset FERRULE_NO_HISTORY for this invocation.",
         )
     })?;
-    let _ = &mut db; // db is read-only here; future prune subcommand will mutate.
 
     let since = match args.since.as_deref() {
         Some(s) => Some(parse_since(s)?),
@@ -158,6 +192,66 @@ pub fn run(args: HistoryArgs, global_config: &GlobalConfig) -> Result<(), CliErr
     let rendered = format_result(&result, format).map_err(CliError::query)?;
     println!("{}", rendered);
     Ok(())
+}
+
+/// Dispatch a `ferrule history <subcommand>`. Today only `prune`.
+fn run_command(command: HistoryCommand, global_config: &GlobalConfig) -> Result<(), CliError> {
+    match command {
+        HistoryCommand::Prune {
+            dry_run,
+            max_age_days,
+            max_rows,
+        } => run_prune(dry_run, max_age_days, max_rows, global_config),
+    }
+}
+
+/// `ferrule history prune [--dry-run] [--max-age-days N] [--max-rows N]`.
+///
+/// Opens the store mutably and applies the retention policy on demand,
+/// using the global `[history]` caps unless overridden per-flag. With
+/// `--dry-run`, reports the would-be deletion count without deleting.
+fn run_prune(
+    dry_run: bool,
+    max_age_days: Option<u32>,
+    max_rows: Option<u64>,
+    global_config: &GlobalConfig,
+) -> Result<(), CliError> {
+    let mut db = HistoryDb::maybe_open(&global_config.history)?.ok_or_else(|| {
+        CliError::usage(
+            "history is disabled. Enable [history] enabled = true in your config, \
+             or unset FERRULE_NO_HISTORY for this invocation.",
+        )
+    })?;
+
+    // Start from the configured caps, then apply per-flag overrides.
+    let cfg = effective_prune_config(&global_config.history, max_age_days, max_rows);
+
+    if dry_run {
+        let n = db.prune_dry_run(&cfg)?;
+        println!("Would delete {n} row(s) (dry run; nothing was removed).");
+    } else {
+        let n = db.prune(&cfg)?;
+        println!("Deleted {n} row(s).");
+    }
+    Ok(())
+}
+
+/// Clone the global history config and overlay any per-flag retention
+/// overrides. A `Some` flag wins over the configured value; `None`
+/// leaves the config value in place.
+fn effective_prune_config(
+    base: &HistoryConfig,
+    max_age_days: Option<u32>,
+    max_rows: Option<u64>,
+) -> HistoryConfig {
+    let mut cfg = base.clone();
+    if let Some(days) = max_age_days {
+        cfg.max_age_days = days;
+    }
+    if let Some(rows) = max_rows {
+        cfg.max_rows = rows;
+    }
+    cfg
 }
 
 fn render(rows: Vec<RunRecord>) -> QueryResult {
@@ -239,5 +333,28 @@ mod tests {
     #[test]
     fn oneline_collapses_whitespace() {
         assert_eq!(oneline("SELECT\n  *\nFROM   x"), "SELECT * FROM x");
+    }
+
+    // #48: per-flag overrides win over the configured caps; absent flags
+    // leave the config value in place.
+    #[test]
+    fn effective_prune_config_applies_overrides() {
+        let base = HistoryConfig {
+            max_age_days: 30,
+            max_rows: 0,
+            ..Default::default()
+        };
+        // No overrides -> config unchanged.
+        let same = effective_prune_config(&base, None, None);
+        assert_eq!(same.max_age_days, 30);
+        assert_eq!(same.max_rows, 0);
+        // max_rows override fires even when config has it at 0.
+        let overridden = effective_prune_config(&base, None, Some(5));
+        assert_eq!(overridden.max_age_days, 30, "untouched flag keeps config");
+        assert_eq!(overridden.max_rows, 5, "override wins");
+        // Both overrides.
+        let both = effective_prune_config(&base, Some(7), Some(100));
+        assert_eq!(both.max_age_days, 7);
+        assert_eq!(both.max_rows, 100);
     }
 }
