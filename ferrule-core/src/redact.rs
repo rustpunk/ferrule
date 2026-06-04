@@ -176,7 +176,17 @@ fn skip_ws(chars: &[char], mut i: usize, out: &mut String) -> usize {
 /// the redacted form to `out` and returns the index just past the
 /// operand. If `i` does not point at a plausible operand, nothing is
 /// redacted and `i` is returned unchanged.
-fn redact_secret_operand(chars: &[char], i: usize, out: &mut String) -> usize {
+fn redact_secret_operand(chars: &[char], mut i: usize, out: &mut String) -> usize {
+    // MSSQL spells the password assignment with an `=` separator
+    // (`CREATE LOGIN x WITH PASSWORD = '...'`, `ALTER LOGIN x WITH PASSWORD
+    // = '...'`). Consume an optional `=` plus the whitespace around it so
+    // the operand scan below lands on the literal/bareword. Other dialects
+    // (`IDENTIFIED BY '...'`, PG `PASSWORD '...'`) have no `=` and are
+    // unaffected.
+    if i < chars.len() && chars[i] == '=' {
+        out.push('=');
+        i = skip_ws(chars, i + 1, out);
+    }
     if i >= chars.len() {
         return i;
     }
@@ -323,6 +333,24 @@ mod tests {
             "secret tail leaked past escape: {out}"
         );
         assert_eq!(out, "CREATE ROLE bob PASSWORD '***'");
+    }
+
+    // MSSQL's canonical login/user DDL uses `WITH PASSWORD = '...'`; the
+    // `=` separator must not defeat redaction.
+    #[test]
+    fn redacts_mssql_with_password_equals() {
+        let out = redact_sql("CREATE LOGIN foo WITH PASSWORD = 'secret'");
+        assert!(!out.contains("secret"), "secret leaked: {out}");
+        assert_eq!(out, "CREATE LOGIN foo WITH PASSWORD = '***'");
+
+        let alter = redact_sql("ALTER LOGIN foo WITH PASSWORD = 'h@x'");
+        assert!(!alter.contains("h@x"), "secret leaked: {alter}");
+        assert_eq!(alter, "ALTER LOGIN foo WITH PASSWORD = '***'");
+
+        // No spaces around `=`, and a bareword operand.
+        let tight = redact_sql("CREATE USER u WITH PASSWORD=tiger");
+        assert!(!tight.contains("tiger"), "secret leaked: {tight}");
+        assert_eq!(tight, "CREATE USER u WITH PASSWORD=***");
     }
 
     #[test]
