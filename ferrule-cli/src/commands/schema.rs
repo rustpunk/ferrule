@@ -1,0 +1,112 @@
+use super::SchemaArgs;
+use crate::error::CliError;
+use ferrule_config::profile::GlobalConfig;
+use ferrule_core::formatter::format_result;
+use ferrule_sql::connection::{ConnectOptions, QueryResult};
+use ferrule_sql::value::{ColumnInfo, TypeHint, Value};
+
+/// List the schemas / databases / owners visible on a connection.
+///
+/// Mirrors [`super::tables::run`]: it resolves the connection, connects
+/// directly (the daemon path is deferred for this command — see the
+/// daemon note below), calls [`ferrule_sql::Connection::list_schemas`],
+/// and renders a two-column result (`schema_name`, `is_default`) through
+/// the shared formatter so `--format` / `--limit` / `--offset` /
+/// `--timing` behave exactly as they do for `ferrule tables`.
+pub fn run(args: SchemaArgs, global_config: &GlobalConfig) -> Result<(), CliError> {
+    let format = args.output.resolve_format(global_config);
+    let limit = args.output.resolve_limit(global_config);
+    let offset = args.output.offset;
+
+    let total_start = std::time::Instant::now();
+
+    let resolved = super::resolve_connection(
+        &args.connection,
+        None,
+        args.conn_flags.ssh_tunnel.as_deref(),
+        args.conn_flags.ssh_key.as_deref(),
+        args.conn_flags.proxy_url.as_deref(),
+        global_config,
+    )?;
+    super::check_daemon_ssh_compat(args.conn_flags.daemon, &resolved)?;
+
+    if args.output.verbose {
+        eprintln!("[ferrule] Resolved URL: {}", resolved.url.redacted());
+    }
+
+    // Daemon routing is not yet wired for `schema` (no Request::ListSchemas
+    // variant); connect directly and tell the user the flag is a no-op so
+    // the behavior is explicit rather than silently misrouted.
+    if args.conn_flags.daemon {
+        eprintln!("[ferrule] schema does not support --daemon yet; connecting directly.");
+    }
+
+    let opts = ConnectOptions {
+        insecure: args.conn_flags.insecure,
+        password: None,
+    };
+    if opts.insecure {
+        eprintln!("Warning: --insecure disables TLS certificate verification.");
+    }
+
+    let conn_start = std::time::Instant::now();
+    let mut conn = super::connect_resolved(resolved, &opts)?;
+    let conn_time = conn_start.elapsed();
+
+    let query_start = std::time::Instant::now();
+    let schemas = conn.list_schemas().map_err(CliError::query)?;
+    let query_time = query_start.elapsed();
+
+    let mut result = QueryResult {
+        columns: vec![
+            ColumnInfo {
+                name: "schema_name".to_string(),
+                type_hint: TypeHint::String,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "is_default".to_string(),
+                type_hint: TypeHint::Bool,
+                nullable: false,
+            },
+        ],
+        rows: schemas
+            .into_iter()
+            .map(|s| vec![Value::String(s.name), Value::Bool(s.is_default)])
+            .collect(),
+    };
+
+    // Apply client-side offset
+    if let Some(off) = offset {
+        if off >= result.rows.len() {
+            result.rows.clear();
+        } else {
+            result.rows = result.rows.split_off(off);
+        }
+    }
+
+    // Apply client-side limit
+    if let Some(limit) = limit {
+        if result.rows.len() > limit {
+            result.rows.truncate(limit);
+        }
+    }
+
+    let format_start = std::time::Instant::now();
+    let output = format_result(&result, format).map_err(CliError::query)?;
+    let format_time = format_start.elapsed();
+
+    println!("{}", output);
+
+    if args.output.timing {
+        eprintln!(
+            "[ferrule] timing: connect={:.3}s query={:.3}s format={:.3}s total={:.3}s",
+            conn_time.as_secs_f64(),
+            query_time.as_secs_f64(),
+            format_time.as_secs_f64(),
+            total_start.elapsed().as_secs_f64(),
+        );
+    }
+
+    Ok(())
+}

@@ -15,7 +15,8 @@ mod watch;
 
 use commands::{
     BookmarkArgs, ConnArgs, CopyArgs, DescribeArgs, DiffArgs, DumpArgs, ExplainArgs, ExportArgs,
-    HistoryArgs, LoadArgs, MigrateArgs, QueryArgs, ReplArgs, SlowArgs, TablesArgs, WatchArgs,
+    HistoryArgs, LoadArgs, MigrateArgs, QueryArgs, ReplArgs, SchemaArgs, SlowArgs, TablesArgs,
+    WatchArgs,
 };
 use error::CliError;
 use history::{HistoryDb, RunRecord};
@@ -65,6 +66,9 @@ enum Commands {
 
     /// Describe a table
     Describe(DescribeArgs),
+
+    /// List schemas/databases on a connection
+    Schema(SchemaArgs),
 
     /// Diff schemas between two connections
     Diff(DiffArgs),
@@ -150,6 +154,7 @@ fn main() {
             Commands::Load(args) => commands::load::run(args, &global_config),
             Commands::Tables(args) => commands::tables::run(args, &global_config),
             Commands::Describe(args) => commands::describe::run(args, &global_config),
+            Commands::Schema(args) => commands::schema::run(args, &global_config),
             Commands::Diff(args) => commands::diff::run(args, &global_config),
             Commands::Copy(args) => commands::copy::run(*args, &global_config),
             Commands::Migrate(args) => commands::migrate::run(args, &global_config),
@@ -217,6 +222,7 @@ impl Snapshot {
                 Some(a.table.clone()),
                 false,
             ),
+            Commands::Schema(a) => ("schema", Some(redact(&a.connection)), None, false),
             Commands::Explain(a) => (
                 "explain",
                 Some(redact(&a.connection)),

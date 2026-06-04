@@ -1,6 +1,6 @@
 use crate::connection::{
     AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
-    StatementResult,
+    SchemaInfo, StatementResult,
 };
 use crate::error::SqlError;
 use crate::stream::{BoxRowStream, DEFAULT_CURSOR_CAPACITY, channel_stream};
@@ -224,6 +224,33 @@ impl AsyncConnection for SqliteConnection {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
             Ok(names)
+        })
+        .await
+        .map_err(|e| SqlError::QueryFailed(e.to_string()))?
+    }
+
+    async fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().unwrap();
+            // `PRAGMA database_list` returns (seq, name, file) rows: the
+            // main database plus any ATTACHed ones. `main` is the schema
+            // unqualified objects resolve against.
+            let mut stmt = guard
+                .prepare("PRAGMA database_list")
+                .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+            let schemas: Vec<SchemaInfo> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| SqlError::QueryFailed(e.to_string()))?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|e| SqlError::QueryFailed(e.to_string()))?
+                .into_iter()
+                .map(|name| {
+                    let is_default = name == "main";
+                    SchemaInfo { name, is_default }
+                })
+                .collect();
+            Ok(schemas)
         })
         .await
         .map_err(|e| SqlError::QueryFailed(e.to_string()))?
@@ -590,6 +617,22 @@ mod tests {
         let tables = conn.list_tables(None).expect("list_tables");
         assert!(tables.contains(&"test_users".to_string()));
         assert!(tables.contains(&"other".to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_sqlite_list_schemas() {
+        let (mut conn, path) = fresh_conn();
+        let schemas = conn.list_schemas().expect("list_schemas");
+        // A fresh connection with no ATTACHed databases reports exactly
+        // one schema, `main`, which is the default.
+        assert_eq!(
+            schemas.len(),
+            1,
+            "fresh sqlite conn should report one schema, got: {schemas:?}"
+        );
+        assert_eq!(schemas[0].name, "main");
+        assert!(schemas[0].is_default, "main should be the default schema");
         let _ = std::fs::remove_file(&path);
     }
 

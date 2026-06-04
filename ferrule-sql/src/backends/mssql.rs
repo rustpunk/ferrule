@@ -1,6 +1,6 @@
 use crate::connection::{
     AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
-    StatementResult,
+    SchemaInfo, StatementResult,
 };
 use crate::error::SqlError;
 use crate::stream::BoxRowStream;
@@ -231,6 +231,29 @@ impl AsyncConnection for MssqlConnection {
             })
             .collect();
         Ok(names)
+    }
+
+    async fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError> {
+        // `sys.schemas` lists the SCHEMAS within the current database
+        // (mirrors list_tables, which is schema-scoped to the connected
+        // database); `SCHEMA_NAME()` flags the caller's default schema,
+        // typically `dbo`. The server-level database list (`sys.databases`)
+        // is a different axis and is intentionally not surfaced here.
+        let sql = "SELECT name, CASE WHEN name = SCHEMA_NAME() THEN 1 ELSE 0 END FROM sys.schemas ORDER BY name";
+        let result = self.query(sql).await?;
+        let schemas: Vec<SchemaInfo> = result
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                let name = match row.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return None,
+                };
+                let is_default = crate::connection::is_default_from_value(row.get(1));
+                Some(SchemaInfo { name, is_default })
+            })
+            .collect();
+        Ok(schemas)
     }
 
     async fn describe_table(
@@ -979,6 +1002,20 @@ mod tests {
             tables.contains(&"test_users".to_string()),
             "should contain test_users"
         );
+    }
+
+    #[test]
+    fn test_mssql_list_schemas() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!("MSSQL test container not available, skipping test_mssql_list_schemas");
+            return;
+        };
+        let schemas = conn.list_schemas().expect("list_schemas should succeed");
+        let dbo = schemas
+            .iter()
+            .find(|s| s.name == "dbo")
+            .unwrap_or_else(|| panic!("should contain dbo, got: {schemas:?}"));
+        assert!(dbo.is_default, "dbo should be the default schema");
     }
 
     #[test]

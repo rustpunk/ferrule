@@ -1,6 +1,6 @@
 use crate::connection::{
     AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
-    StatementResult,
+    SchemaInfo, StatementResult,
 };
 use crate::error::SqlError;
 use crate::stream::BoxRowStream;
@@ -222,6 +222,29 @@ impl AsyncConnection for MySqlConnection {
             })
             .collect();
         Ok(names)
+    }
+
+    async fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError> {
+        // `information_schema.SCHEMATA` lets us compute is_default in one
+        // query (`SCHEMA_NAME = DATABASE()`) and matches the
+        // describe_table information_schema usage. `DATABASE()` is NULL
+        // when no database is selected, so the comparison decodes to
+        // is_default = false.
+        let sql = "SELECT SCHEMA_NAME, SCHEMA_NAME = DATABASE() FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME";
+        let result = self.query(sql).await?;
+        let schemas: Vec<SchemaInfo> = result
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                let name = match row.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return None,
+                };
+                let is_default = crate::connection::is_default_from_value(row.get(1));
+                Some(SchemaInfo { name, is_default })
+            })
+            .collect();
+        Ok(schemas)
     }
 
     async fn describe_table(
@@ -1060,6 +1083,25 @@ mod tests {
         assert!(
             tables.contains(&"test_users".to_string()),
             "should contain test_users"
+        );
+    }
+
+    #[test]
+    fn test_mysql_list_schemas() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!("MySQL test container not available, skipping test_mysql_list_schemas");
+            return;
+        };
+        let schemas = conn.list_schemas().expect("list_schemas should succeed");
+        // The container's seeded database is `ferrule` (see CLAUDE.md
+        // "How to Test"); it is also the connection's default database.
+        assert!(
+            schemas.iter().any(|s| s.name == "ferrule"),
+            "should contain the seeded `ferrule` database, got: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().filter(|s| s.is_default).count() <= 1,
+            "at most one schema should be flagged is_default, got: {schemas:?}"
         );
     }
 

@@ -150,7 +150,7 @@ pub mod backends;
 pub use backend::connect_with_tunnel;
 pub use backend::{Backend, connect};
 pub use connection::{
-    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    BulkInsert, ConnectOptions, Connection, ExecutionSummary, ForeignKey, QueryResult, SchemaInfo,
     StatementResult,
 };
 pub use copy::{

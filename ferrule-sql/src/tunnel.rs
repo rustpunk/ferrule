@@ -297,6 +297,12 @@ mod ssh_impl {
             self.inner.list_tables(schema).await
         }
 
+        async fn list_schemas(
+            &mut self,
+        ) -> Result<Vec<crate::connection::SchemaInfo>, crate::SqlError> {
+            self.inner.list_schemas().await
+        }
+
         async fn describe_table(
             &mut self,
             schema: Option<&str>,

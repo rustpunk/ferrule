@@ -2425,6 +2425,9 @@ mod tests {
             fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
                 self.inner.list_tables(schema)
             }
+            fn list_schemas(&mut self) -> Result<Vec<crate::connection::SchemaInfo>, SqlError> {
+                self.inner.list_schemas()
+            }
             fn describe_table(
                 &mut self,
                 schema: Option<&str>,
