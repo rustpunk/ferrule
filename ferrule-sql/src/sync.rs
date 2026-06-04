@@ -12,7 +12,7 @@
 //! subsequent call. No `async fn` / `Future` crosses the public boundary.
 
 use crate::connection::{
-    AsyncConnection, BulkInsert, Connection, ExecutionSummary, ForeignKey, QueryResult,
+    AsyncConnection, BulkInsert, Connection, ExecutionSummary, ForeignKey, QueryResult, SchemaInfo,
     StatementResult,
 };
 use crate::error::SqlError;
@@ -143,6 +143,11 @@ impl Connection for SyncConnection {
     fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
         let inner = &mut self.inner;
         self.rt.block_on(inner.list_tables(schema))
+    }
+
+    fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError> {
+        let inner = &mut self.inner;
+        self.rt.block_on(inner.list_schemas())
     }
 
     fn describe_table(

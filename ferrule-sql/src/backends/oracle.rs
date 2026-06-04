@@ -1,6 +1,6 @@
 use crate::connection::{
     AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
-    StatementResult,
+    SchemaInfo, StatementResult,
 };
 use crate::error::SqlError;
 use crate::stream::{BoxRowStream, DEFAULT_CURSOR_CAPACITY, channel_stream};
@@ -202,6 +202,27 @@ impl AsyncConnection for OracleConnection {
             })
             .collect();
         Ok(names)
+    }
+
+    async fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError> {
+        // `ALL_USERS` lists every owner/schema visible to the connected
+        // user (the portable choice over `DBA_USERS`, which needs elevated
+        // privileges). `USER` is the connecting schema, flagged default.
+        let sql = "SELECT username, CASE WHEN username = USER THEN 1 ELSE 0 END FROM all_users ORDER BY username";
+        let result = self.query(sql).await?;
+        let schemas: Vec<SchemaInfo> = result
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                let name = match row.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return None,
+                };
+                let is_default = crate::connection::is_default_from_value(row.get(1));
+                Some(SchemaInfo { name, is_default })
+            })
+            .collect();
+        Ok(schemas)
     }
 
     async fn describe_table(
@@ -1013,6 +1034,25 @@ mod tests {
             tables.iter().any(|t| t.eq_ignore_ascii_case("test_users")),
             "should contain test_users (got: {:?})",
             tables
+        );
+    }
+
+    #[test]
+    fn test_oracle_list_schemas() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!("ORACLE_TEST_URL not set or unreachable; skipping test_oracle_list_schemas");
+            return;
+        };
+        let schemas = conn.list_schemas().expect("list_schemas should succeed");
+        // The connecting user (FERRULE in the seed) is its own schema and
+        // is flagged the default. Oracle reports owners upper-cased.
+        let default = schemas
+            .iter()
+            .find(|s| s.is_default)
+            .unwrap_or_else(|| panic!("one schema should be is_default, got: {schemas:?}"));
+        assert!(
+            default.name.eq_ignore_ascii_case("ferrule"),
+            "the default schema should be the connecting user, got: {default:?}"
         );
     }
 

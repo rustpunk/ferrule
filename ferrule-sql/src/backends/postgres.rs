@@ -1,6 +1,6 @@
 use crate::connection::{
     AsyncConnection, BulkInsert, ConnectOptions, ExecutionSummary, ForeignKey, QueryResult,
-    StatementResult,
+    SchemaInfo, StatementResult,
 };
 use crate::error::SqlError;
 use crate::stream::BoxRowStream;
@@ -206,6 +206,29 @@ impl AsyncConnection for PostgresConnection {
             .map(|row| row.get::<_, String>(0))
             .collect();
         Ok(names)
+    }
+
+    async fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError> {
+        // `information_schema.schemata` is the portable, permission-
+        // friendly catalog (mirrors the list_tables / describe_table
+        // information_schema usage); `current_schema()` flags the head
+        // of the search_path so a UI can pre-select it.
+        let rows = self
+            .client
+            .query(
+                "SELECT schema_name, schema_name = current_schema() AS is_default FROM information_schema.schemata ORDER BY schema_name",
+                &[],
+            )
+            .await
+            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+        let schemas = rows
+            .into_iter()
+            .map(|row| SchemaInfo {
+                name: row.get::<_, String>(0),
+                is_default: row.try_get::<_, bool>(1).unwrap_or(false),
+            })
+            .collect();
+        Ok(schemas)
     }
 
     async fn describe_table(
@@ -1461,6 +1484,24 @@ mod tests {
         assert!(
             tables.contains(&"test_users".to_string()),
             "should contain test_users, got: {tables:?}"
+        );
+    }
+
+    #[test]
+    fn test_postgres_list_schemas() {
+        let Some(mut conn) = try_connect() else {
+            eprintln!("Postgres test container not available, skipping test_postgres_list_schemas");
+            return;
+        };
+        let schemas = conn.list_schemas().expect("list_schemas should succeed");
+        assert!(
+            schemas.iter().any(|s| s.name == "public"),
+            "should contain public, got: {schemas:?}"
+        );
+        let defaults = schemas.iter().filter(|s| s.is_default).count();
+        assert_eq!(
+            defaults, 1,
+            "exactly one schema should be flagged is_default, got: {schemas:?}"
         );
     }
 

@@ -12,6 +12,7 @@ pub mod migrate;
 pub mod query;
 pub mod repl;
 pub mod resolver;
+pub mod schema;
 pub mod tables;
 pub mod watch;
 
@@ -325,6 +326,19 @@ pub struct QueryArgs {
 /// Tables command arguments.
 #[derive(Args, Clone, Debug)]
 pub struct TablesArgs {
+    /// Connection name
+    pub connection: String,
+
+    #[command(flatten)]
+    pub output: OutputFlags,
+
+    #[command(flatten)]
+    pub conn_flags: ConnectionFlags,
+}
+
+/// Schema command arguments — list schemas/databases on a connection.
+#[derive(Args, Clone, Debug)]
+pub struct SchemaArgs {
     /// Connection name
     pub connection: String,
 

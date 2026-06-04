@@ -100,6 +100,43 @@ pub struct ForeignKey {
     pub on_delete: Option<String>,
 }
 
+/// One schema / database / namespace returned by
+/// [`Connection::list_schemas`].
+///
+/// "Schema" is the cross-backend umbrella term: a PostgreSQL / MSSQL
+/// schema, a MySQL database, an Oracle user/owner, or a SQLite attached
+/// database. `name` is the identifier as the server reports it
+/// (unquoted). `is_default` marks the schema the connection currently
+/// resolves unqualified objects against (PostgreSQL `current_schema()` /
+/// `public`, MySQL `DATABASE()`, MSSQL `SCHEMA_NAME()` / `dbo`, Oracle
+/// `USER`, SQLite `main`) so a UI can pre-select it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaInfo {
+    /// The schema / database / owner name, unquoted, as the server reports it.
+    pub name: String,
+    /// `true` for the schema the connection resolves unqualified objects
+    /// against. At most one entry is flagged per connection; a backend
+    /// that cannot determine the current schema flags none.
+    pub is_default: bool,
+}
+
+/// Decode the `is_default` flag of a [`SchemaInfo`] from the second
+/// column of a backend introspection query.
+///
+/// Backends that go through the generic [`AsyncConnection::query`] path
+/// (MySQL, MSSQL, Oracle) return the `name = current_schema` comparison
+/// as a [`Value`](crate::value::Value): a `BIT`/boolean surfaces as
+/// `Value::Bool`, a `CASE ... THEN 1` surfaces as `Value::Int64`. A
+/// `NULL` comparison (e.g. MySQL `DATABASE()` is `NULL` when no database
+/// is selected) decodes to `false` rather than erroring.
+pub(crate) fn is_default_from_value(value: Option<&crate::value::Value>) -> bool {
+    match value {
+        Some(crate::value::Value::Bool(b)) => *b,
+        Some(crate::value::Value::Int64(n)) => *n != 0,
+        _ => false,
+    }
+}
+
 /// Internal async backend trait — implemented by every driver.
 ///
 /// This is **not** part of `ferrule-sql`'s public surface: it is the
@@ -158,6 +195,11 @@ pub(crate) trait AsyncConnection: Send {
 
     /// List tables in the given schema (or default schema if `None`).
     async fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError>;
+
+    /// List the schemas / databases / owners visible on this
+    /// connection, ordered by name. The entry whose `is_default` is
+    /// set is the one unqualified objects resolve against.
+    async fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError>;
 
     /// Describe the columns of a single table.
     async fn describe_table(
@@ -289,6 +331,13 @@ pub trait Connection: Send {
     /// List tables in the given schema (or default schema if `None`).
     fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError>;
 
+    /// List the schemas / databases / owners visible on this
+    /// connection, ordered by name. The entry whose `is_default` is
+    /// set is the schema unqualified objects resolve against (PG
+    /// `current_schema()`, MySQL `DATABASE()`, MSSQL `SCHEMA_NAME()`,
+    /// Oracle `USER`, SQLite `main`). Blocks on a round-trip.
+    fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError>;
+
     /// Describe the columns of a single table.
     fn describe_table(
         &mut self,
@@ -345,6 +394,9 @@ impl Connection for Box<dyn Connection> {
     }
     fn list_tables(&mut self, schema: Option<&str>) -> Result<Vec<String>, SqlError> {
         (**self).list_tables(schema)
+    }
+    fn list_schemas(&mut self) -> Result<Vec<SchemaInfo>, SqlError> {
+        (**self).list_schemas()
     }
     fn describe_table(
         &mut self,
