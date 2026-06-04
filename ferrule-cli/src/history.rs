@@ -248,16 +248,21 @@ impl HistoryDb {
 
     /// Open-loop pruning: drop rows older than `max_age_days`, then
     /// trim total count to `max_rows`. Zero in either field disables
-    /// that pass.
-    pub fn prune(&mut self, cfg: &HistoryConfig) -> Result<(), CliError> {
+    /// that pass. Returns the number of rows deleted across both passes.
+    /// The opportunistic caller in [`Self::record`] ignores the count;
+    /// `ferrule history prune` reports it.
+    pub fn prune(&mut self, cfg: &HistoryConfig) -> Result<u64, CliError> {
+        let mut deleted: u64 = 0;
         if cfg.max_age_days > 0 {
             let cutoff = Utc::now() - Duration::days(i64::from(cfg.max_age_days));
-            self.conn
+            let n = self
+                .conn
                 .execute(
                     "DELETE FROM history WHERE ts < ?",
                     params![cutoff.to_rfc3339()],
                 )
                 .map_err(|e| CliError::usage(format!("history: prune (age) failed: {e}")))?;
+            deleted += n as u64;
         }
         if cfg.max_rows > 0 {
             // Count cheap before deleting; SQLite uses a covering index on id.
@@ -267,16 +272,65 @@ impl HistoryDb {
                 .map_err(|e| CliError::usage(format!("history: count failed: {e}")))?;
             let excess = total.saturating_sub(cfg.max_rows as i64);
             if excess > 0 {
-                self.conn
+                let n = self
+                    .conn
                     .execute(
                         "DELETE FROM history WHERE id IN \
                          (SELECT id FROM history ORDER BY id ASC LIMIT ?)",
                         params![excess],
                     )
                     .map_err(|e| CliError::usage(format!("history: prune (count) failed: {e}")))?;
+                deleted += n as u64;
             }
         }
-        Ok(())
+        Ok(deleted)
+    }
+
+    /// Count how many rows [`Self::prune`] would delete under `cfg`,
+    /// without deleting anything. Mirrors prune's two-pass age/count
+    /// logic with `COUNT` in place of `DELETE`, so `--dry-run` reports
+    /// the same number a real prune would remove.
+    pub fn prune_dry_run(&self, cfg: &HistoryConfig) -> Result<u64, CliError> {
+        let mut would_delete: u64 = 0;
+        // Pass 1: rows older than max_age_days.
+        if cfg.max_age_days > 0 {
+            let cutoff = Utc::now() - Duration::days(i64::from(cfg.max_age_days));
+            let n: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM history WHERE ts < ?",
+                    params![cutoff.to_rfc3339()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| CliError::usage(format!("history: dry-run (age) failed: {e}")))?;
+            would_delete += n as u64;
+        }
+        // Pass 2: count-based trim. Mirror prune: it computes excess from
+        // the *current* total, then deletes the oldest `excess` rows.
+        // The age pass runs first in prune, so the post-age survivor
+        // count is `total - (age-deleted)`; compute it with the same
+        // cutoff predicate to keep dry-run faithful.
+        if cfg.max_rows > 0 {
+            let surviving: i64 = if cfg.max_age_days > 0 {
+                let cutoff = Utc::now() - Duration::days(i64::from(cfg.max_age_days));
+                self.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM history WHERE ts >= ?",
+                        params![cutoff.to_rfc3339()],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| CliError::usage(format!("history: dry-run (count) failed: {e}")))?
+            } else {
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0))
+                    .map_err(|e| CliError::usage(format!("history: dry-run (count) failed: {e}")))?
+            };
+            let excess = surviving.saturating_sub(cfg.max_rows as i64);
+            if excess > 0 {
+                would_delete += excess as u64;
+            }
+        }
+        Ok(would_delete)
     }
 
     /// Read rows back from the store, ordered most-recent first (or
@@ -664,6 +718,57 @@ mod tests {
         // newest five survive; the oldest (Q0..Q4) are gone.
         let sqls: Vec<_> = rows.iter().filter_map(|r| r.sql.as_deref()).collect();
         assert_eq!(sqls, ["Q9", "Q8", "Q7", "Q6", "Q5"]);
+    }
+
+    // #48: prune returns the number of rows it deleted, and a dry run
+    // reports the same number without touching the store.
+    #[test]
+    fn prune_returns_deleted_count_and_dry_run_matches() {
+        let mut db = open_memory();
+        // Insert 10 rows with pruning disabled so the count stays at 10.
+        let no_prune = HistoryConfig {
+            max_age_days: 0,
+            max_rows: 0,
+            ..Default::default()
+        };
+        for i in 0..10 {
+            db.record(&rec(&format!("Q{i}"), 1), &no_prune).unwrap();
+        }
+        assert_eq!(db.count().unwrap(), 10);
+
+        // A prune to max_rows = 4 should drop 6 rows.
+        let trim = HistoryConfig {
+            max_age_days: 0,
+            max_rows: 4,
+            ..Default::default()
+        };
+        // Dry run first: reports 6, deletes nothing.
+        let would = db.prune_dry_run(&trim).unwrap();
+        assert_eq!(would, 6, "dry run should report 6 would-be deletions");
+        assert_eq!(db.count().unwrap(), 10, "dry run must not delete");
+
+        // Real prune: deletes exactly the 6 the dry run predicted.
+        let deleted = db.prune(&trim).unwrap();
+        assert_eq!(deleted, would, "real delete count must match dry run");
+        assert_eq!(deleted, 6);
+        assert_eq!(db.count().unwrap(), 4);
+    }
+
+    // #48: a second prune on an already-trimmed store deletes nothing.
+    #[test]
+    fn prune_is_idempotent_on_trimmed_store() {
+        let mut db = open_memory();
+        let trim = HistoryConfig {
+            max_age_days: 0,
+            max_rows: 3,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            db.record(&rec(&format!("Q{i}"), 1), &trim).unwrap();
+        }
+        assert_eq!(db.prune_dry_run(&trim).unwrap(), 0);
+        assert_eq!(db.prune(&trim).unwrap(), 0);
+        assert_eq!(db.count().unwrap(), 3);
     }
 
     #[test]
