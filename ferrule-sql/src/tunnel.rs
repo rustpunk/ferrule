@@ -237,8 +237,8 @@ mod ssh_impl {
         Stream { stream: Box<TunnelStream> },
     }
 
-    /// Wraps a backend [`AsyncConnection`](crate::connection::AsyncConnection)
-    /// plus the
+    /// Wraps a backend `AsyncConnection` (the crate-private async driver
+    /// trait) plus the
     /// SSH session (and, for the LocalListener transport, the
     /// forwarder task) so the entire stack drops together.
     ///
