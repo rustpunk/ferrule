@@ -40,7 +40,7 @@ CLI-support library above `ferrule-sql`: formatting, dump/load, migrations, EXPL
 
 - Reintroducing backend drivers here.
 - Claiming dump is fully constant-memory without auditing final output buffering.
-- Assuming MySQL/Oracle DDL rollback semantics match Postgres/SQLite.
+- Treating MySQL/Oracle DDL rollback semantics as equivalent to Postgres/SQLite without backend-specific verification.
 - Treating `redact_sql` as exhaustive secret detection.
 
 ## Local Commands
@@ -53,7 +53,7 @@ CLI-support library above `ferrule-sql`: formatting, dump/load, migrations, EXPL
 
 Update `doc/ai/40_COMMON_PATTERNS.md` when adding reusable formatting/dump/load/migrate patterns. Update `80_OPEN_QUESTIONS.md` if source and product docs disagree.
 
-## Unclear / Ask Human
+## Approval Gates
 
 Ask before moving responsibilities between `ferrule-core` and `ferrule-sql`, changing migration semantics, or broadening redaction behavior.
 

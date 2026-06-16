@@ -18,13 +18,9 @@ Created the initial `doc/ai` documentation set and root/local `AGENTS.md` guidan
 - CI runs format, clippy default/all-features, build, tests default/all-features, docs with warnings denied, cargo-deny, and a C-free cargo-tree firewall.
 - Product docs source is `docs/src`; `docs/book` is generated.
 
-### Major Unresolved Questions
+### Open Question Routing
 
-- `CLAUDE.md` still describes a three-crate architecture.
-- Product docs may lag code for profile fields and dependency/runtime behavior.
-- `GlobalConfig::load(Some(nonexistent))` returns defaults by tested behavior but may need clearer product documentation.
-- Some internal plans/handoffs are historical and need maintainer triage if used for roadmap work.
-
+Current unresolved questions are tracked in `doc/ai/80_OPEN_QUESTIONS.md`. Keep this changelog focused on dated evidence, resolved uncertainty, and factual documentation maintenance history.
 ### Update Instructions
 
 Future agents should append new dated entries when:

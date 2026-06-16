@@ -60,7 +60,7 @@ Embeddable SQL core with synchronous public API, URL/backend dispatch, neutral v
 
 Update `doc/ai/10_ARCHITECTURE.md`, `30_DESIGN_RULES.md`, `40_COMMON_PATTERNS.md`, and `60_PERFORMANCE_NOTES.md` for public API, backend, dependency, or performance changes.
 
-## Unclear / Ask Human
+## Approval Gates
 
 Ask before changing public APIs, backend features, dependency pins, runtime model, credential model, or size-guard defaults.
 

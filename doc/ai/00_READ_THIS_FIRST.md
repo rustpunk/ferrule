@@ -12,7 +12,7 @@ Initial documentation created from read-only repository inventory and read-only 
 
 - Verified: directly observed in current repository files, metadata, CI config, or commands run in this session.
 - Strong inference: not stated as a single rule, but strongly supported by repeated code, comments, tests, or config.
-- Hypothesis: plausible but not fully proven by current evidence.
+- Needs grounding: plausible but not fully proven by current evidence; move it to open questions or validate it against code before acting.
 - Open question: unresolved issue that needs maintainer input or a targeted code/doc audit.
 
 ## Recommended Reading Order

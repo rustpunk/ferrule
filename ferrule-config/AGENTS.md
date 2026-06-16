@@ -39,7 +39,7 @@ Configuration, profile, registry, credential, bookmark, and parser crate.
 
 - Confusing global `.ferrule.toml` with `connections.toml`.
 - Logging or storing raw passwords.
-- Assuming product docs list every current profile field.
+- Treating product docs as exhaustive for current profile fields without checking `ConnectionProfile`.
 - Treating missing explicit config path behavior as accidental without checking tests.
 
 ## Local Commands
@@ -50,7 +50,7 @@ Configuration, profile, registry, credential, bookmark, and parser crate.
 
 Update `doc/ai/30_DESIGN_RULES.md`, `70_GLOSSARY.md`, and `80_OPEN_QUESTIONS.md` when profile, registry, credential, or parser behavior changes.
 
-## Unclear / Ask Human
+## Approval Gates
 
 Ask before changing credential precedence, config discovery, missing-config behavior, or `hasp` usage.
 

@@ -1,6 +1,6 @@
 # Architecture
 
-## What This Project Appears To Be
+## Project Overview
 
 Verified: Ferrule is a Rust Cargo workspace for a database query CLI and an embeddable SQL core. The product-facing `README.md` describes `ferrule` as a CLI for querying relational databases, and root `Cargo.toml` lists four workspace members: `ferrule-sql`, `ferrule-core`, `ferrule-config`, and `ferrule-cli`.
 
@@ -81,8 +81,6 @@ Strong inference:
 - CLI features in `ferrule-cli`: default backends, opt-in `oracle`, opt-in `ssh`, optional `tui`.
 - Strong inference: New backend work should start in `ferrule-sql`, then flow through `ferrule-core` and CLI only where needed.
 
-## Areas Of Uncertainty
+## Open Question Routing
 
-- Some older docs still describe a three-crate architecture and backend modules under `ferrule-core`; current manifests/source show a four-crate workspace with backend code in `ferrule-sql`.
-- `README.md` "zero runtime deps" wording may need reconciliation with CI/deny policy around opt-in MSSQL/OpenSSL and Oracle runtime client behavior.
-- `docs/internal` mixes active ideas, completed plans, and handoffs; use it as supporting context only.
+Current unresolved architecture questions are tracked in `doc/ai/80_OPEN_QUESTIONS.md`. Check that registry before changing crate-boundary docs, README dependency claims, or `docs/internal` interpretation.

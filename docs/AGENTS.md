@@ -45,7 +45,7 @@ Docs changes must not add dependencies or edit lockfiles without approval.
 
 Update `doc/ai/AI_CHANGELOG.md` and relevant `doc/ai/*.md` when product-doc work discovers architecture drift or resolves open questions.
 
-## Unclear / Ask Human
+## Approval Gates
 
 Ask before deleting historical internal docs, regenerating `docs/book`, or making product claims that conflict with current code.
 

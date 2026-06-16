@@ -42,7 +42,7 @@ User-facing `ferrule` binary crate: clap command tree, command dispatch, output,
 - Making cache/history fatal.
 - Recording raw passwords.
 - Allowing shared and per-side copy flags to silently merge.
-- Assuming `schema --daemon` is implemented.
+- Documenting or depending on `schema --daemon` without verifying implementation.
 - Running long TUI queries on the event loop without design approval.
 
 ## Local Commands
@@ -56,7 +56,7 @@ User-facing `ferrule` binary crate: clap command tree, command dispatch, output,
 
 Update `doc/ai/50_TESTING_AND_COMMANDS.md` for command/CI changes, `30_DESIGN_RULES.md` for exit/runtime/cache rules, and product docs under `docs/src` for user-facing CLI behavior.
 
-## Unclear / Ask Human
+## Approval Gates
 
 Ask before changing exit codes, command names/aliases, telemetry/cache semantics, daemon protocol, SSH behavior, or TUI architecture.
 

@@ -16,7 +16,7 @@
 2. Batch 2: `docs/AGENTS.md` to protect product docs and generated output.
 3. Future batch: only add deeper local `AGENTS.md` files if a source-change task repeatedly needs narrower rules.
 
-## Probably Unnecessary Local `AGENTS.md` Locations
+## Not Recommended Now Local `AGENTS.md` Locations
 
 - `ferrule-cli/src/commands/`: current crate-level CLI guidance can cover command modules; add only if command-specific churn grows.
 - `ferrule-cli/src/tui/`: optional TUI is important, but crate-level guidance can cover it for now.
